@@ -20,7 +20,7 @@ use thiserror::Error;
 use crate::{
     alarm::{Backoff, Wake},
     deletes::{DeleteTarget, DeletesError, PendingDeletes},
-    ids::{Generation, LeaseId, OwnerId, ResourceId},
+    ids::{Generation, LeaseId, MachineIdentity, OwnerId, ResourceId},
     lease::{Expiry, Lease, LeaseError, LeasePolicy},
     tags::{Ceiling, ManagedTags, OwnerTags, ResourceKind},
     time::UnixMillis,
@@ -273,6 +273,21 @@ impl<K: ResourceKind> Holding<K> {
 
         Ok(self.with_state(HoldingState::Leased {
             lease: lease.heartbeat(lease_id, sequence, now, policy)?,
+            slots: slots.clone(),
+        }))
+    }
+
+    /// Binds the identity the leased machine reports, while the lease is live
+    pub fn bind_machine(
+        &self,
+        lease_id: &LeaseId,
+        machine: MachineIdentity,
+        now: UnixMillis,
+    ) -> Result<Self, HoldingError> {
+        let (lease, slots) = self.leased_parts("bind a machine to")?;
+
+        Ok(self.with_state(HoldingState::Leased {
+            lease: lease.bind_machine(lease_id, machine, now)?,
             slots: slots.clone(),
         }))
     }

@@ -30,6 +30,9 @@ The app declares its own Durable Object classes and wraps the handlers in
   not missed.
 - Leases end when released, when a heartbeat is missed, at the hard deadline, or when
   the owner revokes them.
+- A live lease can bind one opaque **machine identity** (`MachineIdentity`, such as a
+  network node ID) that the leased machine reports. The same identity can be reported
+  again, but a different one is rejected, so a client can tie a machine to its lease.
 - The **sweep** lists every resource carrying the managed tag and asks each owner object
   which ones a live lease of the same generation claims. Anything not claimed is deleted.
   An owner object with no record of the resource claims nothing. An owner whose call

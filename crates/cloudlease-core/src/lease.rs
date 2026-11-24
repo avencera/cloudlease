@@ -9,7 +9,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{ids::LeaseId, time::UnixMillis};
+use crate::{
+    ids::{LeaseId, MachineIdentity},
+    time::UnixMillis,
+};
 
 /// Limits applied to every lease an owner grants
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +99,9 @@ pub enum LeaseError {
     /// Persisted lease fields contradict each other
     #[error("stored lease fields are inconsistent")]
     Inconsistent,
+    /// The lease is already bound to a different machine identity
+    #[error("the lease is bound to a different machine")]
+    MachineConflict,
 }
 
 /// A live or ended client lease
@@ -111,6 +117,8 @@ pub struct Lease {
     last_sequence: u64,
     heartbeat_due_at: UnixMillis,
     hard_deadline: UnixMillis,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine: Option<MachineIdentity>,
 }
 
 impl Lease {
@@ -144,6 +152,7 @@ impl Lease {
             last_sequence: 0,
             heartbeat_due_at,
             hard_deadline,
+            machine: None,
         })
     }
 
@@ -181,6 +190,12 @@ impl Lease {
     #[must_use]
     pub const fn hard_deadline(&self) -> UnixMillis {
         self.hard_deadline
+    }
+
+    /// Returns the identity the leased machine reported, once it has
+    #[must_use]
+    pub const fn machine(&self) -> Option<&MachineIdentity> {
+        self.machine.as_ref()
     }
 
     /// Returns the earliest time the lease can expire, which is when its owner must check it
@@ -243,6 +258,27 @@ impl Lease {
             ..self.clone()
         })
     }
+
+    /// Binds the identity the leased machine reports for itself, once, while the lease is live
+    ///
+    /// Reporting the same identity again is accepted, so a machine can retry; a different
+    /// one is rejected, so a client can trust that one live lease names one machine.
+    pub fn bind_machine(
+        &self,
+        id: &LeaseId,
+        machine: MachineIdentity,
+        now: UnixMillis,
+    ) -> Result<Self, LeaseError> {
+        self.ensure_live(id, now)?;
+        match &self.machine {
+            Some(bound) if *bound == machine => Ok(self.clone()),
+            Some(_) => Err(LeaseError::MachineConflict),
+            None => Ok(Self {
+                machine: Some(machine),
+                ..self.clone()
+            }),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -254,6 +290,8 @@ struct LeaseWire {
     last_sequence: u64,
     heartbeat_due_at: UnixMillis,
     hard_deadline: UnixMillis,
+    #[serde(default)]
+    machine: Option<MachineIdentity>,
 }
 
 impl TryFrom<LeaseWire> for Lease {
@@ -271,6 +309,7 @@ impl TryFrom<LeaseWire> for Lease {
             last_sequence: wire.last_sequence,
             heartbeat_due_at: wire.heartbeat_due_at,
             hard_deadline: wire.hard_deadline,
+            machine: wire.machine,
         })
     }
 }
@@ -289,7 +328,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{Expiry, Lease, LeaseError, LeasePolicy};
-    use crate::{ids::LeaseId, time::UnixMillis};
+    use crate::{
+        ids::{LeaseId, MachineIdentity},
+        time::UnixMillis,
+    };
 
     const MINUTE: Duration = Duration::from_secs(60);
 
@@ -422,5 +464,50 @@ mod tests {
         let mut broken = json;
         broken["heartbeatDueAt"] = (lease.hard_deadline().as_millis() + 1).into();
         assert!(serde_json::from_value::<Lease>(broken).is_err());
+    }
+
+    #[test]
+    fn a_live_lease_binds_one_machine_identity_that_survives_heartbeats_and_storage() {
+        let node = MachineIdentity::parse("k51qzi5uqu5dgutdk6i1ynyzgkqngpha5xpgia").unwrap();
+        let other = MachineIdentity::parse("other-node").unwrap();
+        let lease = start();
+        assert_eq!(lease.machine(), None);
+
+        let bound = lease
+            .bind_machine(&lease_id(), node.clone(), at(1_010_000))
+            .unwrap();
+        assert_eq!(bound.machine(), Some(&node));
+        assert_eq!(
+            bound.bind_machine(&lease_id(), node.clone(), at(1_020_000)),
+            Ok(bound.clone())
+        );
+        assert_eq!(
+            bound.bind_machine(&lease_id(), other.clone(), at(1_020_000)),
+            Err(LeaseError::MachineConflict)
+        );
+        assert_eq!(
+            lease.bind_machine(
+                &LeaseId::parse("lease_2").unwrap(),
+                node.clone(),
+                at(1_010_000)
+            ),
+            Err(LeaseError::WrongLease)
+        );
+        assert_eq!(
+            lease.bind_machine(&lease_id(), node.clone(), at(1_120_000)),
+            Err(LeaseError::Expired(Expiry::HeartbeatMissed))
+        );
+
+        let renewed = bound
+            .heartbeat(&lease_id(), 1, at(1_030_000), &policy())
+            .unwrap();
+        assert_eq!(renewed.machine(), Some(&node));
+        let stored = serde_json::to_value(&renewed).unwrap();
+        assert_eq!(stored["machine"], node.as_str());
+        assert_eq!(serde_json::from_value::<Lease>(stored).unwrap(), renewed);
+
+        assert!(MachineIdentity::parse("").is_err());
+        assert!(MachineIdentity::parse("has space").is_err());
+        assert!(MachineIdentity::parse("x".repeat(257)).is_err());
     }
 }
