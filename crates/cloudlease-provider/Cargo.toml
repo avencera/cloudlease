@@ -1,6 +1,6 @@
 [package]
 name = "cloudlease-provider"
-description = "Cloud provider boundary, delete-and-confirm cleanup and the DigitalOcean adapter for cloudlease"
+description = "Cloud provider boundary, delete-and-confirm cleanup and the DigitalOcean, phoenixNAP and AWS adapters for cloudlease"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,10 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+chrono.workspace = true
 cloudlease-core.workspace = true
+hmac.workspace = true
+quick-xml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

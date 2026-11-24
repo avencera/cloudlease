@@ -11,7 +11,7 @@ existed, such as leftovers from a crashed create.
 | Crate | What it holds | Runtime |
 | --- | --- | --- |
 | `cloudlease-core` | Lease, holding, tag, capacity and sweep rules. No I/O, no clock | any |
-| `cloudlease-provider` | The `CloudProvider` trait, the reaper, the sweep executor and the DigitalOcean, phoenixNAP and Latitude.sh adapters | any, given an HTTP transport |
+| `cloudlease-provider` | The `CloudProvider` trait, the reaper, the sweep executor, the DigitalOcean, phoenixNAP, Latitude.sh and AWS adapters, and the `IngressPolicy` firewall extension | any, given an HTTP transport |
 | `cloudlease-worker` | workers-rs glue: owner alarms, holding storage, the capacity gate, the sweep driver, and building the DigitalOcean and phoenixNAP adapters from bindings | Cloudflare Workers (`worker =0.8.5`) |
 
 The app declares its own Durable Object classes and wraps the handlers in
@@ -63,6 +63,15 @@ With prefix `cl`, a managed droplet carries exactly:
 cl-managed  cl-owner-<owner>  cl-gen-<n>  cl-kind-droplet  [cl-until-<unix secs>]
 ```
 
+Providers whose tags are keys and values carry the same set as pairs. With prefix `cl`, an
+AWS Spot instance and its Spot request carry exactly:
+
+```
+cl-managed=true  cl-owner=<owner>  cl-gen=<n>  cl-kind=instance  [cl-until=<unix secs>]  Name=<name>
+```
+
+The AWS adapter leaves `Name` out when it classifies tags, so the name is free text.
+
 A resource with the managed tag but any other tag shape is reported as unrecognized and
 left alone. The exception is a malformed `until` tag on an otherwise exact set: the sweep
 never reads it as a deadline or as the absence of one, and asks the owner instead.
@@ -113,6 +122,9 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
 - A Worker on Latitude.sh. Its adapter is tested only against a fake API in
   `crates/cloudlease-provider/tests/`. The machines Worker runs phoenixNAP classes against
   a fake phoenixNAP API in miniflare; no live phoenixNAP server has been created yet
-- Firewalls
+- A Worker on AWS in this repository. rembuild runs the AWS adapter; here it is tested only
+  against a fake EC2 API in `crates/cloudlease-provider/tests/aws.rs`
+- Firewalls on DigitalOcean, phoenixNAP and Latitude.sh. `firewall::IngressPolicy` has only
+  the AWS shared security group implementation
 - Batch-job records and exit status. These belong to the app, which builds on holdings
   and the sweep report
