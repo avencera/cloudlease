@@ -478,20 +478,23 @@ pub fn presence_wake(
         .min()
 }
 
-/// Returns the first check after `now` on the grid that starts at `first` and steps by
-/// [`PRESENCE_CHECK_INTERVAL`]
+/// Returns `first` while it is ahead, and then the first whole [`PRESENCE_CHECK_INTERVAL`]
+/// since the Unix epoch after `now`
 ///
-/// The grid is fixed rather than counted from `now`, because every renew rearms the run
-/// object: counted from `now`, a run whose other machines renew every 30 seconds would push
-/// the check of an interrupted machine back until its heartbeat lapsed.
+/// The grid is shared and fixed. Shared, because a pass checks every watched machine of the
+/// run, so machines created a few seconds apart must not each add a pass of their own.
+/// Fixed rather than counted from `now`, because every renew rearms the run object: counted
+/// from `now`, a run whose other machines renew every 30 seconds would push the check of an
+/// interrupted machine back until its heartbeat lapsed.
 fn next_presence_check(first: UnixMillis, now: UnixMillis) -> UnixMillis {
-    let Some(elapsed) = now.as_millis().checked_sub(first.as_millis()) else {
+    if now < first {
         return first;
-    };
-    let interval = PRESENCE_CHECK_INTERVAL.as_secs() * 1_000;
-    let steps = u32::try_from(elapsed / interval + 1).unwrap_or(u32::MAX);
+    }
 
-    first.saturating_add(PRESENCE_CHECK_INTERVAL.saturating_mul(steps))
+    let interval = PRESENCE_CHECK_INTERVAL.as_secs() * 1_000;
+    let next = (now.as_millis() / interval + 1) * interval;
+
+    UnixMillis::new(next).unwrap_or(now)
 }
 
 /// How a lease is being ended
@@ -817,26 +820,38 @@ mod tests {
     }
 
     #[test]
-    fn presence_checks_keep_a_fixed_minute_grid_whatever_wakes_the_run() {
+    fn presence_checks_share_a_fixed_minute_grid_whatever_wakes_the_run() {
         let aws = RunRecord {
             provider: ProviderName::Aws,
             ..run()
         };
-        let (record, _, holding) = admitted_machine(1, at(0));
-        let machines = entries(&[(&record, Some(&holding))]);
-        let wake = |now: u64| presence_wake(&aws, &machines, at(now)).unwrap();
+        let (first, _, first_holding) = admitted_machine(1, at(0));
+        let (second, _, second_holding) = admitted_machine(2, at(3_750));
+        let one = entries(&[(&first, Some(&first_holding))]);
+        let both = entries(&[
+            (&first, Some(&first_holding)),
+            (&second, Some(&second_holding)),
+        ]);
+        let wake = |machines: &[MachineEntry<'_>], now: u64| {
+            presence_wake(&aws, machines, at(now)).unwrap()
+        };
 
         // the first check waits out the grace for EC2's eventually consistent lists
-        assert_eq!(wake(30_000), at(2 * MINUTE));
+        assert_eq!(wake(&one, 30_000), at(2 * MINUTE));
         // renews of other machines rearm the run between checks without moving the next one
-        assert_eq!(wake(2 * MINUTE + 1), at(3 * MINUTE));
-        assert_eq!(wake(2 * MINUTE + 30_000), at(3 * MINUTE));
-        assert_eq!(wake(3 * MINUTE - 1), at(3 * MINUTE));
+        assert_eq!(wake(&one, 2 * MINUTE + 1), at(3 * MINUTE));
+        assert_eq!(wake(&one, 2 * MINUTE + 30_000), at(3 * MINUTE));
+        assert_eq!(wake(&one, 3 * MINUTE - 1), at(3 * MINUTE));
         // a pass at a check moves on to the next one
-        assert_eq!(wake(3 * MINUTE), at(4 * MINUTE));
+        assert_eq!(wake(&one, 3 * MINUTE), at(4 * MINUTE));
+        // a machine created seconds later adds one wake at the end of its grace, and then
+        // shares the minute grid, so one pass checks both
+        assert_eq!(wake(&both, 2 * MINUTE), at(2 * MINUTE + 3_750));
+        assert_eq!(wake(&both, 2 * MINUTE + 3_750), at(3 * MINUTE));
+        assert_eq!(wake(&both, 3 * MINUTE), at(4 * MINUTE));
 
         // DigitalOcean never takes a droplet back, so its runs are not watched
-        assert_eq!(presence_wake(&run(), &machines, at(3 * MINUTE)), None);
+        assert_eq!(presence_wake(&run(), &one, at(3 * MINUTE)), None);
     }
 
     #[test]

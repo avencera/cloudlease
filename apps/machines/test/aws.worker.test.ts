@@ -250,10 +250,11 @@ describe("AWS Spot machines in miniflare", () => {
 
     expect((await readLease(lease.lease_id)).state).toBe("running");
     expect(ec2.log).toContain(`DescribeInstances ${instanceOf("hb-spot-present").id}`);
-    // the next check is about a minute away
+    // the next check is at the next whole minute
     const wake = (await alarmAt(run.run_id)) ?? 0;
-    expect(wake - Date.now()).toBeGreaterThan(50_000);
-    expect(wake - Date.now()).toBeLessThanOrEqual(60_000);
+    expect(wake % MINUTE).toBe(0);
+    expect(wake - Date.now()).toBeGreaterThan(0);
+    expect(wake - Date.now()).toBeLessThanOrEqual(MINUTE);
   });
 
   it("sweeps an unclaimed instance past its ceiling and keeps a claimed one", async () => {

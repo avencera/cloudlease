@@ -825,6 +825,7 @@ impl Run {
         self.return_permits(stores).await?;
         // last, so slow presence reads never hold up a delete or permit already due; a lease
         // ended here is cleaned up on the next pass, which its releasing holding asks for now
+        let now = runtime::now().max(now);
         self.end_interrupted(stores, &provider, now).await?;
         self.rearm(stores, now).await
     }
@@ -883,6 +884,9 @@ impl Run {
         let Some(machine) = loaded.machine(generation) else {
             return Ok(());
         };
+        // the time after the read, so a lease whose deadline passed meanwhile is left to
+        // expire with its own reason
+        let now = runtime::now().max(now);
         let current = presence_target(&loaded.run, machine.admitted, machine.holding, now);
         if current.is_none_or(|(_, current)| current != id) {
             return Ok(());

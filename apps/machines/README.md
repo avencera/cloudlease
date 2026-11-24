@@ -87,8 +87,9 @@ it, with a core holding.
    that pass, since a permit's resource may sit at the provider it could not see. Each
    provider that fails to list keeps its own alert streak.
 4. **Presence.** On a provider that takes machines back, which is AWS only, the run object
-   reads each live lease's machine every minute, from 2 minutes after the lease began (EC2
-   reads are eventually consistent, so a describe just after the launch may miss it). A
+   reads each live lease's machine at every whole minute, from 2 minutes after the lease
+   began (EC2 reads are eventually consistent, so a describe just after the launch may miss
+   it). One minute grid serves every machine of the run, so one pass reads them all. A
    machine the provider no longer has ends its lease as `interrupted` by `cloudlease`; its
    cleanup confirms it gone and returns its permit. A failed read is retried a minute later,
    and the heartbeat still ends a lease whose machine stopped renewing.
