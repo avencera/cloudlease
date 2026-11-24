@@ -15,6 +15,7 @@
 use std::fmt::Write as _;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use cloudlease_core::time::UnixMillis;
 use cloudlease_provider::digitalocean::{BootScript, ResourceName};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -277,6 +278,34 @@ pub fn render_user_data(
     BootScript::parse(script).map_err(|_| BootError::UserDataTooLarge)
 }
 
+/// Checks that boot data renders within the provider's user data limit for any lease
+///
+/// It renders with the longest lease ID, token, deadline and volume name a run can produce,
+/// so boot data too large once rendered is refused before a machine is admitted or anything
+/// is created.
+pub fn check_fits(boot: &Boot, api_base: &str, mount: Option<&MountPath>) -> Result<(), BootError> {
+    let longest_run = format!("run_{}", "f".repeat(24));
+    let lease_id = format!("{longest_run}-{}", u64::MAX);
+    let token = format!("cll_{}", "f".repeat(64));
+    let volume = ResourceName::parse(format!("{}-{}", longest_run.replace('_', "-"), u64::MAX))
+        .map_err(|_| BootError::UserDataTooLarge)?;
+    // 9999-12-31T23:59:59.999Z, the longest deadline the timestamp format writes
+    let latest = UnixMillis::new(253_402_300_799_999).ok_or(BootError::UserDataTooLarge)?;
+    let lease = LeaseFile {
+        lease_id: &lease_id,
+        token: &token,
+        api_base,
+        hard_deadline_at: Timestamp(latest),
+        heartbeat_ttl_secs: u64::MAX,
+    };
+    let volume = mount.map(|mount| VolumeMount {
+        name: &volume,
+        mount,
+    });
+
+    render_user_data(&lease, volume, boot).map(drop)
+}
+
 /// Quotes a value for a POSIX shell: inside single quotes nothing is special except the
 /// quote itself
 fn quote(value: &str) -> String {
@@ -292,8 +321,8 @@ mod tests {
     use cloudlease_provider::digitalocean::ResourceName;
 
     use super::{
-        Boot, BootError, BootFile, BootPayload, LeaseFile, MountPath, VolumeMount, quote,
-        render_user_data,
+        Boot, BootError, BootFile, BootPayload, LeaseFile, MountPath, VolumeMount, check_fits,
+        quote, render_user_data,
     };
     use crate::time::Timestamp;
 
@@ -320,6 +349,27 @@ mod tests {
             hard_deadline_at: Timestamp(UnixMillis::new(1_795_572_000_000).unwrap()),
             heartbeat_ttl_secs: 600,
         }
+    }
+
+    #[test]
+    fn boot_data_that_quoting_inflates_past_the_user_data_limit_is_refused_up_front() {
+        let mount = MountPath::parse("/mnt/data").unwrap();
+        let api_base = "https://machines.example.test";
+        assert_eq!(
+            check_fits(&Boot::new(payload()).unwrap(), api_base, Some(&mount)),
+            Ok(())
+        );
+
+        // within the 32 KiB JSON limit, but every quote becomes four bytes once quoted
+        let quotes = BootPayload {
+            files: Vec::new(),
+            run: vec![vec!["'".repeat(3_900); 8]],
+        };
+        let boot = Boot::new(quotes).unwrap();
+        assert_eq!(
+            check_fits(&boot, api_base, None),
+            Err(BootError::UserDataTooLarge)
+        );
     }
 
     #[test]

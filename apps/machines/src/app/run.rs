@@ -17,12 +17,12 @@ use cloudlease_core::{
 };
 use cloudlease_machines::{
     alert::{Alert, Priority},
-    boot::{Boot, LeaseFile, VolumeMount, render_user_data},
+    boot::{Boot, LeaseFile, VolumeMount, check_fits, render_user_data},
     config::{HEARTBEAT_TTL, MachineClass, MachinesConfig, renew_policy},
     ids::{AppName, RunId},
     run::{
         Admission, Admitted, LeaseEnd, MachineEntry, MachineRecord, RunEnd, RunRecord, admit,
-        end_lease, lease_view, run_spend, run_view,
+        confirm, end_lease, lease_view, run_spend, run_view,
     },
     time::Timestamp,
     token::LeaseToken,
@@ -243,7 +243,9 @@ impl Run {
             RunAction::CreateMachine(request) => {
                 self.create_machine(&stores, &caller, request, now).await
             }
-            RunAction::ReadLease(generation) => read_lease(&stores, &caller, generation),
+            RunAction::ReadLease(generation) => {
+                self.read_lease(&stores, &caller, generation, now).await
+            }
             RunAction::ReleaseLease(generation, request) => {
                 self.release_lease(&stores, &caller, generation, request, now)
                     .await
@@ -341,32 +343,40 @@ impl Run {
         let boot = Boot::new(request.boot.clone())
             .map_err(|error| ApiError::new(ErrorCode::InvalidBoot, error.to_string()))?;
 
-        let record = match stores
+        let existing = stores
             .runs
             .by_request(request.request_id)
-            .map_err(internal)?
-        {
-            Some(record) => {
-                if !record.matches(&request) {
+            .map_err(internal)?;
+        if let Some(record) = &existing {
+            if !record.matches(&request) {
+                return Err(ApiError::new(
+                    ErrorCode::RequestConflict,
+                    "the request_id was already used with a different body",
+                ));
+            }
+            match record.admission {
+                Admission::Admitted(_) => {
+                    return answer(200, &loaded.lease_view(record.generation)?);
+                }
+                Admission::Pending { since } if now < since.saturating_add(PENDING_RESUME) => {
                     return Err(ApiError::new(
-                        ErrorCode::RequestConflict,
-                        "the request_id was already used with a different body",
+                        ErrorCode::Busy,
+                        "the same request is still being handled",
                     ));
                 }
-                match record.admission {
-                    Admission::Admitted(_) => {
-                        return answer(200, &loaded.lease_view(record.generation)?);
-                    }
-                    Admission::Pending { since } if now < since.saturating_add(PENDING_RESUME) => {
-                        return Err(ApiError::new(
-                            ErrorCode::Busy,
-                            "the same request is still being handled",
-                        ));
-                    }
-                    // the first attempt stalled or failed on the gate; this retry takes over
-                    Admission::Pending { .. } => record,
-                }
+                // the first attempt stalled or failed on the gate; this retry takes over
+                Admission::Pending { .. } => {}
             }
+        }
+
+        let config = config(&self.env)?;
+        let class = run_class(&config, &loaded.run)?;
+        let mount = class.volume.as_ref().map(|volume| &volume.mount);
+        check_fits(&boot, &config.api_base, mount)
+            .map_err(|error| ApiError::new(ErrorCode::InvalidBoot, error.to_string()))?;
+
+        let record = match existing {
+            Some(record) => record,
             None => {
                 admit(&loaded.run, &loaded.entries(), now)?;
                 let generation = stores.runs.next_generation().map_err(internal)?;
@@ -376,7 +386,12 @@ impl Run {
             }
         };
 
-        let answered = self.admit_and_provision(stores, record, &boot, now).await;
+        let create = Create {
+            config: &config,
+            class,
+            boot: &boot,
+        };
+        let answered = self.admit_and_provision(stores, record, &create, now).await;
         // a pending record counts toward max_machines, so one left by a failure must still
         // expire on the alarm
         if answered.is_err()
@@ -393,22 +408,19 @@ impl Run {
         &self,
         stores: &Stores,
         record: MachineRecord,
-        boot: &Boot,
+        create: &Create<'_>,
         now: UnixMillis,
     ) -> Answer {
+        let Create {
+            config,
+            class,
+            boot,
+        } = *create;
         let generation = record.generation;
         let loaded = stores
             .load()
             .map_err(internal)?
             .ok_or_else(|| internal("the run vanished"))?;
-        let config = config(&self.env)?;
-        let Ok(class) = config.class_for(&loaded.run.app, &loaded.run.class) else {
-            stores.runs.delete_record(generation).map_err(internal)?;
-            return Err(ApiError::new(
-                ErrorCode::UnknownClass,
-                format!("class {} is no longer configured", loaded.run.class),
-            ));
-        };
         let owner = loaded.run.run_id.owner().map_err(internal)?;
         let token = mint_token()?;
 
@@ -448,23 +460,21 @@ impl Run {
             return answer(200, &loaded.lease_view(generation)?);
         }
 
-        let machine_id = current.machine_id(&loaded.run.run_id);
-        let lease = class
-            .lease_policy()
-            .map_err(internal)
-            .and_then(|policy| {
-                let lease_id = machine_id.lease_id().map_err(internal)?;
-                Lease::start(lease_id, &policy, now, Some(loaded.run.deadline_at)).map_err(internal)
-            })
-            .ok()
-            .filter(|_| loaded.run.is_open(now));
-        let Some(lease) = lease else {
-            stores.runs.delete_record(generation).map_err(internal)?;
-            return_permit(&gate, &permit).await;
-            return Err(ApiError::new(
-                ErrorCode::RunEnded,
-                "the run takes no new machines",
-            ));
+        let started = confirm(&loaded.run, &loaded.entries(), now).and_then(|()| {
+            let lease_id = current
+                .machine_id(&loaded.run.run_id)
+                .lease_id()
+                .map_err(internal)?;
+            let policy = class.lease_policy().map_err(internal)?;
+            Lease::start(lease_id, &policy, now, Some(loaded.run.deadline_at)).map_err(internal)
+        });
+        let lease = match started {
+            Ok(lease) => lease,
+            Err(error) => {
+                stores.runs.delete_record(generation).map_err(internal)?;
+                return_permit(&gate, &permit).await;
+                return Err(error);
+            }
         };
 
         let admitted = Admitted {
@@ -482,13 +492,16 @@ impl Run {
         owner::save(&stores.storage, &stores.holdings, &holding, now)
             .await
             .map_err(internal)?;
+        // owner::save and owner::create arm the alarm from holdings alone, so the spend wake
+        // is missing while the provider calls run; the rearm after them restores it, and if
+        // this object dies first, the next renew from any machine of the run does
 
         let provisioned = self
             .create_resources(
                 stores,
                 &loaded.run,
                 class,
-                &config,
+                config,
                 &current,
                 &admitted,
                 &token,
@@ -677,6 +690,30 @@ impl Run {
         self.rearm(stores, now).await.map_err(internal)?;
         let loaded = loaded_for(stores, caller, ErrorCode::LeaseNotFound)?;
         answer(status, &loaded.lease_view(generation)?)
+    }
+
+    async fn read_lease(
+        &self,
+        stores: &Stores,
+        caller: &Caller,
+        generation: Generation,
+        now: UnixMillis,
+    ) -> Answer {
+        let loaded = loaded_for(stores, caller, ErrorCode::LeaseNotFound)?;
+        let (machine, by) = lease_access(&loaded, caller, generation)?;
+        // a lease past a deadline has ended even when its alarm has not run yet
+        if end_machine(stores, &machine, LeaseEnd::Expire, now).await? {
+            self.rearm(stores, now).await.map_err(internal)?;
+        }
+
+        let loaded = loaded_for(stores, caller, ErrorCode::LeaseNotFound)?;
+        let (machine, _) = lease_access(&loaded, caller, generation)?;
+        // a lease token stops working once its lease ends
+        if by == ReleasedBy::Machine && machine.holding.lease().is_none() {
+            return Err(lease_ended());
+        }
+
+        answer(200, &loaded.lease_view(generation)?)
     }
 
     async fn renew_lease(
@@ -888,6 +925,44 @@ impl Run {
     }
 }
 
+/// What a machine create reads from the configuration
+#[derive(Clone, Copy)]
+struct Create<'a> {
+    config: &'a MachinesConfig,
+    class: &'a MachineClass,
+    boot: &'a Boot,
+}
+
+/// Returns the run's class as configured now, if it still costs what the run was opened at
+///
+/// Both caps count every machine of a run at the price stored when the run was created, so a
+/// class repriced since then would be undercounted; such a run takes no new machines.
+fn run_class<'a>(
+    config: &'a MachinesConfig,
+    run: &RunRecord,
+) -> Result<&'a MachineClass, ApiError> {
+    let class = config.class_for(&run.app, &run.class).map_err(|_| {
+        ApiError::new(
+            ErrorCode::RunEnded,
+            format!(
+                "class {} is no longer configured; start a new run",
+                run.class
+            ),
+        )
+    })?;
+    if class.price_per_hour != run.price_per_hour || class.gate_units != run.gate_units {
+        return Err(ApiError::new(
+            ErrorCode::RunEnded,
+            format!(
+                "class {} was repriced since the run started; start a new run",
+                run.class
+            ),
+        ));
+    }
+
+    Ok(class)
+}
+
 fn client_run(stores: &Stores, caller: &Caller) -> Result<Loaded, ApiError> {
     let app = client_app(caller)?;
     let loaded = stores.load().map_err(internal)?;
@@ -924,17 +999,6 @@ fn lease_access<'a>(
     };
 
     Ok((machine, by))
-}
-
-fn read_lease(stores: &Stores, caller: &Caller, generation: Generation) -> Answer {
-    let loaded = loaded_for(stores, caller, ErrorCode::LeaseNotFound)?;
-    let (machine, by) = lease_access(&loaded, caller, generation)?;
-    // a lease token stops working once its lease ends
-    if by == ReleasedBy::Machine && machine.holding.lease().is_none() {
-        return Err(lease_ended());
-    }
-
-    answer(200, &loaded.lease_view(generation)?)
 }
 
 /// Ends one machine's lease and stores the record and holding, or returns `false` when

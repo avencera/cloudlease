@@ -28,7 +28,9 @@ Bodies:
 
 - run create: `{request_id, name, class, max_machines, deadline_at}`. `request_id` is a
   UUID, `deadline_at` RFC 3339 and at most `max_run_hours` away.
-- machine create: `{request_id, hostname, boot: {files: [{path, mode, content}], run: [[argv]]}}`
+- machine create: `{request_id, hostname, boot: {files: [{path, mode, content}], run: [[argv]]}}`.
+  `boot` is at most 32 KiB as JSON, 16 files and 8 commands, and must render to at most
+  64 KiB of user data; anything else is `400 invalid_boot` before a machine is admitted.
 - run release: `{"reason": "requested"}`
 - lease release: `{"reason": "requested" | "idle" | "done"}`
 - renew: `{}`
@@ -60,7 +62,8 @@ it, with a core holding.
    The deadline is also the droplet's `until` tag, so the sweep deletes it even if the run
    object is broken.
 2. **Heartbeat.** The machine must renew within 10 minutes (15 minutes after create, for
-   boot). A missed heartbeat ends the lease on the alarm; a release ends it at once.
+   boot). A missed heartbeat ends the lease on the alarm, or on any earlier read or renew
+   of it; a release ends it at once.
 3. **Tag sweep.** Every 5 minutes the cron trigger lists every droplet and volume tagged
    with `CLOUDLEASE_TAG_PREFIX` and deletes any that no live lease claims.
 4. **Spend caps.** See below.
@@ -76,14 +79,20 @@ volumes bill hourly whether or not they are attached (DigitalOcean's billing doc
 2026-11-24). A class with a volume should include the volume's price in its hourly price.
 
 - **Per run**: the run's accrued spend is each machine's price times its billed life, at
-  least 60 seconds, from create until it was confirmed gone. A create that would take the
-  run past `run_spend_cap_usd` is refused with `spend_cap_reached`. When accrued spend
+  least 60 seconds, from create until it was confirmed gone. Each create still waiting on
+  the gate reserves one 60-second minimum, so simultaneous creates cannot pass the cap
+  together. A create that would take the run past `run_spend_cap_usd` is refused with
+  `spend_cap_reached`, and is checked again after the gate answers. When accrued spend
   reaches the cap, the run object ends the run, releases every machine with reason
   `spend_cap`, and alerts.
 - **Per hour**: a rate cap. Every machine not yet confirmed gone holds a permit in the
   `Gate` object weighted by its class's price in cents per hour, rounded up. A create whose
   permit would take the total past `HOURLY_SPEND_CAP_CENTS` is refused with
   `spend_cap_reached`, and alerts. A permit is returned once its machine is confirmed gone.
+
+A run counts every machine at the class price stored when the run was created. If the
+class is repriced or removed from the config while the run is open, the run takes no new
+machines (`409 run_ended`) and the client starts a new run.
 
 ## Alerts
 

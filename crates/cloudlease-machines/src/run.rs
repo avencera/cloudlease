@@ -260,20 +260,45 @@ pub fn run_spend(run: &RunRecord, machines: &[MachineEntry<'_>], now: UnixMillis
     )
 }
 
-/// Decides whether the run takes one more machine at `now`
+/// Returns what the run has committed to spend: its machines' accrued spend, plus the minimum
+/// charge of each create still pending, which may become a machine at any moment
+fn committed(run: &RunRecord, machines: &[MachineEntry<'_>], now: UnixMillis) -> MicroUsd {
+    let minimum = billed(run.price_per_hour, now, now);
+    let pending = machines
+        .iter()
+        .filter(|machine| matches!(machine.record.admission, Admission::Pending { .. }));
+
+    pending.fold(run_spend(run, machines, now).accrued, |total, _| {
+        total.saturating_add(minimum)
+    })
+}
+
+fn spend_cap_reached(run: &RunRecord, committed: MicroUsd) -> ApiError {
+    ApiError::new(
+        ErrorCode::SpendCapReached,
+        format!(
+            "the run has spent or committed {committed} of its {} cap",
+            run.spend_cap
+        ),
+    )
+}
+
+fn run_ended() -> ApiError {
+    ApiError::new(ErrorCode::RunEnded, "the run takes no new machines")
+}
+
+/// Decides whether the run takes one more create request at `now`
 ///
-/// The run must be open, below `max_machines`, and able to pay at least one machine's
-/// minimum without passing its spend cap. The hourly cap is the gate's to decide.
+/// The run must be open, below `max_machines`, and able to pay one more machine's minimum on
+/// top of what it has committed without passing its spend cap. The hourly cap is the gate's
+/// to decide.
 pub fn admit(
     run: &RunRecord,
     machines: &[MachineEntry<'_>],
     now: UnixMillis,
 ) -> Result<(), ApiError> {
     if !run.is_open(now) {
-        return Err(ApiError::new(
-            ErrorCode::RunEnded,
-            "the run takes no new machines",
-        ));
+        return Err(run_ended());
     }
 
     let live = machines.iter().filter(|machine| machine.is_live()).count();
@@ -284,18 +309,30 @@ pub fn admit(
         ));
     }
 
-    let spend = run_spend(run, machines, now);
-    let after = spend
-        .accrued
-        .saturating_add(billed(run.price_per_hour, now, now));
+    let after = committed(run, machines, now).saturating_add(billed(run.price_per_hour, now, now));
     if after > run.spend_cap {
-        return Err(ApiError::new(
-            ErrorCode::SpendCapReached,
-            format!(
-                "the run has spent {} of its {} cap",
-                spend.accrued, run.spend_cap
-            ),
-        ));
+        return Err(spend_cap_reached(run, after));
+    }
+
+    Ok(())
+}
+
+/// Decides whether a pending create may start its lease at `now`, after the gate answered
+///
+/// The run may have ended or spent more meanwhile, and a resumed request was never checked
+/// against the spend it now joins. `machines` includes the pending request itself.
+pub fn confirm(
+    run: &RunRecord,
+    machines: &[MachineEntry<'_>],
+    now: UnixMillis,
+) -> Result<(), ApiError> {
+    if !run.is_open(now) {
+        return Err(run_ended());
+    }
+
+    let committed = committed(run, machines, now);
+    if committed > run.spend_cap {
+        return Err(spend_cap_reached(run, committed));
     }
 
     Ok(())
@@ -521,7 +558,7 @@ mod tests {
 
     use super::{
         Admission, Admitted, LeaseEnd, MachineEntry, MachineRecord, RunEnd, RunRecord, admit,
-        end_lease, lease_view, run_spend, run_state,
+        confirm, end_lease, lease_view, run_spend, run_state,
     };
     use crate::{
         boot::BootPayload,
@@ -667,6 +704,47 @@ mod tests {
         assert_eq!(run_state(&ended, &one, at(2)), RunState::Releasing);
         assert_eq!(run_state(&ended, &[], at(2)), RunState::Released);
         assert_eq!(run_spend(&run, &one, at(90_000)).accrued.micros(), 900_000);
+    }
+
+    #[test]
+    fn pending_creates_reserve_their_minimum_against_the_spend_cap() {
+        let run = RunRecord {
+            max_machines: 8,
+            ..run()
+        };
+        let pending = |generation: u64, slot: &str| {
+            MachineRecord::pending(Generation::new(generation).unwrap(), &request(slot), at(0))
+        };
+        let first = pending(1, "0193a2b4-1c2d-7e3f-8a9b-000000000001");
+        let second = pending(2, "0193a2b4-1c2d-7e3f-8a9b-000000000002");
+        let third = pending(3, "0193a2b4-1c2d-7e3f-8a9b-000000000003");
+
+        // three pending minimums of $0.60 fit under $2, a fourth does not
+        let three = entries(&[(&first, None), (&second, None), (&third, None)]);
+        assert_eq!(
+            admit(&run, &three, at(0)).unwrap_err().code,
+            ErrorCode::SpendCapReached
+        );
+        assert_eq!(confirm(&run, &three, at(0)), Ok(()));
+
+        // a pending create that waited on the gate while an admitted machine ran is refused
+        // once their spend together passes the cap: $1.50 run plus $0.60 pending
+        let (record, _, holding) = admitted_machine(4, at(0));
+        let late = entries(&[(&first, None), (&record, Some(&holding))]);
+        assert_eq!(confirm(&run, &late, at(60_000)), Ok(()));
+        assert_eq!(
+            confirm(&run, &late, at(150_000)).unwrap_err().code,
+            ErrorCode::SpendCapReached
+        );
+
+        let ended = RunRecord {
+            ended: Some(RunEnd::Requested { at: at(1) }),
+            ..run
+        };
+        assert_eq!(
+            confirm(&ended, &three, at(2)).unwrap_err().code,
+            ErrorCode::RunEnded
+        );
     }
 
     #[test]

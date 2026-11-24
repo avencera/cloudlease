@@ -468,6 +468,54 @@ describe("cloudlease machines in miniflare", () => {
     );
   });
 
+  it("refuses boot data too large once rendered, before admitting anything", async () => {
+    const run = await createRun();
+    // under the 32 KiB JSON limit, but each quote takes four bytes once shell-quoted
+    const body = {
+      ...machineBody("hb-big-boot"),
+      boot: { files: [], run: [Array.from({ length: 8 }, () => "'".repeat(3_900))] },
+    };
+
+    await expectError(await call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, body), 400, "invalid_boot");
+    expect(fake.log.filter((entry) => entry.startsWith("POST"))).toEqual([]);
+    expect(ntfy.sent).toEqual([]);
+    expect((await readRun(run.run_id)).machines).toEqual([]);
+  });
+
+  it("takes no new machines once its class was repriced", async () => {
+    const run = await createRun();
+    await createMachine(run, "hb-repriced-1");
+    // the deployed config now prices the class differently from when the run started
+    await runInDurableObject(runStub(run.run_id), (_instance, state) => {
+      const row = state.storage.sql.exec("SELECT record FROM machines_run").one();
+      const record = JSON.parse(row.record as string);
+      record.price_per_hour -= 1;
+      state.storage.sql.exec("UPDATE machines_run SET record = ?", JSON.stringify(record));
+    });
+
+    await expectError(
+      await call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-repriced-2")),
+      409,
+      "run_ended",
+    );
+    expect(fake.droplets.size).toBe(1);
+  });
+
+  it("ends a lapsed lease when it is read, before its alarm runs", async () => {
+    const run = await createRun();
+    const lease = await createMachine(run, "hb-read-lapsed");
+    const token = leaseToken("hb-read-lapsed");
+
+    await editHolding(lease, (holding) => {
+      holding.state.lease.heartbeatDueAt = Date.now() - 1_000;
+    });
+
+    await expectError(await call("GET", `/v1/leases/${lease.lease_id}`, token), 410, "lease_ended");
+    const view = await readLease(lease.lease_id);
+    expect(view.state).not.toBe("running");
+    expect(view.release).toMatchObject({ reason: "heartbeat_lapsed", by: "cloudlease" });
+  });
+
   it("refuses a machine past max_machines", async () => {
     const run = await createRun({ max_machines: 1 });
     await createMachine(run, "hb-full-1");
