@@ -107,6 +107,7 @@ dependencies = [
 name = "cloudlease-provider"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "cloudlease-core",
  "serde",
  "serde_json",

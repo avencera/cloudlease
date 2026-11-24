@@ -26,6 +26,10 @@ pub enum ProviderErrorCode {
     Validation,
     /// The request conflicts with provider state, such as deleting an attached volume
     Conflict,
+    /// The provider has no stock of the requested machine type at the requested location
+    ///
+    /// Not retryable as-is; a caller may try another location, type or provider.
+    NoCapacity,
     /// The provider response did not match the expected schema
     InvalidResponse,
     /// Provider state broke an ownership invariant

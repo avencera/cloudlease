@@ -11,7 +11,7 @@ existed, such as leftovers from a crashed create.
 | Crate | What it holds | Runtime |
 | --- | --- | --- |
 | `cloudlease-core` | Lease, holding, tag, capacity and sweep rules. No I/O, no clock | any |
-| `cloudlease-provider` | The `CloudProvider` trait, the reaper, the sweep executor and the DigitalOcean adapter | any, given an HTTP transport |
+| `cloudlease-provider` | The `CloudProvider` trait, the reaper, the sweep executor and the DigitalOcean and phoenixNAP adapters | any, given an HTTP transport |
 | `cloudlease-worker` | workers-rs glue: owner alarms, holding storage, the capacity gate and the sweep driver | Cloudflare Workers (`worker =0.8.5`) |
 
 The app declares its own Durable Object classes and wraps the handlers in
@@ -109,6 +109,8 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
 
 ## Not covered yet
 
-- Providers other than DigitalOcean, and firewalls
+- A Worker on a provider other than DigitalOcean. The phoenixNAP adapter is tested only
+  against a fake phoenixNAP API in `crates/cloudlease-provider/tests/phoenixnap.rs`
+- Firewalls
 - Batch-job records and exit status. These belong to the app, which builds on holdings
   and the sweep report
