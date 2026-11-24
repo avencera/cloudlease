@@ -33,6 +33,8 @@ export class FakePhoenixNap {
   readonly outOfStock = new Set<string>();
   // lists and reads that still return a server after its deprovision
   listsAfterDeprovision = 0;
+  // answers every server list with HTTP 503
+  failLists = false;
   private nextId = 1;
 
   addServer(tags: Tag[], hostname = `server-${this.nextId}`): string {
@@ -140,6 +142,9 @@ export class FakePhoenixNap {
     }
 
     this.log.push(`${method} ${path}`);
+    if (method === "GET" && id === undefined && this.failLists) {
+      return Response.json({ message: "service unavailable" }, { status: 503 });
+    }
     if (method === "GET" && id === undefined) {
       const listed = [...this.servers.values()].filter((server) => this.stillListed(server));
       return Response.json(listed.map(serverJson));

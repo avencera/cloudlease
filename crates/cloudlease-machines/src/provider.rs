@@ -13,7 +13,7 @@ use std::fmt;
 
 use cloudlease_core::{
     ids::{Generation, OwnerId, ResourceId},
-    sweep::{Inventory, Observed},
+    sweep::{Inventory, Observed, Unlisted},
     tags::{ManagedTags, OwnerTags, ResourceKind},
 };
 use cloudlease_provider::{
@@ -272,7 +272,23 @@ fn digitalocean_kind(kind: MachineKind) -> Option<DoKind> {
     }
 }
 
-fn widen<K: Into<MachineKind>>(inventory: Inventory<K>, into: &mut Inventory<MachineKind>) {
+/// Adds one provider's list to the inventory, or names the provider if its list failed
+fn add<K: Into<MachineKind>>(
+    into: &mut Inventory<MachineKind>,
+    provider: ProviderName,
+    listed: ProviderResult<Inventory<K>>,
+) {
+    let inventory = match listed {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            into.unlisted.push(Unlisted {
+                provider: provider.as_str().to_owned(),
+                error: error.to_string(),
+            });
+            return;
+        }
+    };
+
     into.managed
         .extend(inventory.managed.into_iter().map(|observed| Observed {
             id: observed.id,
@@ -284,6 +300,7 @@ fn widen<K: Into<MachineKind>>(inventory: Inventory<K>, into: &mut Inventory<Mac
             },
         }));
     into.unrecognized.extend(inventory.unrecognized);
+    into.unlisted.extend(inventory.unlisted);
 }
 
 impl<D, P> CloudProvider for Providers<D, P>
@@ -331,20 +348,34 @@ where
         }
     }
 
-    /// Lists every configured provider; if any list fails, the whole inventory fails
+    /// Lists every configured provider, and fails only when none could be listed
     ///
-    /// A partial inventory would let the sweep return a permit whose resource sits at the
-    /// provider that failed to list, so a failure stops the sweep from deleting anything,
-    /// as a failed DigitalOcean list always did. Leases still end on their run objects'
-    /// alarms meanwhile.
+    /// A provider whose list fails is named in the inventory's `unlisted`, which makes it
+    /// incomplete: the sweep still deletes what the other providers listed, but returns no
+    /// permit, since its resource may sit at the provider that failed. Leases still end on
+    /// their run objects' alarms meanwhile.
     async fn inventory(&self) -> ProviderResult<Inventory<MachineKind>> {
         let mut inventory = Inventory {
             managed: Vec::new(),
             unrecognized: Vec::new(),
+            unlisted: Vec::new(),
         };
-        widen(self.digitalocean.inventory().await?, &mut inventory);
-        if let Some(phoenixnap) = &self.phoenixnap {
-            widen(phoenixnap.inventory().await?, &mut inventory);
+        let digitalocean = self.digitalocean.inventory().await;
+        let Some(phoenixnap) = &self.phoenixnap else {
+            add(
+                &mut inventory,
+                ProviderName::DigitalOcean,
+                Ok(digitalocean?),
+            );
+            return Ok(inventory);
+        };
+
+        match (digitalocean, phoenixnap.inventory().await) {
+            (Err(error), Err(_)) => return Err(error),
+            (digitalocean, phoenixnap) => {
+                add(&mut inventory, ProviderName::DigitalOcean, digitalocean);
+                add(&mut inventory, ProviderName::PhoenixNap, phoenixnap);
+            }
         }
 
         Ok(inventory)

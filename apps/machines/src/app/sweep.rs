@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use cloudlease_machines::{
-    alert::{Alert, Priority, SWEEP_KEY},
+    alert::{Alert, Priority, SWEEP_KEY, UNLISTED_KEY_PREFIX},
     provider::MachineKind,
 };
 use cloudlease_worker::{
@@ -29,10 +29,15 @@ pub async fn run(env: &Env) {
     let failing: BTreeSet<String> = match &report {
         Ok(report) => {
             alert_orphans(env, &report.deletes).await;
+            let unlisted = report
+                .unlisted
+                .iter()
+                .map(|unlisted| format!("{UNLISTED_KEY_PREFIX}{}", unlisted.provider));
             report
                 .owners_failed
                 .iter()
                 .map(|failure| failure.owner.as_str().to_owned())
+                .chain(unlisted)
                 .collect()
         }
         Err(error) => {
@@ -135,6 +140,25 @@ fn failure_alert(key: &str, count: u32, report: Option<&SweepReport<MachineKind>
             message: format!(
                 "The last {count} sweeps failed before asking any owner, so nothing was \
                  deleted by tag. Leases still end on their own alarms. See the Worker logs."
+            ),
+            priority: Priority::High,
+        };
+    }
+    if let Some(provider) = key.strip_prefix(UNLISTED_KEY_PREFIX) {
+        let error = report
+            .and_then(|report| {
+                report
+                    .unlisted
+                    .iter()
+                    .find(|unlisted| unlisted.provider == provider)
+            })
+            .map_or("unknown", |unlisted| unlisted.error.as_str());
+        return Alert {
+            title: format!("cloudlease: the sweep cannot list {provider}"),
+            message: format!(
+                "The last {count} sweeps could not list {provider} (latest: {error}), so its \
+                 orphans are not deleted and no permit is returned. The other providers are \
+                 still swept, and leases still end on their own alarms."
             ),
             priority: Priority::High,
         };

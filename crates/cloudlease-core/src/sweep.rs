@@ -57,6 +57,16 @@ pub struct Unrecognized {
     pub tags: Vec<String>,
 }
 
+/// A provider whose resources could not be listed, in an inventory that spans several
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Unlisted {
+    /// The provider, such as `phoenixnap`
+    pub provider: String,
+    /// Why its list failed
+    pub error: String,
+}
+
 /// Every resource with the app's managed tag
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Inventory<K> {
@@ -64,15 +74,17 @@ pub struct Inventory<K> {
     pub managed: Vec<Observed<K>>,
     /// Resources with the managed tag but another shape
     pub unrecognized: Vec<Unrecognized>,
+    /// Providers that failed to list, whose resources are missing from `managed`
+    pub unlisted: Vec<Unlisted>,
 }
 
 impl<K> Inventory<K> {
-    /// Reports whether every managed-tagged resource was recognized
+    /// Reports whether every managed-tagged resource was listed and recognized
     ///
     /// Absence can be proven from an inventory only when it is complete.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.unrecognized.is_empty()
+        self.unrecognized.is_empty() && self.unlisted.is_empty()
     }
 }
 

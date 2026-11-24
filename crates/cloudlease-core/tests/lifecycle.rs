@@ -14,7 +14,7 @@ use cloudlease_core::{
     lease::{Expiry, Lease, LeaseError, LeasePolicy},
     sweep::{
         DoomReason, Doomed, Inventory, Observed, OwnerAnswer, OwnerQuery, OwnerReply, SweepPlan,
-        Unrecognized, answer, doom_past_ceiling, doom_unclaimed, owner_ended, plan,
+        Unlisted, Unrecognized, answer, doom_past_ceiling, doom_unclaimed, owner_ended, plan,
         releasable_permits,
     },
     tags::{Ceiling, CeilingTag, OwnerTags, ResourceKind, UnrecognizedReason},
@@ -386,6 +386,7 @@ fn the_sweep_deletes_orphans_expired_and_past_ceiling_resources_but_keeps_live_o
             observed("down", 1, Kind::Machine, "301"),
         ],
         unrecognized: Vec::new(),
+        unlisted: Vec::new(),
     };
 
     let plan = plan(&inventory, &[], now);
@@ -466,6 +467,7 @@ fn only_resources_of_leases_their_owner_did_not_end_are_marked_as_orphans() {
             ghost_past_ceiling,
         ],
         unrecognized: Vec::new(),
+        unlisted: Vec::new(),
     };
 
     let plan = plan(&inventory, &[], now);
@@ -602,7 +604,7 @@ fn suspect_permits_are_released_only_with_a_complete_inventory_and_an_idle_owner
 }
 
 #[test]
-fn unrecognized_resources_make_the_inventory_incomplete_and_are_never_doomed() {
+fn unrecognized_resources_and_unlisted_providers_make_the_inventory_incomplete() {
     let inventory = Inventory::<Kind> {
         managed: Vec::new(),
         unrecognized: vec![Unrecognized {
@@ -612,12 +614,24 @@ fn unrecognized_resources_make_the_inventory_incomplete_and_are_never_doomed() {
             reason: UnrecognizedReason::ExtraTag,
             tags: vec!["cl-managed".to_owned(), "team-x".to_owned()],
         }],
+        unlisted: Vec::new(),
     };
     let plan = plan(&inventory, &[], start());
 
     assert!(!inventory.is_complete());
     assert!(plan.owners.is_empty());
     assert!(doom(&plan, &BTreeMap::new()).is_empty());
+
+    // a provider that failed to list may hold anything, so absence is unproven too
+    let unlisted = Inventory::<Kind> {
+        managed: Vec::new(),
+        unrecognized: Vec::new(),
+        unlisted: vec![Unlisted {
+            provider: "phoenixnap".to_owned(),
+            error: "HTTP 503".to_owned(),
+        }],
+    };
+    assert!(!unlisted.is_complete());
 }
 
 #[test]

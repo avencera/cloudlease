@@ -24,8 +24,8 @@ use cloudlease_core::{
     capacity::{AbsenceProof, Permit, PermitKey, PermitStatus, ReleaseRequest},
     ids::{OwnerId, PermitId},
     sweep::{
-        OwnerAnswer, OwnerQuery, OwnerReply, Unrecognized, doom_past_ceiling, doom_unclaimed,
-        owner_ended, plan, releasable_permits,
+        OwnerAnswer, OwnerQuery, OwnerReply, Unlisted, Unrecognized, doom_past_ceiling,
+        doom_unclaimed, owner_ended, plan, releasable_permits,
     },
     tags::ResourceKind,
     time::UnixMillis,
@@ -77,6 +77,8 @@ pub struct SweepReport<K> {
     pub managed: usize,
     /// Resources with the managed tag in another shape, left alone
     pub unrecognized: Vec<Unrecognized>,
+    /// Providers that failed to list, so their resources were neither deleted nor proven gone
+    pub unlisted: Vec<Unlisted>,
     /// Owners asked
     pub owners_asked: usize,
     /// Owners that did not answer
@@ -102,10 +104,12 @@ pub struct SweepDelete<K> {
 }
 
 impl<K> SweepReport<K> {
-    /// Reports whether every doomed resource was confirmed gone and every owner answered
+    /// Reports whether every provider listed, every doomed resource was confirmed gone, and
+    /// every owner answered
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.owners_failed.is_empty()
+        self.unlisted.is_empty()
+            && self.owners_failed.is_empty()
             && self.capacity_errors.is_empty()
             && self
                 .deletes
@@ -208,6 +212,7 @@ where
     Ok(SweepReport {
         managed: inventory.managed.len(),
         unrecognized: inventory.unrecognized,
+        unlisted: inventory.unlisted,
         owners_asked: plan.owners.len(),
         owners_failed,
         deletes,

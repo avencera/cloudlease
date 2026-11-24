@@ -76,8 +76,10 @@ it, with a core holding.
    phoenixNAP server tagged with `CLOUDLEASE_TAG_PREFIX`. It first deletes every one past
    its `until` tag, without asking any run object, then asks each run object which of the
    rest it claims and deletes those no live lease claims. A run object that does not answer
-   within 5 seconds keeps its other resources until the next sweep. If either provider's
-   list fails, the sweep deletes nothing that time.
+   within 5 seconds keeps its other resources until the next sweep. If one provider's list
+   fails, the sweep still deletes what the other listed but returns no hourly-gate permit
+   that pass, since a permit's resource may sit at the provider it could not see; if every
+   list fails, it deletes nothing that time.
 4. **Spend caps.** See below.
 
 A machine is `released` only after the droplet, then the volume, or the server, are
@@ -147,9 +149,9 @@ the Worker log either way:
 - a provider create failure, once per run (priority 3)
 - a sweep deleting a resource whose lease no run had already ended, which means it leaked
   (priority 3)
-- a run object failing to answer the sweep (priority 3), or the sweep failing outright
-  (priority 4), on the third sweep in a row and then hourly (the `Monitor` object counts the
-  streaks)
+- a run object failing to answer the sweep (priority 3), a provider the sweep cannot list
+  (priority 4), or the sweep failing outright (priority 4), on the third sweep in a row and
+  then hourly (the `Monitor` object counts the streaks)
 
 No alert uses priority 5: the topic may be one a Superalert Mac app follows, which sounds its
 alarm for every priority 5 message.
@@ -201,6 +203,7 @@ The phoenixNAP suite covers a server's create with its location, tags and boot d
 location out of stock falling through to the next and the last failing the create with no
 spend counted, renew,
 release, heartbeat lapse and hard deadline each deleting the server and confirming it
-gone, the sweep deleting unclaimed servers and keeping a claimed one, and hourly billing:
+gone, the sweep deleting unclaimed servers and keeping a claimed one, the sweep still
+deleting a DigitalOcean orphan while phoenixNAP fails to list, and hourly billing:
 a 5 minute server costs an hour, and the second hour takes a run past its cap. The bare
 suite covers a phoenixNAP class refused without credentials.

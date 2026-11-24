@@ -24,6 +24,9 @@ pub const REALERT_EVERY: u32 = 12;
 /// The streak key of a sweep that failed before it could ask any owner
 pub const SWEEP_KEY: &str = "sweep";
 
+/// The streak key prefix of a provider the sweep could not list, followed by its name
+pub const UNLISTED_KEY_PREFIX: &str = "unlisted:";
+
 /// How urgent an alert is, as ntfy priorities
 ///
 /// There is no priority 5: the alerts topic may be one that a Superalert Mac app follows, and

@@ -568,7 +568,7 @@ describe("cloudlease machines in miniflare", () => {
     expect(fake.droplets.has(7009)).toBe(false);
   }, 30_000);
 
-  it("alerts when the sweep keeps failing", async () => {
+  it("alerts when the sweep keeps failing to list DigitalOcean", async () => {
     fake.failLists = true;
 
     await scheduled();
@@ -576,7 +576,8 @@ describe("cloudlease machines in miniflare", () => {
     expect(ntfy.titles()).toEqual([]);
     await scheduled();
 
-    expect(ntfy.titles()).toEqual(["cloudlease: the machines sweep keeps failing"]);
+    // phoenixNAP still lists, so the sweep runs without DigitalOcean rather than failing
+    expect(ntfy.titles()).toEqual(["cloudlease: the sweep cannot list digitalocean"]);
 
     // a good sweep resets the streak
     fake.failLists = false;

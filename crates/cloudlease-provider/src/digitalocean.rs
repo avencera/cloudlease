@@ -341,6 +341,7 @@ impl<T: HttpTransport, R: Runtime> CloudProvider for DigitalOcean<T, R> {
         let mut inventory = Inventory {
             managed: Vec::new(),
             unrecognized: Vec::new(),
+            unlisted: Vec::new(),
         };
         for entry in classified {
             match entry {

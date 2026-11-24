@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FakeDigitalOcean } from "../../../tests/worker/test/fake-digitalocean";
+import { FakeDigitalOcean, tags as doTags } from "../../../tests/worker/test/fake-digitalocean";
 import { FakeNtfy } from "./fake-ntfy";
 import { FakePhoenixNap, pnapTags, type Server } from "./fake-phoenixnap";
 import {
@@ -22,6 +22,7 @@ import {
   settle,
 } from "./support";
 
+let digitalocean: FakeDigitalOcean;
 let pnap: FakePhoenixNap;
 let ntfy: FakeNtfy;
 
@@ -46,7 +47,7 @@ async function metalRun(overrides: Record<string, unknown> = {}) {
 
 describe("phoenixNAP machines in miniflare", () => {
   beforeEach(async () => {
-    const digitalocean = new FakeDigitalOcean();
+    digitalocean = new FakeDigitalOcean();
     digitalocean.dropletReadsAfterDelete = 0;
     digitalocean.install();
     pnap = new FakePhoenixNap();
@@ -188,6 +189,26 @@ describe("phoenixNAP machines in miniflare", () => {
     expect(pnap.servers.has(foreign)).toBe(true);
     expect(ntfy.titles()).toEqual(["cloudlease: sweep deleted 2 orphaned resources"]);
   });
+
+  it("still sweeps DigitalOcean while phoenixNAP fails to list, and alerts on both failing", async () => {
+    const past = Math.floor(Date.now() / 1000) - 10;
+    digitalocean.addDroplet(7101, doTags("run_000000000000000000000000", 1, "droplet", past, "clm"));
+    pnap.failLists = true;
+
+    await scheduled();
+    await scheduled();
+    expect(digitalocean.droplets.has(7101)).toBe(false);
+    expect(ntfy.titles()).toEqual(["cloudlease: sweep deleted 1 orphaned resources"]);
+    await scheduled();
+    expect(ntfy.titles()).toContain("cloudlease: the sweep cannot list phoenixnap");
+
+    digitalocean.failLists = true;
+    for (let sweep = 0; sweep < 3; sweep += 1) {
+      await scheduled();
+    }
+    expect(ntfy.titles()).toContain("cloudlease: the machines sweep keeps failing");
+    // each failed list retries with backoff, so six sweeps take about 15 seconds
+  }, 60_000);
 
   it("bills every started hour: a 5 minute server costs an hour, and a second hour starts at 60 minutes", async () => {
     // a 3 cent cap holds one $0.02 hour, not two
