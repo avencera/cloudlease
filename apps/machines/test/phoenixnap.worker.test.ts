@@ -87,7 +87,8 @@ describe("phoenixNAP machines in miniflare", () => {
 
   it("moves to the next location when the first has no stock, and fails the create after the last", async () => {
     pnap.outOfStock.add("SEA");
-    const run = await metalRun();
+    // a 5 cent cap holds two $0.02 hours; the refused create must not take a third
+    const run = await metalRun({ spend_cap_cents: 5 });
 
     await createMachine(run, "hb-metal-stock-1");
     expect(serverOf("hb-metal-stock-1").location).toBe("NLD");
@@ -101,6 +102,11 @@ describe("phoenixNAP machines in miniflare", () => {
     expect(pnap.serverNamed("hb-metal-stock-2")).toBeUndefined();
     expect(ntfy.titles()).toEqual(["cloudlease: machine create failed in run pool-metal"]);
     expect(ntfy.sent[0]?.body).toContain("no s2.c2.large in stock at SEA, NLD");
+
+    // nothing was created, so once stock returns the run still has room for a second hour
+    pnap.outOfStock.clear();
+    await createMachine(run, "hb-metal-stock-3");
+    expect(serverOf("hb-metal-stock-3").location).toBe("SEA");
   });
 
   it("renews, and deletes a released server and confirms it gone", async () => {

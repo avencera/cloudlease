@@ -167,6 +167,10 @@ pub struct Admitted {
     pub permit_returned: bool,
     /// How the lease ended, once it has
     pub release: Option<Release>,
+    /// Whether the provider refused the machine's first create for lack of stock, so nothing
+    /// of it existed or was billed and it adds nothing to the run's spend
+    #[serde(default)]
+    pub out_of_stock: bool,
 }
 
 /// Where a create request is in admission
@@ -267,7 +271,10 @@ impl MachineEntry<'_> {
     }
 
     fn billed_life(&self) -> Option<BilledLife> {
-        let admitted = self.record.admitted()?;
+        let admitted = self
+            .record
+            .admitted()
+            .filter(|admitted| !admitted.out_of_stock)?;
         let gone_at = match self.holding.map(Holding::state) {
             Some(HoldingState::Released { at, .. }) => Some(*at),
             _ => None,
@@ -404,6 +411,9 @@ pub enum LeaseEnd<'a> {
     },
     /// It passed its heartbeat or hard deadline
     Expire,
+    /// The provider had no stock for the machine's first resource, so nothing was created;
+    /// recorded as a failed create
+    OutOfStock,
 }
 
 /// Ends a leased holding and records why, or returns `None` when there is nothing to end:
@@ -421,6 +431,7 @@ pub fn end_lease(
         return Ok(None);
     };
 
+    let out_of_stock = matches!(end, LeaseEnd::OutOfStock);
     let (ended, reason, by) = match end {
         LeaseEnd::Release {
             lease_id,
@@ -428,6 +439,11 @@ pub fn end_lease(
             by,
         } => (holding.release(lease_id, now)?, reason, by),
         LeaseEnd::Revoke { reason, by } => (holding.revoke(now), reason, by),
+        LeaseEnd::OutOfStock => (
+            holding.revoke(now),
+            ReleaseReason::CreateFailed,
+            ReleasedBy::Cloudlease,
+        ),
         LeaseEnd::Expire => {
             let Some(ended) = holding.expire(now) else {
                 return Ok(None);
@@ -458,6 +474,7 @@ pub fn end_lease(
         ended,
         Admitted {
             release: Some(release),
+            out_of_stock: admitted.out_of_stock || out_of_stock,
             ..admitted.clone()
         },
     )))
@@ -674,6 +691,7 @@ mod tests {
             permit: PermitId::parse("cap_1").unwrap(),
             permit_returned: false,
             release: None,
+            out_of_stock: false,
         };
         let holding = Holding::leased(run.run_id.owner().unwrap(), record.generation, lease);
         let record = MachineRecord {
@@ -904,5 +922,45 @@ mod tests {
         let loaded: RunRecord = serde_json::from_value(stored).unwrap();
         assert_eq!(loaded.provider, ProviderName::DigitalOcean);
         assert_eq!(loaded.billing, Billing::DIGITALOCEAN);
+    }
+
+    #[test]
+    fn a_machine_refused_for_lack_of_stock_adds_nothing_to_the_run_spend() {
+        // phoenixNAP bills its first hour at once, so a refused create counted as a
+        // machine would hold a whole hour of the run's cap
+        let run = RunRecord {
+            billing: Billing::PHOENIXNAP,
+            provider: ProviderName::PhoenixNap,
+            ..run()
+        };
+        let (record, admitted, holding) = admitted_machine(1, at(0));
+        let refused = |end| {
+            let (holding, admitted) = end_lease(&holding, &admitted, end, at(1_000))
+                .unwrap()
+                .unwrap();
+            let record = MachineRecord {
+                admission: Admission::Admitted(admitted),
+                ..record.clone()
+            };
+            (record, holding)
+        };
+
+        let (record, ended) = refused(LeaseEnd::OutOfStock);
+        let stock = entries(&[(&record, Some(&ended))]);
+        assert_eq!(run_spend(&run, &stock, at(2_000)).accrued, MicroUsd::ZERO);
+        let view = lease_view(&run, &record, record.admitted().unwrap(), &ended);
+        assert_eq!(view.release.unwrap().reason, ReleaseReason::CreateFailed);
+
+        // any other failed create may have left a server behind, so its hour still counts
+        let failed = LeaseEnd::Revoke {
+            reason: ReleaseReason::CreateFailed,
+            by: ReleasedBy::Cloudlease,
+        };
+        let (record, ended) = refused(failed);
+        let other = entries(&[(&record, Some(&ended))]);
+        assert_eq!(
+            run_spend(&run, &other, at(2_000)).accrued,
+            MicroUsd::parse_dollars("36").unwrap()
+        );
     }
 }

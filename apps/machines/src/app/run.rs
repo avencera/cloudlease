@@ -5,7 +5,7 @@
 //! earliest of: a lease deadline, a cleanup retry, the moment the run's spend would reach its
 //! cap, a stale pending create, and a permit that still has to be returned.
 
-use std::{collections::BTreeMap, num::NonZeroU64, time::Duration};
+use std::{cell::Cell, collections::BTreeMap, num::NonZeroU64, time::Duration};
 
 use cloudlease_core::{
     alarm::{Backoff, Wake},
@@ -35,6 +35,7 @@ use cloudlease_machines::{
 };
 use cloudlease_provider::{
     digitalocean::{BootScript, DoSpec, DropletSpec, ResourceName, VolumeSpec},
+    error::ProviderErrorCode,
     phoenixnap::{self, ServerSpec},
 };
 use cloudlease_worker::{
@@ -509,6 +510,7 @@ impl Run {
             permit: permit.permit_id,
             permit_returned: false,
             release: None,
+            out_of_stock: false,
         };
         stores
             .put_admitted(&current, admitted.clone())
@@ -533,8 +535,8 @@ impl Run {
                 boot,
             )
             .await;
-        if let Err(error) = provisioned {
-            self.create_failed(stores, &loaded.run, &current, error)
+        if let Err(failure) = provisioned {
+            self.create_failed(stores, &loaded.run, &current, failure)
                 .await?;
         }
 
@@ -558,7 +560,7 @@ impl Run {
         admitted: &Admitted,
         token: &LeaseToken,
         boot: &Boot,
-    ) -> CloudleaseResult<()> {
+    ) -> Result<(), CreateFailure> {
         let provider = provider(&self.env)?;
         let lease_id = record.machine_id(&run.run_id).to_string();
         let lease = LeaseFile {
@@ -575,12 +577,17 @@ impl Run {
             record,
             lease: &lease,
             boot,
+            created: Cell::new(false),
         };
 
-        match &class.provider {
+        let provisioned = match &class.provider {
             ProviderClass::DigitalOcean(droplet) => provisioning.droplet(droplet).await,
             ProviderClass::PhoenixNap(server) => provisioning.server(server).await,
-        }
+        };
+        provisioned.map_err(|error| CreateFailure {
+            out_of_stock: !provisioning.created.get() && is_out_of_stock(&error),
+            error,
+        })
     }
 
     /// Ends a lease whose create failed, so its cleanup finds anything that was created
@@ -589,8 +596,12 @@ impl Run {
         stores: &Stores,
         run: &RunRecord,
         record: &MachineRecord,
-        error: CloudleaseError,
+        failure: CreateFailure,
     ) -> Result<(), ApiError> {
+        let CreateFailure {
+            error,
+            out_of_stock,
+        } = failure;
         // a lease that ended while the create was in flight is already being cleaned up
         if matches!(error, CloudleaseError::Holding(_)) {
             worker::console_warn!(
@@ -606,9 +617,13 @@ impl Run {
             .map_err(internal)?
             .ok_or_else(|| internal("the run vanished"))?;
         if let Some(machine) = loaded.machine(record.generation) {
-            let end = LeaseEnd::Revoke {
-                reason: ReleaseReason::CreateFailed,
-                by: ReleasedBy::Cloudlease,
+            let end = if out_of_stock {
+                LeaseEnd::OutOfStock
+            } else {
+                LeaseEnd::Revoke {
+                    reason: ReleaseReason::CreateFailed,
+                    by: ReleasedBy::Cloudlease,
+                }
             };
             end_machine(stores, &machine, end, now).await?;
         }
@@ -1109,6 +1124,32 @@ struct Provisioning<'a> {
     record: &'a MachineRecord,
     lease: &'a LeaseFile<'a>,
     boot: &'a Boot,
+    // whether any resource of the machine was created, after which a failure may have
+    // something billed behind it
+    created: Cell<bool>,
+}
+
+/// A failed machine create
+struct CreateFailure {
+    error: CloudleaseError,
+    /// Whether the provider refused the machine's first resource for lack of stock, so
+    /// nothing of it was created
+    out_of_stock: bool,
+}
+
+impl From<CloudleaseError> for CreateFailure {
+    fn from(error: CloudleaseError) -> Self {
+        Self {
+            error,
+            out_of_stock: false,
+        }
+    }
+}
+
+fn is_out_of_stock(error: &CloudleaseError) -> bool {
+    // phoenixNAP answers no stock before it creates anything, and the adapter reports it
+    // only once every location of the class refused
+    matches!(error, CloudleaseError::Provider(error) if error.code == ProviderErrorCode::NoCapacity)
 }
 
 impl Provisioning<'_> {
@@ -1122,6 +1163,7 @@ impl Provisioning<'_> {
             runtime::now(),
         )
         .await?;
+        self.created.set(true);
 
         Ok(id)
     }

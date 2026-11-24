@@ -91,7 +91,8 @@ A phoenixNAP class names a `server_type`, an ordered list of up to 3 `locations`
 `os` with cloud-init support (`ubuntu/jammy`). A create tries each location in turn and
 moves on only when phoenixNAP answers that the type is out of stock there (HTTP 406),
 which means nothing was created; after the last location the lease ends with
-`create_failed`. There is no fallback to another provider. Servers have local NVMe and no
+`create_failed` and adds nothing to the run's spend. Any other failed create counts its
+minimum, since it may have left a server behind. There is no fallback to another provider. Servers have local NVMe and no
 volume. Every server gets the five Tag Manager tags `{prefix}-managed`, `-owner`, `-gen`,
 `-kind` and `-until`, which the Worker creates on first use, and is deprovisioned with its
 IP block.
@@ -197,7 +198,8 @@ and volume are gone, `max_machines`, both spend caps and a client's lower run ca
 create, a create whose pending record expired while it waited on the gate, a stalled run
 object whose droplet is past its hard deadline, and the sweep's orphan and failure alerts.
 The phoenixNAP suite covers a server's create with its location, tags and boot data, a
-location out of stock falling through to the next and the last failing the create, renew,
+location out of stock falling through to the next and the last failing the create with no
+spend counted, renew,
 release, heartbeat lapse and hard deadline each deleting the server and confirming it
 gone, the sweep deleting unclaimed servers and keeping a claimed one, and hourly billing:
 a 5 minute server costs an hour, and the second hour takes a run past its cap. The bare
