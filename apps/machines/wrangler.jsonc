@@ -58,6 +58,8 @@
           "server_type": "s2.c2.large",
           "locations": ["SEA", "NLD"],
           "os": "ubuntu/jammy",
+          // the account key cloudlease-pnap; its private half is ~/.ssh/cloudlease-pnap on code
+          "ssh_key_ids": ["6b060c5309b1f2cb75cb85f3"],
           "price_per_hour_usd": "0.40",
           "max_hours": 1
         },
@@ -67,6 +69,8 @@
           "server_type": "s2.c2.small",
           "locations": ["SEA", "NLD"],
           "os": "ubuntu/jammy",
+          // the account key cloudlease-pnap; its private half is ~/.ssh/cloudlease-pnap on code
+          "ssh_key_ids": ["6b060c5309b1f2cb75cb85f3"],
           "price_per_hour_usd": "0.31",
           "max_hours": 1
         }
