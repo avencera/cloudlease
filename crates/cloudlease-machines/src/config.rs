@@ -22,7 +22,7 @@ use cloudlease_core::{
 };
 use cloudlease_provider::{
     digitalocean::{DropletImage, Slug},
-    phoenixnap::{Location, OsImage, ServerType},
+    phoenixnap::{Location, OsImage, ServerType, SshKeyIds},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -187,8 +187,9 @@ pub struct PhoenixNapClass {
     pub locations: Locations,
     /// The OS image, which must support cloud-init, such as `ubuntu/jammy`
     pub os: OsImage,
-    /// IDs of account SSH keys installed for break-glass access
-    pub ssh_key_ids: Vec<ResourceId>,
+    /// IDs of account SSH keys installed for break-glass access; phoenixNAP refuses a Linux
+    /// server without one
+    pub ssh_key_ids: SshKeyIds,
 }
 
 /// The provider a class uses and the machine it asks that provider for
@@ -598,6 +599,8 @@ fn phoenixnap_class(
             ResourceId::parse(id).map_err(|error| ConfigError::invalid(field("ssh_key_ids"), error))
         })
         .collect::<Result<_, _>>()?;
+    let ssh_key_ids = SshKeyIds::new(ssh_key_ids)
+        .map_err(|error| ConfigError::invalid(field("ssh_key_ids"), error))?;
 
     Ok(PhoenixNapClass {
         server_type: ServerType::parse(raw.server_type)
@@ -649,6 +652,7 @@ pub(crate) mod tests {
                     "server_type": "s2.c2.large",
                     "locations": ["SEA", "NLD"],
                     "os": "ubuntu/jammy",
+                    "ssh_key_ids": ["5fa54d1e91867c03a0a7b4a4"],
                     "price_per_hour_usd": "0.40",
                     "max_hours": 12
                 }
@@ -741,6 +745,8 @@ pub(crate) mod tests {
         assert!(broken(&["classes", "pnap-s2", "locations"], json!(["SEA", "SEA"])).is_err());
         assert!(broken(&["classes", "pnap-s2", "locations"], json!(["sea"])).is_err());
         assert!(broken(&["classes", "pnap-s2", "server_type"], json!("S2 C2")).is_err());
+        // phoenixNAP refuses a Linux server with no SSH key
+        assert!(broken(&["classes", "pnap-s2", "ssh_key_ids"], json!([])).is_err());
         // billing finer than phoenixNAP's hour would undercount
         assert!(broken(&["classes", "pnap-s2", "billing_increment_secs"], json!(60)).is_err());
         assert!(broken(&["classes", "pnap-s2", "boot_grace_secs"], json!(30)).is_err());

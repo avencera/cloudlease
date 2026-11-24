@@ -179,8 +179,10 @@ Every class has `price_per_hour_usd`, `max_hours`, and optionally `boot_grace_se
 
 - `digitalocean`, the default when `provider` is absent: `{region, size, image, volume?:
   {size_gib, mount}, ssh_key_ids?, vpc_uuid?}`
-- `phoenixnap`: `{server_type, locations, os, ssh_key_ids?}`, with `locations` such as
-  `["SEA", "NLD"]` and `ssh_key_ids` the IDs of account SSH keys
+- `phoenixnap`: `{server_type, locations, os, ssh_key_ids}`, with `locations` such as
+  `["SEA", "NLD"]` and `ssh_key_ids` the IDs of account SSH keys, at least one: phoenixNAP
+  refuses a Linux server with no SSH key, and the Worker never adds the account's default
+  keys
 
 `api_base` is the URL machines renew at, written into their `lease.json`. See
 `wrangler.jsonc` for an example.

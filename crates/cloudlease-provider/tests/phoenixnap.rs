@@ -25,7 +25,7 @@ use cloudlease_provider::{
     },
     phoenixnap::{
         BootScript, ClientOptions, Hostname, Location, OsImage, PhoenixNap, PhoenixNapClient,
-        PnapCredentials, PnapKind, PnapSpec, ServerSpec, ServerType,
+        PnapCredentials, PnapKind, PnapSpec, ServerSpec, ServerType, SshKeyIds,
     },
     provider::{CloudProvider, Presence},
     reaper::reap,
@@ -384,7 +384,8 @@ fn server_spec(hostname: &str) -> PnapSpec {
         server_type: ServerType::parse("s3.c3.medium").unwrap(),
         os: OsImage::parse("ubuntu/jammy").unwrap(),
         boot: BootScript::parse("#cloud-config\nruncmd:\n  - echo hello\n").unwrap(),
-        ssh_key_ids: vec![ResourceId::parse("5fa54d1e91867c03a0a7b4a4").unwrap()],
+        ssh_key_ids: SshKeyIds::new(vec![ResourceId::parse("5fa54d1e91867c03a0a7b4a4").unwrap()])
+            .unwrap(),
     })
 }
 

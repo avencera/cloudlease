@@ -116,9 +116,21 @@ export class FakePhoenixNap {
         type: string;
         os: string;
         tags: Tag[];
+        installDefaultSshKeys?: boolean;
+        sshKeyIds?: string[];
         osConfiguration: { cloudInit: { userData: string } };
       };
       this.log.push(`POST bmc/v1/servers ${body.location}`);
+      // the live API checks this before stock: a Linux server needs at least one SSH key
+      if ((body.sshKeyIds ?? []).length === 0 && body.installDefaultSshKeys !== true) {
+        return Response.json(
+          {
+            message: "The request failed due to wrong data.",
+            validationErrors: ["At least one SSH key required for operating system"],
+          },
+          { status: 400 },
+        );
+      }
       if (this.outOfStock.has(body.location)) {
         return Response.json(
           { message: `Server type ${body.type} is out of stock at ${body.location}` },

@@ -142,6 +142,35 @@ validated!(
     |value| !value.is_empty() && value.len() <= MAX_USER_DATA_BYTES
 );
 
+/// The account SSH keys a server installs, at least one
+///
+/// phoenixNAP refuses a Linux server with no SSH key, and the adapter never adds the
+/// account's default keys, so a create must name its keys.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SshKeyIds(Vec<ResourceId>);
+
+/// An SSH key list with no key
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("phoenixNAP needs at least one account SSH key ID to create a Linux server")]
+pub struct NoSshKeys;
+
+impl SshKeyIds {
+    /// Checks the list is not empty
+    pub fn new(ids: Vec<ResourceId>) -> Result<Self, NoSshKeys> {
+        if ids.is_empty() {
+            return Err(NoSshKeys);
+        }
+
+        Ok(Self(ids))
+    }
+
+    /// Returns the key IDs
+    #[must_use]
+    pub fn as_slice(&self) -> &[ResourceId] {
+        &self.0
+    }
+}
+
 /// A server to create, billed hourly
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerSpec {
@@ -156,7 +185,7 @@ pub struct ServerSpec {
     /// The first-boot user data
     pub boot: BootScript,
     /// IDs of SSH keys stored in the account; the account's default keys are not added
-    pub ssh_key_ids: Vec<ResourceId>,
+    pub ssh_key_ids: SshKeyIds,
 }
 
 /// A phoenixNAP create request
@@ -387,7 +416,12 @@ fn server_body(spec: &ServerSpec, tags: Vec<PnapTag>) -> Value {
         "pricingModel": "HOURLY",
         // phoenixNAP adds every default account key unless told not to
         "installDefaultSshKeys": false,
-        "sshKeyIds": spec.ssh_key_ids.iter().map(ResourceId::as_str).collect::<Vec<_>>(),
+        "sshKeyIds": spec
+            .ssh_key_ids
+            .as_slice()
+            .iter()
+            .map(ResourceId::as_str)
+            .collect::<Vec<_>>(),
         "osConfiguration": {
             "cloudInit": { "userData": STANDARD.encode(spec.boot.as_str()) },
         },
