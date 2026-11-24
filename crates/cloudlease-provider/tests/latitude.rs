@@ -15,7 +15,8 @@ use cloudlease_core::{
     holding::{Holding, HoldingState, ReleaseReason},
     ids::{Generation, LeaseId, OwnerId, ResourceId, TagPrefix},
     lease::{Lease, LeasePolicy},
-    tags::{Ceiling, OwnerTags, TagScheme, UnrecognizedReason},
+    sweep::{Inventory, doom_past_ceiling, plan},
+    tags::{Ceiling, CeilingTag, OwnerTags, TagScheme, UnrecognizedReason},
     time::UnixMillis,
 };
 use cloudlease_provider::{
@@ -25,10 +26,11 @@ use cloudlease_provider::{
     },
     latitude::{
         BootScript, ClientOptions, LatKind, LatSpec, Latitude, LatitudeApiKey, LatitudeClient,
-        ServerSpec, Slug, UserDataSpec,
+        ORPHAN_OWNER, ORPHAN_SETTLE, ServerSpec, Slug, UserDataSpec,
     },
     provider::{CloudProvider, Presence},
     reaper::reap,
+    sweep::{ConfirmPolicy, DeleteOutcome, delete_doomed},
 };
 use serde_json::{Value, json};
 
@@ -39,6 +41,8 @@ const PAGE_CAP: usize = 2;
 #[derive(Default)]
 struct FakeApi {
     servers: BTreeMap<String, String>,
+    // when servers were ordered, as Latitude.sh's `created_at`; servers without one have none
+    created_at: BTreeMap<String, String>,
     // user data ID to description
     user_data: BTreeMap<String, String>,
     // servers and user data in another project of the same team
@@ -110,9 +114,10 @@ impl FakeApi {
         respond(200, json!({ "data": page, "meta": {} }))
     }
 
-    fn server_json(id: &str, hostname: &str) -> Value {
+    fn server_json(&self, id: &str, hostname: &str) -> Value {
         json!({ "id": id, "type": "servers", "attributes": {
             "hostname": hostname, "status": "on", "tags": [],
+            "created_at": self.created_at.get(id),
         } })
     }
 
@@ -146,7 +151,7 @@ impl FakeApi {
                 self.in_project(request, id)
                     && hostname.as_ref().is_none_or(|wanted| *name == wanted)
             })
-            .map(|(id, name)| Self::server_json(id, name))
+            .map(|(id, name)| self.server_json(id, name))
             .collect();
 
         Self::page(request, items)
@@ -165,7 +170,7 @@ impl FakeApi {
 
     fn read_server(&self, id: &str) -> HttpResponse {
         self.servers.get(id).map_or_else(not_found, |hostname| {
-            respond(200, json!({ "data": Self::server_json(id, hostname) }))
+            respond(200, json!({ "data": self.server_json(id, hostname) }))
         })
     }
 
@@ -194,7 +199,7 @@ impl FakeApi {
         let hostname = attributes["hostname"].as_str().unwrap().to_owned();
         self.servers.insert(id.clone(), hostname.clone());
 
-        respond(201, json!({ "data": Self::server_json(&id, &hostname) }))
+        respond(201, json!({ "data": self.server_json(&id, &hostname) }))
     }
 
     fn create_user_data(&mut self, request: &HttpRequest) -> HttpResponse {
@@ -658,4 +663,99 @@ fn an_expired_holding_deletes_its_server_before_the_record_that_names_it() {
     );
     assert!(harness.api.borrow().servers.is_empty());
     assert!(harness.api.borrow().user_data.is_empty());
+}
+
+#[test]
+fn a_server_listed_only_after_its_cleanup_gave_up_is_swept_as_an_orphan_once_settled() {
+    // 2026-11-24T20:00:00Z
+    const CREATED: u64 = 1_795_550_400_000;
+    let harness = harness();
+    let owner = owner_tags("run_1", 1);
+    let record = block_on(harness.provider.create(&owner, &user_data_spec())).unwrap();
+
+    // the server create timed out and Latitude.sh did not list the server during the
+    // lease's tag search, so its cleanup proved it absent and deleted the only record
+    let policy = LeasePolicy::new(Duration::from_secs(120), Duration::from_secs(3_600)).unwrap();
+    let lease = Lease::start(
+        LeaseId::parse("lease_1").unwrap(),
+        &policy,
+        at(CREATED),
+        None,
+    )
+    .unwrap();
+    let releasing = Holding::leased(owner.owner.clone(), owner.generation, lease)
+        .request(LatKind::UserData, at(CREATED))
+        .unwrap()
+        .record_created(LatKind::UserData, record, at(CREATED))
+        .unwrap()
+        .request(LatKind::Server, at(CREATED))
+        .unwrap()
+        .revoke(at(CREATED));
+    let after_settle = CREATED + 121_000;
+    let reaped = block_on(reap(
+        &harness.provider,
+        &releasing,
+        at(after_settle),
+        &Backoff::default(),
+    ))
+    .unwrap();
+    assert!(reaped.holding.is_released());
+    assert!(harness.api.borrow().user_data.is_empty());
+
+    // then the server shows up, with no record left to name its owner
+    let hostname = harness.provider.hostname(&owner.owner, owner.generation);
+    {
+        let mut api = harness.api.borrow_mut();
+        api.servers.insert("sv_late".to_owned(), hostname.clone());
+        api.created_at
+            .insert("sv_late".to_owned(), "2026-11-24T20:00:00+00:00".to_owned());
+        // a hand-named server in the namespace but not in the adapter's shape is left alone
+        api.servers
+            .insert("sv_hand".to_owned(), "cl-build-box".to_owned());
+        api.created_at
+            .insert("sv_hand".to_owned(), "2026-11-24T19:00:00+00:00".to_owned());
+    }
+
+    // inside the settle window it is only reported, as any recordless server is
+    harness.runtime.now.set(CREATED + 9 * 60_000);
+    let young = block_on(harness.provider.inventory()).unwrap();
+    assert!(young.managed.is_empty());
+    let reported: Vec<_> = young
+        .unrecognized
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect();
+    assert_eq!(reported, ["sv_hand", "sv_late"]);
+
+    // once settled it is managed under the orphan owner with its ceiling reached, so the
+    // sweep deletes it without asking any owner
+    let settled = CREATED + u64::try_from(ORPHAN_SETTLE.as_millis()).unwrap();
+    harness.runtime.now.set(settled);
+    let inventory: Inventory<LatKind> = block_on(harness.provider.inventory()).unwrap();
+    assert_eq!(inventory.managed.len(), 1);
+    let orphan = &inventory.managed[0];
+    assert_eq!(orphan.id.as_str(), "sv_late");
+    assert_eq!(orphan.tags.owner.as_str(), ORPHAN_OWNER);
+    assert_eq!(orphan.tags.kind, LatKind::Server);
+    assert_eq!(
+        orphan.tags.ceiling,
+        CeilingTag::At(Ceiling::at_or_before(at(settled)))
+    );
+    assert_eq!(inventory.unrecognized.len(), 1, "the hand-named server");
+
+    let doomed = doom_past_ceiling(&plan(&inventory, &[], at(settled)));
+    let reports = block_on(delete_doomed(
+        &harness.provider,
+        &harness.runtime,
+        doomed,
+        ConfirmPolicy {
+            reads: 2,
+            pause: Duration::from_secs(1),
+        },
+    ));
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].outcome, DeleteOutcome::Gone);
+    let api = harness.api.borrow();
+    assert!(!api.servers.contains_key("sv_late"));
+    assert!(api.servers.contains_key("sv_hand"));
 }

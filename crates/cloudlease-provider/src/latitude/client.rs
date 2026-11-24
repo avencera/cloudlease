@@ -109,6 +109,9 @@ pub struct ServerAttributes {
     /// The status, an open set such as `starting_deploy`, `deploying` or `on`
     #[serde(default)]
     pub status: Option<String>,
+    /// When the server was ordered, in RFC 3339 form such as `2026-11-24T19:52:37+00:00`
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 /// User data attributes as the API returns them

@@ -14,8 +14,15 @@
 //!   locates a server by that hostname, so a server whose create response was lost is still
 //!   found.
 //! - The sweep reads a server's owner, generation and ceiling from the user data record
-//!   whose hostname matches. A hostname in the app's `{p}-` namespace without exactly one
-//!   consistent record is reported as unrecognized and never deleted automatically.
+//!   whose hostname matches. A hostname in the app's `{p}-` namespace with records that
+//!   disagree, or in another shape than the adapter's, is reported as unrecognized and never
+//!   deleted automatically.
+//! - A server with the adapter's exact hostname shape and no record at all is an orphan once
+//!   it is [`ORPHAN_SETTLE`] old. Its record is created before it and deleted only after it
+//!   is confirmed gone, so this happens only when the server appeared after its lease's
+//!   cleanup had already given up finding it, such as a create whose response was lost and
+//!   that Latitude.sh listed late. The adapter reports it under [`ORPHAN_OWNER`] with its
+//!   ceiling reached, so the sweep deletes it without asking an owner and alerts on it.
 //!
 //! Servers have delete rank 0 and user data rank 1, so cleanup confirms a server gone
 //! before it deletes the record that names its owner.
@@ -26,13 +33,17 @@
 
 pub mod client;
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use cloudlease_core::{
     ids::{Generation, OwnerId, ResourceId},
     sweep::{Inventory, Observed, Unrecognized},
-    tags::{ManagedTags, OwnerTags, ResourceKind, TagMatch, TagScheme, UnrecognizedReason},
+    tags::{
+        Ceiling, CeilingTag, ManagedTags, OwnerTags, ResourceKind, TagMatch, TagScheme,
+        UnrecognizedReason,
+    },
+    time::UnixMillis,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -52,6 +63,23 @@ pub use client::{ClientOptions, LatitudeApiKey, LatitudeClient, WireServer, Wire
 /// Latitude.sh documents no limit; this matches DigitalOcean's so one boot script fits all
 /// providers.
 pub const MAX_USER_DATA_BYTES: usize = 64 * 1024;
+
+/// How old a server with the adapter's hostname and no record must be before the sweep
+/// deletes it as an orphan
+///
+/// A record is created before its server and deleted after it, so a recordless server is
+/// normally one the sweep listed between the two deletes, or a server listed before its
+/// record in the same sweep. Ten minutes is well past both and past a lease's two minute
+/// tag search, and still inside the first billed hour.
+pub const ORPHAN_SETTLE: Duration = Duration::from_secs(10 * 60);
+
+/// The owner the inventory names for an orphan server, whose real owner is unknown
+///
+/// No owner object of that name holds anything, so the sweep's question to it claims
+/// nothing, and the delete is reported as an orphan.
+pub const ORPHAN_OWNER: &str = "latitude-orphan";
+
+const HOSTNAME_HEX_DIGITS: usize = 16;
 
 /// A Latitude.sh resource kind cloudlease manages
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -186,7 +214,7 @@ impl<T: HttpTransport, R: Runtime> Latitude<T, R> {
             .chain_update([0])
             .chain_update(generation.to_string())
             .finalize();
-        let hex: String = digest[..8]
+        let hex: String = digest[..HOSTNAME_HEX_DIGITS / 2]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
@@ -233,22 +261,74 @@ impl<T: HttpTransport, R: Runtime> Latitude<T, R> {
         )))
     }
 
+    /// Reports whether a hostname has the exact shape [`Self::hostname`] gives
+    fn is_adapter_hostname(&self, hostname: &str) -> bool {
+        let namespace = format!("{}-", self.scheme.prefix());
+        hostname.strip_prefix(&namespace).is_some_and(|hex| {
+            hex.len() == HOSTNAME_HEX_DIGITS
+                && hex
+                    .chars()
+                    .all(|character| matches!(character, '0'..='9' | 'a'..='f'))
+        })
+    }
+
+    /// Returns the tags an orphan server is swept under, once it has settled
+    ///
+    /// A server with no parseable creation time, or one younger than [`ORPHAN_SETTLE`], gets
+    /// none and stays unrecognized.
+    fn orphan_tags(&self, server: &WireServer, now: UnixMillis) -> Option<ManagedTags<LatKind>> {
+        if !self.is_adapter_hostname(&server.attributes.hostname) {
+            return None;
+        }
+        let created = server.attributes.created_at.as_deref()?;
+        let created = chrono::DateTime::parse_from_rfc3339(created).ok()?;
+        let settled = u64::try_from(created.timestamp_millis())
+            .ok()?
+            .checked_add(u64::try_from(ORPHAN_SETTLE.as_millis()).ok()?)?;
+        let settled = UnixMillis::new(settled)?;
+        let ceiling = Ceiling::at_or_before(settled);
+        if !ceiling.is_reached_at(now) {
+            return None;
+        }
+
+        Some(ManagedTags {
+            owner: OwnerId::parse(ORPHAN_OWNER).ok()?,
+            generation: Generation::new(1).ok()?,
+            kind: LatKind::Server,
+            ceiling: CeilingTag::At(ceiling),
+        })
+    }
+
     fn classify_server(
         &self,
         server: WireServer,
         records: &BTreeMap<String, Vec<ManagedTags<LatKind>>>,
+        now: UnixMillis,
     ) -> Option<Result<Observed<LatKind>, Unrecognized>> {
         let namespace = format!("{}-", self.scheme.prefix());
-        let hostname = server.attributes.hostname;
-        if !hostname.starts_with(&namespace) {
+        if !server.attributes.hostname.starts_with(&namespace) {
             return None;
         }
 
-        let reason = match records.get(&hostname).map(Vec::as_slice) {
-            None | Some([]) => UnrecognizedReason::WrongShape,
+        let orphan = self.orphan_tags(&server, now);
+        let hostname = server.attributes.hostname;
+        let reason = match (records.get(&hostname).map(Vec::as_slice), orphan) {
+            (None | Some([]), Some(tags)) => {
+                return Some(match ResourceId::parse(&server.id) {
+                    Ok(id) => Ok(Observed { id, tags }),
+                    Err(_) => Err(unrecognized(
+                        LatKind::Server,
+                        server.id,
+                        hostname,
+                        UnrecognizedReason::InvalidValue,
+                        Vec::new(),
+                    )),
+                });
+            }
+            (None | Some([]), None) => UnrecognizedReason::WrongShape,
             // a lost user data create can leave two records for one generation; they name
             // the same server only if they agree
-            Some([first, rest @ ..]) if rest.iter().all(|other| other == first) => {
+            (Some([first, rest @ ..]), _) if rest.iter().all(|other| other == first) => {
                 let tags = ManagedTags {
                     kind: LatKind::Server,
                     ..first.clone()
@@ -264,7 +344,7 @@ impl<T: HttpTransport, R: Runtime> Latitude<T, R> {
                     )),
                 });
             }
-            Some(_) => UnrecognizedReason::DuplicateTag,
+            (Some(_), _) => UnrecognizedReason::DuplicateTag,
         };
 
         Some(Err(unrecognized(
@@ -277,11 +357,15 @@ impl<T: HttpTransport, R: Runtime> Latitude<T, R> {
     }
 
     async fn classified(&self) -> ProviderResult<Vec<Result<Observed<LatKind>, Unrecognized>>> {
-        let records = self.client.list_user_data(self.project.as_str()).await?;
+        // servers first: every server listed then had its record created before it, so the
+        // record list after it holds that record unless its cleanup already deleted it
         let servers = self
             .client
             .list_servers(self.project.as_str(), None)
             .await?;
+        let records = self.client.list_user_data(self.project.as_str()).await?;
+        let now = UnixMillis::new(self.client.runtime().now_millis())
+            .ok_or_else(|| ProviderError::invalid_response("the runtime clock is out of range"))?;
 
         let records: Vec<_> = records
             .into_iter()
@@ -296,7 +380,7 @@ impl<T: HttpTransport, R: Runtime> Latitude<T, R> {
         }
         let servers: Vec<_> = servers
             .into_iter()
-            .filter_map(|server| self.classify_server(server, &by_hostname))
+            .filter_map(|server| self.classify_server(server, &by_hostname, now))
             .collect();
 
         Ok(servers.into_iter().chain(records).collect())
