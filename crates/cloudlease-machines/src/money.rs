@@ -77,6 +77,15 @@ impl MicroUsd {
             .ok_or_else(invalid)
     }
 
+    /// Creates an amount from whole US cents, or `None` past what fits
+    #[must_use]
+    pub const fn from_cents(cents: u64) -> Option<Self> {
+        match cents.checked_mul(MICROS_PER_CENT) {
+            Some(micros) => Some(Self(micros)),
+            None => None,
+        }
+    }
+
     /// Adds without overflow
     #[must_use]
     pub const fn saturating_add(self, other: Self) -> Self {

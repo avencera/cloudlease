@@ -556,6 +556,32 @@ describe("cloudlease machines in miniflare", () => {
     expect(fake.droplets.size).toBe(1);
   });
 
+  it("holds a run to the client's spend cap, which may not pass the config's", async () => {
+    await expectError(await call("POST", "/v1/runs", CLIENT, runBody({ spend_cap_cents: 6 })), 400, "invalid_request");
+    await expectError(await call("POST", "/v1/runs", CLIENT, runBody({ spend_cap_cents: 0 })), 400, "invalid_request");
+
+    const body = runBody({ spend_cap_cents: 1 });
+    const created = await call("POST", "/v1/runs", CLIENT, body);
+    expect(created.status).toBe(201);
+    const run = (await created.json()) as RunView;
+    expect((await call("POST", "/v1/runs", CLIENT, body)).status).toBe(200);
+    await expectError(
+      await call("POST", "/v1/runs", CLIENT, { ...body, spend_cap_cents: 2 }),
+      409,
+      "request_conflict",
+    );
+    await expectError(await call("POST", "/v1/runs", CLIENT, { ...body, spend_cap_cents: undefined }), 409, "request_conflict");
+
+    // two hours at $0.01 is past the run's 1 cent cap but well inside the config's 5 cents
+    const lease = await createMachine(run, "hb-client-cap-1");
+    await backdateMachine(lease, 2 * HOUR);
+    await expectError(
+      await call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-client-cap-2")),
+      429,
+      "spend_cap_reached",
+    );
+  });
+
   it("releases a run's machines when it reaches its spend cap, and alerts", async () => {
     const run = await createRun();
     const lease = await createMachine(run, "hb-spend-1");

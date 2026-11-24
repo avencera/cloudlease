@@ -26,8 +26,10 @@ app and sees only that app's runs; a lease token is written into its machine's
 
 Bodies:
 
-- run create: `{request_id, name, class, max_machines, deadline_at}`. `request_id` is a
-  UUID, `deadline_at` RFC 3339 and at most `max_run_hours` away.
+- run create: `{request_id, name, class, max_machines, deadline_at, spend_cap_cents?}`.
+  `request_id` is a UUID, `deadline_at` RFC 3339 and at most `max_run_hours` away.
+  `spend_cap_cents` is a whole number of US cents from 1 up to `run_spend_cap_usd`, which
+  applies when it is absent; a retry must repeat it, or leave it out again.
 - machine create: `{request_id, hostname, boot: {files: [{path, mode, content}], run: [[argv]]}}`.
   `boot` is at most 32 KiB as JSON, 16 files and 8 commands, and must render to at most
   64 KiB of user data; anything else is `400 invalid_boot` before a machine is admitted.
@@ -84,8 +86,9 @@ volumes bill hourly whether or not they are attached (DigitalOcean's billing doc
 - **Per run**: the run's accrued spend is each machine's price times its billed life, at
   least 60 seconds, from create until it was confirmed gone. Each create still waiting on
   the gate reserves one 60-second minimum, so simultaneous creates cannot pass the cap
-  together. A create that would take the run past `run_spend_cap_usd` is refused with
-  `spend_cap_reached`, and is checked again after the gate answers. When accrued spend
+  together. A run's cap is the client's `spend_cap_cents`, or else `run_spend_cap_usd`. A
+  create that would take the run past it is refused with `spend_cap_reached`, and is
+  checked again after the gate answers. When accrued spend
   reaches the cap, the run object ends the run, releases every machine with reason
   `spend_cap`, and alerts.
 - **Per hour**: a rate cap. Every machine not yet confirmed gone holds a permit in the
@@ -140,5 +143,6 @@ commands in order.
 against the fake DigitalOcean API in `tests/worker/test` and a fake ntfy topic. It covers
 run and machine create idempotency, renew by lease token and refusal on another lease, a
 lapsed heartbeat, an immediate release, the hard deadline, `released` only after the droplet
-and volume are gone, `max_machines`, both spend caps, a failed create, a stalled run object
-whose droplet is past its hard deadline, and the sweep's orphan and failure alerts.
+and volume are gone, `max_machines`, both spend caps and a client's lower run cap, a failed
+create, a stalled run object whose droplet is past its hard deadline, and the sweep's orphan
+and failure alerts.

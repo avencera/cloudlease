@@ -5,7 +5,7 @@
 //! earliest of: a lease deadline, a cleanup retry, the moment the run's spend would reach its
 //! cap, a stale pending create, and a permit that still has to be returned.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, num::NonZeroU64, time::Duration};
 
 use cloudlease_core::{
     alarm::{Backoff, Wake},
@@ -20,6 +20,7 @@ use cloudlease_machines::{
     boot::{Boot, LeaseFile, VolumeMount, check_fits, render_user_data},
     config::{HEARTBEAT_TTL, MachineClass, MachinesConfig, renew_policy},
     ids::{AppName, RunId},
+    money::MicroUsd,
     run::{
         Admission, Admitted, LeaseEnd, MachineEntry, MachineRecord, RunEnd, RunRecord, admit,
         confirm, end_lease, lease_view, run_spend, run_view,
@@ -289,6 +290,7 @@ impl Run {
             )
         })?;
         check_run_request(&config, &request, now)?;
+        let spend_cap = run_spend_cap(&config, request.spend_cap_cents)?;
 
         let run = RunRecord {
             run_id: run_id.clone(),
@@ -301,7 +303,8 @@ impl Run {
             created_at: now,
             price_per_hour: class.price_per_hour,
             gate_units: class.gate_units,
-            spend_cap: config.run_spend_cap,
+            spend_cap,
+            requested_spend_cap_cents: request.spend_cap_cents,
             ended: None,
             create_failure_alerted: false,
         };
@@ -1068,6 +1071,29 @@ fn check_run_request(
     }
 
     Ok(())
+}
+
+/// The run's spend cap: the client's, when it asked for one within the config's, else the
+/// config's
+fn run_spend_cap(
+    config: &MachinesConfig,
+    requested: Option<NonZeroU64>,
+) -> Result<MicroUsd, ApiError> {
+    let Some(cents) = requested else {
+        return Ok(config.run_spend_cap);
+    };
+
+    MicroUsd::from_cents(cents.get())
+        .filter(|cap| *cap <= config.run_spend_cap)
+        .ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "spend_cap_cents may be at most the run spend cap of {}",
+                    config.run_spend_cap
+                ),
+            )
+        })
 }
 
 /// The permit lives as long as the lease can, plus a margin for deletion; after that the gate

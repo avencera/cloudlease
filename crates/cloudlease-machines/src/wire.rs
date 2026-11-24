@@ -7,6 +7,8 @@
 //! [`RunCall`] is internal: the public Worker authenticates a request, parses its body into a
 //! typed action and sends it to the run's Durable Object, which trusts it.
 
+use std::num::NonZeroU64;
+
 use cloudlease_core::ids::Generation;
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +33,10 @@ pub struct CreateRunRequest {
     pub max_machines: u16,
     /// No lease of the run outlives this
     pub deadline_at: Timestamp,
+    /// The most the run may spend, in US cents; at most the config's `run_spend_cap_usd`,
+    /// which applies when it is absent
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_cap_cents: Option<NonZeroU64>,
 }
 
 /// `POST /v1/runs/{run_id}/machines`

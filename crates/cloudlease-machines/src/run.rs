@@ -15,6 +15,8 @@
 //! needs on top: who ended a lease and why, its last deadlines, its capacity permit, and the
 //! spend of the run.
 
+use std::num::NonZeroU64;
+
 use cloudlease_core::{
     capacity::PermitUnits,
     holding::{Holding, HoldingError, HoldingState, ReleaseReason as CoreReason, Slot},
@@ -77,6 +79,9 @@ pub struct RunRecord {
     pub gate_units: PermitUnits,
     /// What the run may spend, fixed at create
     pub spend_cap: MicroUsd,
+    /// The cap the client asked for, if any, which a retried create must repeat
+    #[serde(default)]
+    pub requested_spend_cap_cents: Option<NonZeroU64>,
     /// Why it stopped taking machines early, if it did
     pub ended: Option<RunEnd>,
     /// Whether a failed provider create was already alerted on, so a client that keeps
@@ -94,6 +99,7 @@ impl RunRecord {
             && self.class == request.class
             && self.max_machines == request.max_machines
             && self.deadline_at == request.deadline_at.0
+            && self.requested_spend_cap_cents == request.spend_cap_cents
     }
 
     /// Reports whether the run takes new machines at `now`
@@ -590,6 +596,7 @@ mod tests {
             price_per_hour: MicroUsd::parse_dollars("36").unwrap(),
             gate_units: PermitUnits::new(3_600).unwrap(),
             spend_cap: MicroUsd::parse_dollars("2").unwrap(),
+            requested_spend_cap_cents: None,
             ended: None,
             create_failure_alerted: false,
         }
