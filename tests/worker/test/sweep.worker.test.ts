@@ -112,7 +112,11 @@ async function leaseOwner(owner: string, generation: number): Promise<void> {
 
 async function holdings(
   owner: string,
-): Promise<Array<{ state: { state: string; lease?: { heartbeatDueAt: number } } }>> {
+): Promise<
+  Array<{
+    state: { state: string; lease?: { heartbeatDueAt: number }; slots?: Record<string, Slot> };
+  }>
+> {
   const response = await ownerStub(owner).fetch("https://owner/holdings");
   expect(response.status).toBe(200);
   return response.json();
@@ -199,6 +203,37 @@ describe("cloudlease sweep in miniflare", () => {
     expect([...fake.droplets.keys()]).toEqual([inFlight.id]);
     expect(fake.volumes.size).toBe(0);
     await expect(holdings("ghost_owner")).resolves.toEqual([]);
+  });
+
+  it("does not record a create that returns after its lease lapsed", async () => {
+    const now = Date.now();
+    await seedHolding(
+      "job_lapsing",
+      leasedHolding(
+        "job_lapsing",
+        1,
+        { startedAt: now, heartbeatDueAt: now + 500, hardDeadline: now + 60 * MINUTE },
+        {},
+      ),
+    );
+
+    // the create returns after the heartbeat deadline but before any alarm has stored the
+    // expiry, so only the clock read after the provider call can refuse it
+    const release = fake.hold("POST");
+    const creating = ownerStub("job_lapsing").fetch("https://owner/droplet", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ generation: 1 }),
+    });
+    await vi.waitUntil(() => fake.log.includes("POST droplets"));
+    await parkAlarm(ownerStub("job_lapsing"));
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    release();
+
+    expect((await creating).status).not.toBe(201);
+    const [holding] = await holdings("job_lapsing");
+    expect(holding?.state.state).toBe("leased");
+    expect(holding?.state.slots).toEqual({ droplet: { status: "requested" } });
   });
 
   it("deletes an owned droplet whose lease is past its hard deadline", async () => {

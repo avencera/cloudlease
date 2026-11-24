@@ -89,7 +89,7 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
 - live resources that must be kept
 - failing owners, unrecognized tags and malformed ceilings
 - capacity permit release
-- the owner alarm's delete-and-confirm loop
+- the owner alarm's delete-and-confirm loop, and a create that returns after its lease lapsed
 - the cron trigger
 
 ## Not covered yet

@@ -246,8 +246,9 @@ impl Lease {
 
     /// Accepts a heartbeat from a client that sends no sequence numbers
     ///
-    /// It counts as the next sequence number, so it still moves the deadline only forward
-    /// in time and never past the hard deadline.
+    /// It counts as the next sequence number and sets the deadline to `now` plus the
+    /// heartbeat timeout, never past the hard deadline. The boot grace covers only the time
+    /// before the first heartbeat, so a first renew can bring the deadline earlier.
     pub fn renew(
         &self,
         id: &LeaseId,
