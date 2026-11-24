@@ -5,10 +5,12 @@
 //!
 //! 1. lists every resource with the app's managed tag; if that fails, nothing is deleted
 //! 2. reads the capacity gate's suspect permits, when the app has a gate
-//! 3. deletes resources past their ceiling without asking their owner
-//! 4. asks each owner object which of its resources it claims and deletes the rest; an owner
-//!    object that never existed claims nothing, and an owner that fails to answer keeps its
-//!    resources until the next sweep
+//! 3. asks each owner object which of its resources it claims and which generations it is
+//!    already releasing; an owner object that never existed claims nothing, and an owner that
+//!    fails to answer keeps its resources until the next sweep
+//! 4. deletes resources past their ceiling whatever their owner answers, and every other
+//!    resource no live lease claims; each delete reports whether the owner was already
+//!    releasing it, so an app can alert on orphans only
 //! 5. releases suspect permits once their resources are proven absent
 
 use std::collections::{BTreeMap, BTreeSet};

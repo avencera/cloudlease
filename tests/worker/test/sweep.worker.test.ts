@@ -16,6 +16,7 @@ import { FakeDigitalOcean, tags } from "./fake-digitalocean";
 interface DeleteReport {
   resource: { id: string; tags: { owner: string; generation: number; kind: string } };
   reason: "pastCeiling" | "unclaimed";
+  ownerReleasing: boolean;
   outcome: { outcome: "gone" | "stillPresent" | "deferred" | "failed" };
 }
 
@@ -278,7 +279,7 @@ describe("cloudlease sweep in miniflare", () => {
     expect([...fake.volumes.keys()]).toEqual(["vol-501"]);
   });
 
-  it("deletes a claimed droplet past its ceiling without asking the owner", async () => {
+  it("deletes a claimed droplet past its ceiling whatever its owner answers", async () => {
     const now = Date.now();
     await seedHolding(
       "job_ceiling",
@@ -293,8 +294,10 @@ describe("cloudlease sweep in miniflare", () => {
 
     const report = await sweep();
 
-    expect(report.ownersAsked).toBe(0);
+    // the owner is asked only whether it was already releasing the droplet, which it was not
+    expect(report.ownersAsked).toBe(1);
     expect(outcomes(report)).toEqual([["601", "pastCeiling", "gone"]]);
+    expect(report.deletes[0]?.ownerReleasing).toBe(false);
   });
 
   it("asks the owner about a droplet whose ceiling tag is malformed", async () => {

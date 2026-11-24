@@ -425,6 +425,79 @@ fn the_sweep_deletes_orphans_expired_and_past_ceiling_resources_but_keeps_live_o
 }
 
 #[test]
+fn only_resources_their_owner_is_not_already_releasing_are_marked_as_orphans() {
+    let now = at(1_120_000);
+    // generation 1 expired and is releasing; generation 2 is live
+    let releasing = half_created().expire(now).unwrap();
+    let live_lease = Lease::start(lease_id(), &policy(), at(1_110_000), None).unwrap();
+    let live = Holding::<Kind>::leased(owner(), generation(2), live_lease);
+    let mut outlived = observed("job_1", 2, Kind::Machine, "111");
+    outlived.tags.ceiling = CeilingTag::At(Ceiling::at_or_before(at(1_000_000)));
+    let mut ghost_past_ceiling = observed("ghost", 2, Kind::Machine, "202");
+    ghost_past_ceiling.tags.ceiling = CeilingTag::At(Ceiling::at_or_before(at(1_000_000)));
+    let inventory = Inventory {
+        managed: vec![
+            observed("job_1", 1, Kind::Machine, "101"),
+            outlived.clone(),
+            observed("job_1", 3, Kind::Machine, "131"),
+            observed("ghost", 1, Kind::Machine, "201"),
+            ghost_past_ceiling,
+        ],
+        unrecognized: Vec::new(),
+    };
+
+    let plan = plan(&inventory, &[], now);
+    // the owner is asked about the generation past its ceiling, but not to keep it
+    let query = &plan.owners[&owner()];
+    assert_eq!(
+        query.generations,
+        BTreeSet::from([generation(1), generation(2), generation(3)])
+    );
+    assert!(!query.resources.contains(&outlived));
+
+    let answer_job = answer([&releasing, &live], query, now);
+    assert_eq!(answer_job.releasing, BTreeSet::from([generation(1)]));
+    assert_eq!(
+        answer_job.busy,
+        BTreeSet::from([generation(1), generation(2)])
+    );
+    let replies = BTreeMap::from([
+        (owner(), OwnerReply::Answered(answer_job)),
+        (OwnerId::parse("ghost").unwrap(), OwnerReply::Failed),
+    ]);
+
+    let marks: Vec<_> = doom(&plan, &replies)
+        .iter()
+        .map(|doomed| {
+            (
+                doomed.resource.id.as_str().to_owned(),
+                doomed.reason,
+                doomed.owner_releasing,
+            )
+        })
+        .collect();
+    assert_eq!(
+        marks,
+        vec![
+            // a live lease its owner failed to end at the ceiling is not the owner's cleanup
+            ("111".to_owned(), DoomReason::PastCeiling, false),
+            // the failed owner keeps 201 this round, but its past-ceiling resource still goes
+            ("202".to_owned(), DoomReason::PastCeiling, false),
+            ("101".to_owned(), DoomReason::Unclaimed, true),
+            ("131".to_owned(), DoomReason::Unclaimed, false),
+        ]
+    );
+
+    // an answer from an owner that predates the field reads as releasing nothing
+    let old: OwnerAnswer = serde_json::from_value(serde_json::json!({
+        "claimed": ["101"],
+        "busy": [1],
+    }))
+    .unwrap();
+    assert!(old.releasing.is_empty());
+}
+
+#[test]
 fn suspect_permits_are_released_only_with_a_complete_inventory_and_an_idle_owner() {
     let suspect = |owner: &str, generation_value: u64| Permit {
         permit_id: PermitId::parse(format!("cap_{owner}")).unwrap(),
@@ -458,6 +531,7 @@ fn suspect_permits_are_released_only_with_a_complete_inventory_and_an_idle_owner
             OwnerReply::Answered(OwnerAnswer {
                 claimed: BTreeSet::new(),
                 busy: BTreeSet::from([generation(1)]),
+                releasing: BTreeSet::new(),
             }),
         ),
         (OwnerId::parse("down").unwrap(), OwnerReply::Failed),

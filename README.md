@@ -36,7 +36,11 @@ The app declares its own Durable Object classes and wraps the handlers in
   which ones a live lease of the same generation claims. Anything not claimed is deleted.
   An owner object with no record of the resource claims nothing. An owner whose call
   fails or times out is not counted as claiming nothing, so it keeps its resources until
-  the next sweep. A resource past its `until` ceiling tag is deleted without asking.
+  the next sweep. A resource past its `until` ceiling tag is deleted whatever its owner
+  answers.
+- Each owner also says which of the asked generations it is already releasing. A sweep
+  delete of such a generation is the owner's own cleanup racing the sweep; every other
+  delete is reported with `ownerReleasing: false`, which apps use to alert on orphans.
 - **Capacity permits** count against a global limit until the owner proves its resources
   absent. A permit takes one unit by default; a gate that caps spend weighs each permit by
   its price, such as cents per hour. A suspect permit is released only by a sweep whose
