@@ -23,17 +23,19 @@
     // every resource this Worker creates or sweeps carries tags with this prefix; no other
     // cloudlease app may use it
     "CLOUDLEASE_TAG_PREFIX": "clm",
-    // the most the machines not yet confirmed gone may cost per hour, in US cents: 40 lets
-    // one s2.c2.large run and no second phoenixNAP server
-    "HOURLY_SPEND_CAP_CENTS": "40",
+    // the most the machines not yet confirmed gone may cost per hour, in US cents: 125 lets
+    // one m4.metal.medium run for the Latitude.sh test; after it, 41 fits one
+    // s2.c2.large with its IP block
+    "HOURLY_SPEND_CAP_CENTS": "125",
     "MACHINES_CONFIG": {
       // where machines renew: the deployed Worker on the Avencera account
       "api_base": "https://cloudlease-machines.avencera.workers.dev",
-      // limits of the first live phoenixNAP test: one machine per run, and $0.40 is one
-      // started hour of s2.c2.large; raise them for a real pool, such as afv
+      // limits of the live provider tests: one machine per run, and $1.25 is one hour of
+      // Latitude.sh m4.metal.medium (after it, 0.41 fits one hour of pnap-s2-large); raise
+      // them for a real pool
       "max_run_hours": 1,
       "max_machines_per_run": 1,
-      "run_spend_cap_usd": "0.40",
+      "run_spend_cap_usd": "1.25",
       // a machine renews every 30 seconds; a run keeps the windows it was created with
       "heartbeat_ttl_secs": 180,
       // the boot grace of DigitalOcean classes; a phoenixNAP class waits 20 minutes, a
@@ -61,7 +63,8 @@
           "os": "ubuntu/jammy",
           // the account key cloudlease-pnap; its private half is ~/.ssh/cloudlease-pnap on code
           "ssh_key_ids": ["6b060c5309b1f2cb75cb85f3"],
-          "price_per_hour_usd": "0.40",
+          // $0.40 for the server and $0.007 for its /31 IP block, both billed per started hour
+          "price_per_hour_usd": "0.407",
           "max_hours": 1
         },
         // the same E-2388G with 64 GB and one NVMe disk, the fallback when s2.c2.large has no stock
@@ -72,25 +75,25 @@
           "os": "ubuntu/jammy",
           // the account key cloudlease-pnap; its private half is ~/.ssh/cloudlease-pnap on code
           "ssh_key_ids": ["6b060c5309b1f2cb75cb85f3"],
-          "price_per_hour_usd": "0.31",
+          // $0.31 for the server and $0.007 for its /31 IP block
+          "price_per_hour_usd": "0.317",
           "max_hours": 1
-        }
+        },
         // a Latitude.sh class needs LATITUDE_API_KEY and LATITUDE_PROJECT; check the plan's
         // hourly price and per-site stock with GET /plans?filter[slug]=m4-metal-medium first.
         // On 2026-11-24 m4.metal.medium (EPYC 9124, 16 cores, 128 GB) cost $1.25 an hour
         // with one in stock at each of DAL, CHI, MIA2 and SJC2. One hour of it needs
         // HOURLY_SPEND_CAP_CENTS of at least 125 and a run spend cap of at least $1.25
-        // ,
-        // "lat-m4-medium": {
-        //   "provider": "latitude",
-        //   "plan": "m4-metal-medium",
-        //   "sites": ["DAL", "CHI", "SJC2"],
-        //   "operating_system": "ubuntu_24_04_x64_lts",
-        //   "price_per_hour_usd": "1.25",
-        //   "max_hours": 1
-        // }
+        "lat-m4-medium": {
+          "provider": "latitude",
+          "plan": "m4-metal-medium",
+          "sites": ["DAL", "CHI", "SJC2"],
+          "operating_system": "ubuntu_24_04_x64_lts",
+          "price_per_hour_usd": "1.25",
+          "max_hours": 1
+        }
       },
-      "apps": { "homebased": { "classes": ["do-s1-1g", "pnap-s2-large", "pnap-s2-small"] } }
+      "apps": { "homebased": { "classes": ["do-s1-1g", "pnap-s2-large", "pnap-s2-small", "lat-m4-medium"] } }
     }
   }
 }
