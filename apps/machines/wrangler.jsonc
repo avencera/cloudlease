@@ -22,15 +22,17 @@
     // every resource this Worker creates or sweeps carries tags with this prefix; no other
     // cloudlease app may use it
     "CLOUDLEASE_TAG_PREFIX": "clm",
-    // the most the machines not yet confirmed gone may cost per hour, in US cents
-    "HOURLY_SPEND_CAP_CENTS": "100",
+    // the most the machines not yet confirmed gone may cost per hour, in US cents: 40 lets
+    // one s2.c2.large run and no second phoenixNAP server
+    "HOURLY_SPEND_CAP_CENTS": "40",
     "MACHINES_CONFIG": {
       // where machines renew: the deployed Worker on the Avencera account
       "api_base": "https://cloudlease-machines.avencera.workers.dev",
-      // pilot limits from the first live test; raise them for a real pool, such as afv
+      // limits of the first live phoenixNAP test: one machine per run, and $0.40 is one
+      // started hour of s2.c2.large; raise them for a real pool, such as afv
       "max_run_hours": 1,
-      "max_machines_per_run": 2,
-      "run_spend_cap_usd": "1.00",
+      "max_machines_per_run": 1,
+      "run_spend_cap_usd": "0.40",
       // a machine renews every 30 seconds; a run keeps the windows it was created with
       "heartbeat_ttl_secs": 180,
       // the boot grace of DigitalOcean classes; a phoenixNAP class waits 20 minutes, and any
@@ -47,23 +49,29 @@
           "image": "ubuntu-24-04-x64",
           "price_per_hour_usd": "0.00893",
           "max_hours": 1
+        },
+        // an E-2388G with 128 GB, billed every started hour; the locations are tried in
+        // order when one is out of stock. Stock changes daily: on 2026-11-24 s3.c3.medium
+        // ($0.47) had none anywhere, and s2.c2.large moved from SEA to NLD within hours
+        "pnap-s2-large": {
+          "provider": "phoenixnap",
+          "server_type": "s2.c2.large",
+          "locations": ["SEA", "NLD"],
+          "os": "ubuntu/jammy",
+          "price_per_hour_usd": "0.40",
+          "max_hours": 1
+        },
+        // the same E-2388G with 64 GB and one NVMe disk, the fallback when s2.c2.large has no stock
+        "pnap-s2-small": {
+          "provider": "phoenixnap",
+          "server_type": "s2.c2.small",
+          "locations": ["SEA", "NLD"],
+          "os": "ubuntu/jammy",
+          "price_per_hour_usd": "0.31",
+          "max_hours": 1
         }
-        // the deployed Worker has no phoenixNAP credentials yet, and /v1/health fails while a
-        // phoenixNAP class is configured without them; add this back with them
-        // ,
-        // // an E-2388G with 128 GB, billed every started hour; the locations are tried in
-        // // order when one is out of stock. Stock changes daily, and s3.c3.medium ($0.47) had
-        // // none anywhere on 2026-11-24
-        // "pnap-s2-large": {
-        //   "provider": "phoenixnap",
-        //   "server_type": "s2.c2.large",
-        //   "locations": ["SEA", "NLD"],
-        //   "os": "ubuntu/jammy",
-        //   "price_per_hour_usd": "0.40",
-        //   "max_hours": 24
-        // }
       },
-      "apps": { "homebased": { "classes": ["do-s1-1g"] } }
+      "apps": { "homebased": { "classes": ["do-s1-1g", "pnap-s2-large", "pnap-s2-small"] } }
     }
   }
 }
