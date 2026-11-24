@@ -77,9 +77,9 @@ it, with a core holding.
    its `until` tag, without asking any run object, then asks each run object which of the
    rest it claims and deletes those no live lease claims. A run object that does not answer
    within 5 seconds keeps its other resources until the next sweep. If one provider's list
-   fails, the sweep still deletes what the other listed but returns no hourly-gate permit
-   that pass, since a permit's resource may sit at the provider it could not see; if every
-   list fails, it deletes nothing that time.
+   fails, the sweep still deletes what the others listed but returns no hourly-gate permit
+   that pass, since a permit's resource may sit at the provider it could not see. Each
+   provider that fails to list keeps its own alert streak.
 4. **Spend caps.** See below.
 
 A machine is `released` only after the droplet, then the volume, or the server, are
@@ -151,8 +151,8 @@ the Worker log either way:
 - a sweep deleting a resource whose lease no run had already ended, which means it leaked
   (priority 3)
 - a run object failing to answer the sweep (priority 3), a provider the sweep cannot list
-  (priority 4), or the sweep failing outright (priority 4), on the third sweep in a row and
-  then hourly (the `Monitor` object counts the streaks)
+  (priority 4), or the sweep failing outright for another reason (priority 4), on the third
+  sweep in a row and then hourly (the `Monitor` object counts the streaks)
 
 No alert uses priority 5: the topic may be one a Superalert Mac app follows, which sounds its
 alarm for every priority 5 message.

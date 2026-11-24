@@ -348,12 +348,12 @@ where
         }
     }
 
-    /// Lists every configured provider, and fails only when none could be listed
+    /// Lists every configured provider, naming each one whose list fails instead of failing
     ///
-    /// A provider whose list fails is named in the inventory's `unlisted`, which makes it
-    /// incomplete: the sweep still deletes what the other providers listed, but returns no
-    /// permit, since its resource may sit at the provider that failed. Leases still end on
-    /// their run objects' alarms meanwhile.
+    /// A provider in the inventory's `unlisted` makes it incomplete: the sweep still deletes
+    /// what the other providers listed, but returns no permit, since its resource may sit at
+    /// the provider that failed. Each failing provider keeps its own alert streak, even when
+    /// every list fails. Leases still end on their run objects' alarms meanwhile.
     async fn inventory(&self) -> ProviderResult<Inventory<MachineKind>> {
         let mut inventory = Inventory {
             managed: Vec::new(),
@@ -361,21 +361,13 @@ where
             unlisted: Vec::new(),
         };
         let digitalocean = self.digitalocean.inventory().await;
-        let Some(phoenixnap) = &self.phoenixnap else {
+        add(&mut inventory, ProviderName::DigitalOcean, digitalocean);
+        if let Some(phoenixnap) = &self.phoenixnap {
             add(
                 &mut inventory,
-                ProviderName::DigitalOcean,
-                Ok(digitalocean?),
+                ProviderName::PhoenixNap,
+                phoenixnap.inventory().await,
             );
-            return Ok(inventory);
-        };
-
-        match (digitalocean, phoenixnap.inventory().await) {
-            (Err(error), Err(_)) => return Err(error),
-            (digitalocean, phoenixnap) => {
-                add(&mut inventory, ProviderName::DigitalOcean, digitalocean);
-                add(&mut inventory, ProviderName::PhoenixNap, phoenixnap);
-            }
         }
 
         Ok(inventory)

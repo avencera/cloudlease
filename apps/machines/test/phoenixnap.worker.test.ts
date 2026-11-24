@@ -190,23 +190,31 @@ describe("phoenixNAP machines in miniflare", () => {
     expect(ntfy.titles()).toEqual(["cloudlease: sweep deleted 2 orphaned resources"]);
   });
 
-  it("still sweeps DigitalOcean while phoenixNAP fails to list, and alerts on both failing", async () => {
+  it("still sweeps DigitalOcean while phoenixNAP fails to list, and alerts per provider", async () => {
     const past = Math.floor(Date.now() / 1000) - 10;
     digitalocean.addDroplet(7101, doTags("run_000000000000000000000000", 1, "droplet", past, "clm"));
     pnap.failLists = true;
 
     await scheduled();
-    await scheduled();
     expect(digitalocean.droplets.has(7101)).toBe(false);
     expect(ntfy.titles()).toEqual(["cloudlease: sweep deleted 1 orphaned resources"]);
+
+    // a sweep where DigitalOcean fails too still counts toward phoenixNAP's streak
+    digitalocean.failLists = true;
     await scheduled();
-    expect(ntfy.titles()).toContain("cloudlease: the sweep cannot list phoenixnap");
+    digitalocean.failLists = false;
+    await scheduled();
+    expect(ntfy.titles()).toEqual([
+      "cloudlease: sweep deleted 1 orphaned resources",
+      "cloudlease: the sweep cannot list phoenixnap",
+    ]);
 
     digitalocean.failLists = true;
     for (let sweep = 0; sweep < 3; sweep += 1) {
       await scheduled();
     }
-    expect(ntfy.titles()).toContain("cloudlease: the machines sweep keeps failing");
+    expect(ntfy.titles()).toContain("cloudlease: the sweep cannot list digitalocean");
+    expect(ntfy.titles()).not.toContain("cloudlease: the machines sweep keeps failing");
     // each failed list retries with backoff, so six sweeps take about 15 seconds
   }, 60_000);
 
