@@ -1,11 +1,16 @@
-//! Prices, accrued spend and when a run reaches its cap
+//! Prices, billing, accrued spend and when a run reaches its cap
 //!
-//! DigitalOcean bills droplets per second with a minimum of 60 seconds or $0.01, whichever
-//! is higher, and volumes hourly (docs.digitalocean.com droplet and volume pricing pages,
-//! checked 2026-11-24). A class's price is its droplet and volume together per hour, and
-//! spend is billed per millisecond from the lease's creation until its resources are
-//! confirmed gone, with the same minimum. That counts from before the provider create until after the delete, so it never
-//! undercounts what DigitalOcean bills.
+//! A class's price is per hour, and its [`Billing`] says how its provider rounds a machine's
+//! life: every started increment is billed in full, with a minimum.
+//!
+//! - DigitalOcean bills droplets per second with a minimum of 60 seconds or $0.01, whichever
+//!   is higher, and volumes hourly (docs.digitalocean.com droplet and volume pricing pages,
+//!   checked 2026-11-24).
+//! - phoenixNAP bills every started hour in full, with a minimum of one hour, from deploy until
+//!   the server is deleted (phoenixNAP billing knowledge base, checked 2026-11-24).
+//!
+//! Spend counts from the lease's creation, before the provider create, until its resources
+//! are confirmed gone, so it never undercounts what the provider bills.
 
 use std::{fmt, time::Duration};
 
@@ -13,15 +18,13 @@ use cloudlease_core::{capacity::PermitUnits, time::UnixMillis};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The shortest billed lifetime of a droplet
-pub const MINIMUM_BILLED: Duration = Duration::from_secs(60);
-
-/// The least DigitalOcean charges for a droplet, whatever its price and life
-pub const MINIMUM_CHARGE: MicroUsd = MicroUsd(MICROS_PER_CENT);
-
 const MICROS_PER_DOLLAR: u64 = 1_000_000;
 const MICROS_PER_CENT: u64 = 10_000;
 const MILLIS_PER_HOUR: u128 = 3_600_000;
+const SECS_PER_HOUR: u64 = 3_600;
+
+/// The longest billing increment a class may set
+pub const MAX_BILLING_INCREMENT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// A rejected amount
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -32,6 +35,9 @@ pub enum MoneyError {
     /// The hourly price is too large to weigh a capacity permit
     #[error("an hourly price above $655.35 cannot weigh a capacity permit")]
     TooLarge,
+    /// A billing increment finer than the provider's, not whole seconds, or over a day
+    #[error("the billing increment must be whole seconds, at least {0} and at most 86400")]
+    Increment(u64),
 }
 
 /// An amount in millionths of a US dollar
@@ -118,30 +124,113 @@ impl fmt::Display for MicroUsd {
     }
 }
 
-/// What a resource at `price_per_hour` costs from `from` to `to`: at least
-/// [`MINIMUM_BILLED`] of its time, and at least [`MINIMUM_CHARGE`]
-#[must_use]
-pub fn billed(price_per_hour: MicroUsd, from: UnixMillis, to: UnixMillis) -> MicroUsd {
-    let elapsed = to.as_millis().saturating_sub(from.as_millis());
-    let minimum = u64::try_from(MINIMUM_BILLED.as_millis()).unwrap_or(u64::MAX);
-    let billed_millis = u128::from(elapsed.max(minimum));
-    let micros = (u128::from(price_per_hour.0) * billed_millis).div_ceil(MILLIS_PER_HOUR);
-
-    MicroUsd(u64::try_from(micros).unwrap_or(u64::MAX)).max(MINIMUM_CHARGE)
+/// How a provider turns a machine's life into billed time
+///
+/// Every started increment is billed in full, so a machine is billed from the first instant
+/// of each increment; the billed time is at least the minimum, and the charge at least the
+/// minimum charge. The minimum is always a whole number of increments.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Billing {
+    increment_secs: u64,
+    minimum_secs: u64,
+    minimum_charge: MicroUsd,
 }
 
-/// How long a machine at `price_per_hour` lives before its bill grows past the minimum
-#[must_use]
-pub fn minimum_life(price_per_hour: MicroUsd) -> Duration {
-    if price_per_hour == MicroUsd::ZERO {
-        return MINIMUM_BILLED;
+impl Billing {
+    /// DigitalOcean: per second, at least 60 seconds and $0.01
+    pub const DIGITALOCEAN: Self = Self {
+        increment_secs: 1,
+        minimum_secs: 60,
+        minimum_charge: MicroUsd(MICROS_PER_CENT),
+    };
+
+    /// phoenixNAP: every started hour, at least one hour
+    pub const PHOENIXNAP: Self = Self {
+        increment_secs: SECS_PER_HOUR,
+        minimum_secs: SECS_PER_HOUR,
+        minimum_charge: MicroUsd::ZERO,
+    };
+
+    /// Bills in a coarser increment than the provider's, such as a class priced by the hour
+    ///
+    /// The increment is whole seconds, at least the provider's and at most
+    /// [`MAX_BILLING_INCREMENT`]; a finer one would undercount. The minimum is rounded up to
+    /// a whole number of the new increments.
+    pub fn with_increment(self, increment: Duration) -> Result<Self, MoneyError> {
+        let secs = increment.as_secs();
+        let whole = increment.subsec_nanos() == 0;
+        if !whole || secs < self.increment_secs || increment > MAX_BILLING_INCREMENT {
+            return Err(MoneyError::Increment(self.increment_secs));
+        }
+
+        Ok(Self {
+            increment_secs: secs,
+            minimum_secs: self.minimum_secs.div_ceil(secs) * secs,
+            ..self
+        })
     }
 
-    let charge_millis =
-        (u128::from(MINIMUM_CHARGE.0) * MILLIS_PER_HOUR).div_ceil(u128::from(price_per_hour.0));
-    let charge = Duration::from_millis(u64::try_from(charge_millis).unwrap_or(u64::MAX));
+    /// The length of one billed increment
+    #[must_use]
+    pub const fn increment(self) -> Duration {
+        Duration::from_secs(self.increment_secs)
+    }
 
-    charge.max(MINIMUM_BILLED)
+    const fn increment_millis(self) -> u64 {
+        self.increment_secs * 1_000
+    }
+
+    /// What a resource at `price_per_hour` costs from `from` to `to`
+    #[must_use]
+    pub fn billed(self, price_per_hour: MicroUsd, from: UnixMillis, to: UnixMillis) -> MicroUsd {
+        let elapsed = to.as_millis().saturating_sub(from.as_millis());
+        let increment = self.increment_millis();
+        let started = elapsed / increment + 1;
+        let billed_millis = (started.saturating_mul(increment)).max(self.minimum_secs * 1_000);
+        let micros =
+            (u128::from(price_per_hour.0) * u128::from(billed_millis)).div_ceil(MILLIS_PER_HOUR);
+
+        MicroUsd(u64::try_from(micros).unwrap_or(u64::MAX)).max(self.minimum_charge)
+    }
+
+    /// What a machine at `price_per_hour` costs however short its life
+    #[must_use]
+    pub fn minimum(self, price_per_hour: MicroUsd) -> MicroUsd {
+        let now = UnixMillis::new(0).unwrap_or_else(|| unreachable!("zero is a valid time"));
+        self.billed(price_per_hour, now, now)
+    }
+
+    /// How long after creation a machine's bill first grows past its minimum, or earlier
+    ///
+    /// It is never later than the real moment, so a spend check armed for it is never late.
+    #[must_use]
+    pub fn accrues_after(self, price_per_hour: MicroUsd) -> Duration {
+        let minimum = Duration::from_secs(self.minimum_secs);
+        if price_per_hour == MicroUsd::ZERO {
+            return minimum;
+        }
+
+        // the bill reaches the minimum charge at this time; it grows at the start of the
+        // increment that passes it, which is no earlier than the increment it falls in
+        let charge_millis =
+            u128::from(self.minimum_charge.0) * MILLIS_PER_HOUR / u128::from(price_per_hour.0);
+        let increment = u128::from(self.increment_millis());
+        let charge_millis = charge_millis / increment * increment;
+        let charge = Duration::from_millis(u64::try_from(charge_millis).unwrap_or(u64::MAX));
+
+        charge.max(minimum)
+    }
+
+    /// Returns when the increment after the one running at `now` starts, for a machine
+    /// created at `from`
+    #[must_use]
+    pub fn next_increment(self, from: UnixMillis, now: UnixMillis) -> UnixMillis {
+        let elapsed = now.as_millis().saturating_sub(from.as_millis());
+        let increment = self.increment_millis();
+        let started = elapsed / increment + 1;
+
+        from.saturating_add(Duration::from_millis(started.saturating_mul(increment)))
+    }
 }
 
 /// One machine's billed life: from its lease's creation until its resources are gone
@@ -158,29 +247,40 @@ pub struct BilledLife {
 pub struct Spend {
     /// What the run's machines have cost so far
     pub accrued: MicroUsd,
-    /// What the run's live machines past their minimum add per hour
+    /// What the run's live machines past their minimum add per hour, on average
     pub per_hour: MicroUsd,
     /// When the first live machine still inside its minimum starts to add to the spend
     pub next_accrual: Option<UnixMillis>,
+    /// When the next increment of a live machine past its minimum starts, the earliest the
+    /// spend can grow
+    pub next_increment: Option<UnixMillis>,
+    /// The billing increment
+    pub increment: Duration,
 }
 
 impl Spend {
-    /// Adds up the machines of a run whose class costs `price_per_hour`
+    /// Adds up the machines of a run whose class costs `price_per_hour` under `billing`
     #[must_use]
     pub fn of(
+        billing: Billing,
         price_per_hour: MicroUsd,
         machines: impl IntoIterator<Item = BilledLife>,
         now: UnixMillis,
     ) -> Self {
-        let minimum = minimum_life(price_per_hour);
+        let accrues_after = billing.accrues_after(price_per_hour);
+        let earliest = |current: Option<UnixMillis>, at: UnixMillis| {
+            Some(current.map_or(at, |current| current.min(at)))
+        };
         let empty = Self {
             accrued: MicroUsd::ZERO,
             per_hour: MicroUsd::ZERO,
             next_accrual: None,
+            next_increment: None,
+            increment: billing.increment(),
         };
 
         machines.into_iter().fold(empty, |spend, machine| {
-            let accrued = spend.accrued.saturating_add(billed(
+            let accrued = spend.accrued.saturating_add(billing.billed(
                 price_per_hour,
                 machine.from,
                 machine.gone_at.unwrap_or(now),
@@ -189,22 +289,22 @@ impl Spend {
                 return Self { accrued, ..spend };
             }
 
-            let accrues_from = machine.from.saturating_add(minimum);
+            let accrues_from = machine.from.saturating_add(accrues_after);
             if accrues_from <= now {
                 return Self {
                     accrued,
                     per_hour: spend.per_hour.saturating_add(price_per_hour),
+                    next_increment: earliest(
+                        spend.next_increment,
+                        billing.next_increment(machine.from, now),
+                    ),
                     ..spend
                 };
             }
 
             Self {
                 accrued,
-                next_accrual: Some(
-                    spend
-                        .next_accrual
-                        .map_or(accrues_from, |next| next.min(accrues_from)),
-                ),
+                next_accrual: earliest(spend.next_accrual, accrues_from),
                 ..spend
             }
         })
@@ -219,10 +319,13 @@ impl Spend {
     /// Returns when the spend must next be checked against `cap`, or `None` when nothing
     /// is accruing or will
     ///
-    /// That is the earlier of when the machines past their minimum reach the cap, and when
-    /// the next machine inside its minimum starts to accrue, so it is never later than the
-    /// real crossing. Machines inside their minimum add nothing until then, so they cannot
-    /// pull the check ever closer while the spend stays flat.
+    /// The spend grows only when an increment starts, by the price of each machine whose
+    /// increment it is, so it can cross the cap no earlier than the next increment, and no
+    /// earlier than one increment before the hourly rate would cross it. The check is the
+    /// later of those two, or when the next machine inside its minimum starts to accrue if
+    /// that is sooner, so it is never later than the real crossing. Machines inside their
+    /// minimum add nothing until then, so they cannot pull the check ever closer while the
+    /// spend stays flat, and with hourly increments the run object wakes about once an hour.
     #[must_use]
     pub fn reaches_cap_at(&self, cap: MicroUsd, now: UnixMillis) -> Option<UnixMillis> {
         if self.has_reached(cap) {
@@ -232,9 +335,10 @@ impl Spend {
         let crossing = (self.per_hour != MicroUsd::ZERO).then(|| {
             let left = u128::from(cap.0 - self.accrued.0);
             let millis = (left * MILLIS_PER_HOUR).div_ceil(u128::from(self.per_hour.0));
-            now.saturating_add(Duration::from_millis(
-                u64::try_from(millis).unwrap_or(u64::MAX),
-            ))
+            let millis = u64::try_from(millis).unwrap_or(u64::MAX);
+            let increment = u64::try_from(self.increment.as_millis()).unwrap_or(u64::MAX);
+            let early = now.saturating_add(Duration::from_millis(millis.saturating_sub(increment)));
+            self.next_increment.map_or(early, |next| next.max(early))
         });
 
         match (crossing, self.next_accrual) {
@@ -250,7 +354,11 @@ mod tests {
 
     use std::time::Duration;
 
-    use super::{BilledLife, MicroUsd, MoneyError, Spend, billed, minimum_life};
+    use super::{BilledLife, Billing, MicroUsd, MoneyError, Spend};
+
+    const DO: Billing = Billing::DIGITALOCEAN;
+    const PNAP: Billing = Billing::PHOENIXNAP;
+    const HOUR: u64 = 3_600_000;
 
     fn at(millis: u64) -> UnixMillis {
         UnixMillis::new(millis).unwrap()
@@ -258,6 +366,13 @@ mod tests {
 
     fn dollars(value: &str) -> MicroUsd {
         MicroUsd::parse_dollars(value).unwrap()
+    }
+
+    fn live(from: u64) -> BilledLife {
+        BilledLife {
+            from: at(from),
+            gone_at: None,
+        }
     }
 
     #[test]
@@ -280,16 +395,54 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_is_billed_from_creation_to_gone_with_a_minute_and_cent_minimum() {
+    fn digitalocean_bills_every_started_second_with_a_minute_and_cent_minimum() {
         let price = dollars("36"); // a cent a second
-        assert_eq!(billed(price, at(0), at(1_000)), dollars("0.60"));
-        assert_eq!(billed(price, at(0), at(90_000)), dollars("0.90"));
-        assert_eq!(billed(price, at(5_000), at(0)), dollars("0.60"));
+        assert_eq!(DO.billed(price, at(0), at(1_000)), dollars("0.60"));
+        assert_eq!(DO.billed(price, at(0), at(89_500)), dollars("0.90"));
+        // the 91st second has started
+        assert_eq!(DO.billed(price, at(0), at(90_000)), dollars("0.91"));
+        assert_eq!(DO.billed(price, at(5_000), at(0)), dollars("0.60"));
 
         // a minute of a $0.125/h droplet is about $0.002, but DigitalOcean charges a cent
         let cheap = dollars("0.125");
-        assert_eq!(billed(cheap, at(0), at(60_000)), dollars("0.01"));
-        assert_eq!(billed(cheap, at(0), at(3_600_000)), dollars("0.125"));
+        assert_eq!(DO.billed(cheap, at(0), at(59_000)), dollars("0.01"));
+        assert_eq!(DO.billed(cheap, at(0), at(HOUR - 1)), dollars("0.125"));
+        assert_eq!(DO.minimum(cheap), dollars("0.01"));
+    }
+
+    #[test]
+    fn phoenixnap_bills_every_started_hour_in_full() {
+        let price = dollars("0.47");
+        // a server deleted after 5 minutes costs a whole hour
+        assert_eq!(PNAP.billed(price, at(0), at(5 * 60_000)), price);
+        assert_eq!(PNAP.billed(price, at(0), at(HOUR - 1)), price);
+        assert_eq!(PNAP.billed(price, at(0), at(HOUR)), dollars("0.94"));
+        assert_eq!(PNAP.billed(price, at(0), at(61 * 60_000)), dollars("0.94"));
+        assert_eq!(PNAP.minimum(price), price);
+        assert_eq!(PNAP.accrues_after(price), Duration::from_secs(3_600));
+        assert_eq!(PNAP.next_increment(at(0), at(61 * 60_000)), at(2 * HOUR));
+    }
+
+    #[test]
+    fn a_class_may_bill_coarser_but_never_finer_than_its_provider() {
+        let hourly = DO.with_increment(Duration::from_secs(3_600)).unwrap();
+        // the minute minimum becomes a whole hour
+        assert_eq!(hourly.billed(dollars("1"), at(0), at(1_000)), dollars("1"));
+        let minutes = DO.with_increment(Duration::from_secs(90)).unwrap();
+        assert_eq!(
+            minutes.billed(dollars("36"), at(0), at(1_000)),
+            dollars("0.90")
+        );
+
+        assert_eq!(
+            PNAP.with_increment(Duration::from_secs(60)),
+            Err(MoneyError::Increment(3_600))
+        );
+        assert!(DO.with_increment(Duration::from_millis(1_500)).is_err());
+        assert!(
+            DO.with_increment(Duration::from_secs(2 * 24 * 3_600))
+                .is_err()
+        );
     }
 
     #[test]
@@ -297,33 +450,36 @@ mod tests {
         let price = dollars("36");
         let cap = dollars("3");
         let machines = [
-            // gone after 100 s: $1.00, adds nothing per hour
+            // gone after 100 s: 101 started seconds, $1.01, adds nothing per hour
             BilledLife {
                 from: at(0),
                 gone_at: Some(at(100_000)),
             },
             // live for 50 s: still at its $0.60 minimum
-            BilledLife {
-                from: at(150_000),
-                gone_at: None,
-            },
+            live(150_000),
         ];
 
-        let spend = Spend::of(price, machines, at(200_000));
-        assert_eq!(spend.accrued, dollars("1.60"));
+        let spend = Spend::of(DO, price, machines, at(200_000));
+        assert_eq!(spend.accrued, dollars("1.61"));
         assert!(!spend.has_reached(cap));
         // the live machine adds nothing until its minute is up, so that is the next check
         assert_eq!(spend.per_hour, MicroUsd::ZERO);
         assert_eq!(spend.reaches_cap_at(cap, at(200_000)), Some(at(210_000)));
 
-        // from then it accrues a cent a second, and the remaining $1.40 takes 140 s
-        let accruing = Spend::of(price, machines, at(210_000));
+        // from then it accrues a cent a second; the remaining $1.38 takes 138 s at the rate,
+        // and the check comes one increment early, since a started second bills at once
+        let accruing = Spend::of(DO, price, machines, at(210_000));
         assert_eq!(accruing.per_hour, price);
-        let projected = accruing.reaches_cap_at(cap, at(210_000)).unwrap();
-        assert_eq!(projected, at(350_000));
-        assert!(Spend::of(price, machines, projected).has_reached(cap));
+        let early = accruing.reaches_cap_at(cap, at(210_000)).unwrap();
+        assert_eq!(early, at(347_000));
+        assert!(!Spend::of(DO, price, machines, early).has_reached(cap));
+        let last = Spend::of(DO, price, machines, early)
+            .reaches_cap_at(cap, early)
+            .unwrap();
+        assert_eq!(last, at(348_000));
+        assert!(Spend::of(DO, price, machines, last).has_reached(cap));
 
-        let idle = Spend::of(price, [machines[0]], at(200_000));
+        let idle = Spend::of(DO, price, [machines[0]], at(200_000));
         assert_eq!(idle.reaches_cap_at(cap, at(200_000)), None);
         assert_eq!(
             idle.reaches_cap_at(dollars("1"), at(200_000)),
@@ -335,28 +491,46 @@ mod tests {
     fn a_spend_left_just_under_the_cap_is_checked_when_it_next_grows() {
         // a cent buys 288 s of a $0.125/h machine, longer than the 60 s minimum
         let price = dollars("0.125");
-        assert_eq!(minimum_life(price), Duration::from_secs(288));
+        assert_eq!(DO.accrues_after(price), Duration::from_secs(288));
+        assert_eq!(DO.billed(price, at(0), at(287_999)), dollars("0.01"));
+        assert!(DO.billed(price, at(0), at(288_000)) > dollars("0.01"));
 
         let machines = [
-            // released after 575.9 s: $0.019997
+            // released after 574.9 s, 575 started seconds: $0.019966
             BilledLife {
                 from: at(0),
-                gone_at: Some(at(575_900)),
+                gone_at: Some(at(574_900)),
             },
             // still inside its one cent minimum
-            BilledLife {
-                from: at(600_000),
-                gone_at: None,
-            },
+            live(600_000),
         ];
-        let spend = Spend::of(price, machines, at(601_000));
-        assert_eq!(spend.accrued, MicroUsd::new(29_997));
+        let spend = Spend::of(DO, price, machines, at(601_000));
+        assert_eq!(spend.accrued, MicroUsd::new(29_966));
 
-        // 3 millionths short of a 3 cent cap, the next check is when the live machine starts
-        // to accrue, not a few milliseconds away again and again
+        // a few millionths short of a 3 cent cap, the next check is when the live machine
+        // starts to accrue, not a few milliseconds away again and again
         assert_eq!(
             spend.reaches_cap_at(dollars("0.03"), at(601_000)),
             Some(at(888_000))
         );
+    }
+
+    #[test]
+    fn an_hourly_run_is_checked_at_the_hour_its_spend_steps_up() {
+        let price = dollars("0.47");
+        let cap = dollars("1.00");
+        let machines = [live(0)];
+
+        // inside its first hour the server has cost $0.47 and will cost no more until 1 h
+        let first = Spend::of(PNAP, price, machines, at(5 * 60_000));
+        assert_eq!(first.accrued, price);
+        assert_eq!(first.reaches_cap_at(cap, at(5 * 60_000)), Some(at(HOUR)));
+
+        // the second hour bills $0.94 at once; the $1.41 third hour starts at 2 h, which is
+        // when the check is, not every few minutes along the hourly rate
+        let second = Spend::of(PNAP, price, machines, at(HOUR));
+        assert_eq!(second.accrued, dollars("0.94"));
+        assert_eq!(second.reaches_cap_at(cap, at(HOUR)), Some(at(2 * HOUR)));
+        assert!(Spend::of(PNAP, price, machines, at(2 * HOUR)).has_reached(cap));
     }
 }

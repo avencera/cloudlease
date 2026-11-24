@@ -7,7 +7,7 @@
     "build:worker": "worker-build tests/worker --release",
     "test:worker": "pnpm run build:worker && vitest run --config vitest.worker.config.ts",
     "build:machines": "worker-build apps/machines --release",
-    "test:machines": "pnpm run build:machines && vitest run --config vitest.machines.config.ts",
+    "test:machines": "pnpm run build:machines && vitest run --config vitest.machines.config.ts && vitest run --config vitest.machines-bare.config.ts",
     "typecheck": "tsc --project tests/worker/tsconfig.json --noEmit && tsc --project apps/machines/tsconfig.json --noEmit"
   },
   "devDependencies": {

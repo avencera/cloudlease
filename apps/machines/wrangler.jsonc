@@ -16,8 +16,8 @@
     "crons": ["*/5 * * * *"]
   },
   "observability": { "enabled": true },
-  // secrets, set with `wrangler secret put`: DIGITALOCEAN_TOKEN, CLIENT_TOKENS, NTFY_URL and
-  // optionally NTFY_TOKEN
+  // secrets, set with `wrangler secret put`: DIGITALOCEAN_TOKEN, CLIENT_TOKENS, NTFY_URL,
+  // optionally NTFY_TOKEN, and PNAP_CLIENT_ID with PNAP_CLIENT_SECRET for phoenixNAP classes
   "vars": {
     // every resource this Worker creates or sweeps carries tags with this prefix; no other
     // cloudlease app may use it
@@ -32,9 +32,11 @@
       "run_spend_cap_usd": "25.00",
       // a machine renews every 30 seconds; a run keeps the windows it was created with
       "heartbeat_ttl_secs": 180,
+      // the boot grace of DigitalOcean classes; a phoenixNAP class waits 20 minutes, and any
+      // class may set its own boot_grace_secs
       "boot_grace_secs": 480,
-      // prices are DigitalOcean list prices per hour; check them with
-      // `doctl compute size list` before deploying
+      // prices are list prices per hour; check DigitalOcean's with `doctl compute size list`
+      // and phoenixNAP's with its product availability API before deploying
       "classes": {
         "do-c4": {
           "region": "nyc3",
@@ -42,9 +44,20 @@
           "image": "ubuntu-24-04-x64",
           "price_per_hour_usd": "0.125",
           "max_hours": 24
+        },
+        // an E-2388G with 128 GB, billed every started hour; the locations are tried in
+        // order when one is out of stock. Stock changes daily, and s3.c3.medium ($0.47) had
+        // none anywhere on 2026-11-24
+        "pnap-s2-large": {
+          "provider": "phoenixnap",
+          "server_type": "s2.c2.large",
+          "locations": ["SEA", "NLD"],
+          "os": "ubuntu/jammy",
+          "price_per_hour_usd": "0.40",
+          "max_hours": 24
         }
       },
-      "apps": { "homebased": { "classes": ["do-c4"] } }
+      "apps": { "homebased": { "classes": ["do-c4", "pnap-s2-large"] } }
     }
   }
 }

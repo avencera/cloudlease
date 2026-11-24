@@ -12,7 +12,7 @@ existed, such as leftovers from a crashed create.
 | --- | --- | --- |
 | `cloudlease-core` | Lease, holding, tag, capacity and sweep rules. No I/O, no clock | any |
 | `cloudlease-provider` | The `CloudProvider` trait, the reaper, the sweep executor and the DigitalOcean, phoenixNAP and Latitude.sh adapters | any, given an HTTP transport |
-| `cloudlease-worker` | workers-rs glue: owner alarms, holding storage, the capacity gate and the sweep driver | Cloudflare Workers (`worker =0.8.5`) |
+| `cloudlease-worker` | workers-rs glue: owner alarms, holding storage, the capacity gate, the sweep driver, and building the DigitalOcean and phoenixNAP adapters from bindings | Cloudflare Workers (`worker =0.8.5`) |
 
 The app declares its own Durable Object classes and wraps the handlers in
 `cloudlease-worker`, so it keeps its own class names, bindings and settings.
@@ -22,7 +22,7 @@ The app declares its own Durable Object classes and wraps the handlers in
 
 | App | What it is |
 | --- | --- |
-| `apps/machines` (rules in `crates/cloudlease-machines`) | Temporary machines for client apps such as homebased: runs, leases renewed by the machine, spend caps and ntfy alerts. See its [README](apps/machines/README.md) |
+| `apps/machines` (rules in `crates/cloudlease-machines`) | Temporary DigitalOcean and phoenixNAP machines for client apps such as homebased: runs, leases renewed by the machine, a provider per machine class, spend caps and ntfy alerts. See its [README](apps/machines/README.md) |
 
 ## Lifetime rules
 
@@ -80,7 +80,8 @@ never reads it as a deadline or as the absence of one, and asks the owner instea
    through `capacity::CapacityClient`.
 3. A cron trigger that calls `sweep::run_sweep` with a `SweepConfig` naming the owner
    namespace and the capacity object.
-4. A provider built with `digitalocean::from_env`.
+4. A provider built with `digitalocean::from_env`, or `phoenixnap::from_env`, which returns
+   `None` when the Worker has no phoenixNAP credentials.
 
 ## Development
 
@@ -109,8 +110,9 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
 
 ## Not covered yet
 
-- A Worker on a provider other than DigitalOcean. The phoenixNAP and Latitude.sh adapters
-  are tested only against fake APIs in `crates/cloudlease-provider/tests/`
+- A Worker on Latitude.sh. Its adapter is tested only against a fake API in
+  `crates/cloudlease-provider/tests/`. The machines Worker runs phoenixNAP classes against
+  a fake phoenixNAP API in miniflare; no live phoenixNAP server has been created yet
 - Firewalls
 - Batch-job records and exit status. These belong to the app, which builds on holdings
   and the sweep report

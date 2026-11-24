@@ -1,6 +1,6 @@
 [package]
 name = "cloudlease-machines-worker"
-description = "The cloudlease machines Worker: temporary DigitalOcean machines whose lifetime Cloudflare enforces"
+description = "The cloudlease machines Worker: temporary DigitalOcean and phoenixNAP machines whose lifetime Cloudflare enforces"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

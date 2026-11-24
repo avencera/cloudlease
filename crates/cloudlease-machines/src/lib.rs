@@ -7,8 +7,9 @@
 //! holds everything that needs no Worker runtime:
 //!
 //! - [`alert`]: what the Worker alerts on, and how often
-//! - [`config`]: classes, prices, caps and the lease policy
-//! - [`money`]: prices, accrued spend and when a run reaches its cap
+//! - [`config`]: classes, providers, prices, caps and the lease policy
+//! - [`money`]: prices, billing, accrued spend and when a run reaches its cap
+//! - [`provider`]: the providers a class can name, behind one cloud provider
 //! - [`ids`]: run and lease identifiers that route themselves to their run object
 //! - [`token`]: client and lease tokens, stored only as hashes
 //! - [`boot`]: validating the client's boot data and rendering the droplet's user data
@@ -21,6 +22,7 @@ pub mod boot;
 pub mod config;
 pub mod ids;
 pub mod money;
+pub mod provider;
 pub mod run;
 pub mod time;
 pub mod token;

@@ -2,8 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use cloudlease_machines::alert::{Alert, Priority, SWEEP_KEY};
-use cloudlease_provider::digitalocean::DoKind;
+use cloudlease_machines::{
+    alert::{Alert, Priority, SWEEP_KEY},
+    provider::MachineKind,
+};
 use cloudlease_worker::{
     error::CloudleaseResult,
     http::call_json,
@@ -54,13 +56,13 @@ pub async fn run(env: &Env) {
     }
 }
 
-async fn sweep(env: &Env) -> CloudleaseResult<SweepReport<DoKind>> {
+async fn sweep(env: &Env) -> CloudleaseResult<SweepReport<MachineKind>> {
     let provider = provider(env)?;
 
     run_sweep(env, &provider, &WorkersRuntime, SWEEP, now()).await
 }
 
-fn log(report: &SweepReport<DoKind>) {
+fn log(report: &SweepReport<MachineKind>) {
     if report.is_clean() && report.unrecognized.is_empty() {
         return;
     }
@@ -70,7 +72,7 @@ fn log(report: &SweepReport<DoKind>) {
     }
 }
 
-async fn alert_orphans(env: &Env, deletes: &[SweepDelete<DoKind>]) {
+async fn alert_orphans(env: &Env, deletes: &[SweepDelete<MachineKind>]) {
     // a resource of a lease its owner already ended is routine cleanup; any other one leaked
     let orphans: Vec<String> = deletes
         .iter()
@@ -126,7 +128,7 @@ async fn record_failures(
     Ok(due.due)
 }
 
-fn failure_alert(key: &str, count: u32, report: Option<&SweepReport<DoKind>>) -> Alert {
+fn failure_alert(key: &str, count: u32, report: Option<&SweepReport<MachineKind>>) -> Alert {
     if key == SWEEP_KEY {
         return Alert {
             title: "cloudlease: the machines sweep keeps failing".to_owned(),

@@ -1,7 +1,8 @@
 # cloudlease machines
 
-A Cloudflare Worker that creates temporary DigitalOcean machines for a client app and
-deletes them when their lease ends. homebased uses it for batch pools: the client opens a
+A Cloudflare Worker that creates temporary machines on DigitalOcean or phoenixNAP Bare
+Metal Cloud for a client app and deletes them when their lease ends. Each machine class
+names its provider. homebased uses it for batch pools: the client opens a
 run, asks for machines in it, and each machine renews its own lease. Cloudflare enforces
 every machine's lifetime, so a client or agent that dies leaves nothing running.
 
@@ -22,7 +23,7 @@ app and sees only that app's runs; a lease token is written into its machine's
 | `GET /v1/leases/{lease_id}` | client, or the lease's token | `200` lease; `410` to the lease token once the lease ended |
 | `POST /v1/leases/{lease_id}/release` | client, or the lease's token | `202` lease, `200` if it had already ended |
 | `POST /v1/leases/{lease_id}/renew` | the lease's token only | `200` with the new heartbeat deadline; `410` once ended |
-| `GET /v1/health` | none | `200` or `503` with one boolean per setting |
+| `GET /v1/health` | none | `200` or `503` with one boolean per setting; `phoenixnap` is `null` when the Worker has no phoenixNAP credentials and no class needs them |
 
 Bodies:
 
@@ -37,9 +38,9 @@ Bodies:
 - lease release: `{"reason": "requested" | "idle" | "done"}`
 - renew: `{}`
 
-A lease is `provisioning` until its droplet exists or it first renews, then `running`,
-`releasing` once it ended, and `released` only after DigitalOcean confirms the droplet and
-volume gone. Its `release` says why (`requested`, `idle`, `done`, `heartbeat_lapsed`,
+A lease is `provisioning` until its droplet or server exists or it first renews, then
+`running`, `releasing` once it ended, and `released` only after the provider confirms every
+resource gone: the droplet and volume, or the server. Its `release` says why (`requested`, `idle`, `done`, `heartbeat_lapsed`,
 `hard_deadline`, `run_released`, `spend_cap`, `create_failed`) and who (`client`,
 `machine`, `cloudlease`). A run is `open` until its deadline or release, `releasing` while
 any machine is not yet released, then `released`.
@@ -62,33 +63,63 @@ it, with a core holding.
 
 1. **Hard deadline.** A lease ends at the earliest of the run's `deadline_at` and the class's
    `max_hours` from its create. The run object's alarm fires then and deletes the machine.
-   The deadline is also the droplet's `until` tag, so the sweep deletes it even if the run
+   The deadline is also the machine's `until` tag, so the sweep deletes it even if the run
    object is broken.
 2. **Heartbeat.** The machine must renew within the heartbeat window, 3 minutes by
-   default, and first within the boot grace, 8 minutes after create by default; homebased
-   renews every 30 seconds. A run keeps the windows the config had when the run was
-   created, so renews never read the config. A missed heartbeat ends the lease on the alarm, or on any earlier read or renew
-   of it; a release ends it at once.
-3. **Tag sweep.** Every 5 minutes the cron trigger lists every droplet and volume tagged
-   with `CLOUDLEASE_TAG_PREFIX`. It first deletes every one past its `until` tag, without
-   asking any run object, then asks each run object which of the rest it claims and deletes
-   those no live lease claims. A run object that does not answer within 5 seconds keeps its
-   other resources until the next sweep.
+   default, and first within its class's boot grace: 8 minutes after create for
+   DigitalOcean and 20 for phoenixNAP by default. A provisioning lease's
+   `heartbeat_deadline_at` is that boot deadline. homebased renews every 30 seconds. A run
+   keeps the windows its config and class had when the run was created, so renews never
+   read the config. A missed heartbeat ends the lease on the alarm, or on any earlier read
+   or renew of it; a release ends it at once.
+3. **Tag sweep.** Every 5 minutes the cron trigger lists every droplet, volume and
+   phoenixNAP server tagged with `CLOUDLEASE_TAG_PREFIX`. It first deletes every one past
+   its `until` tag, without asking any run object, then asks each run object which of the
+   rest it claims and deletes those no live lease claims. A run object that does not answer
+   within 5 seconds keeps its other resources until the next sweep. If either provider's
+   list fails, the sweep deletes nothing that time.
 4. **Spend caps.** See below.
 
-A machine is `released` only after the droplet, then the volume, are confirmed absent;
-until then the run object retries with backoff.
+A machine is `released` only after the droplet, then the volume, or the server, are
+confirmed absent; until then the run object retries with backoff. phoenixNAP shows a
+deprovisioned server as `deleting` for a while, and it counts as present until it leaves
+the server list.
+
+## phoenixNAP
+
+A phoenixNAP class names a `server_type`, an ordered list of up to 3 `locations` and an
+`os` with cloud-init support (`ubuntu/jammy`). A create tries each location in turn and
+moves on only when phoenixNAP answers that the type is out of stock there (HTTP 406),
+which means nothing was created; after the last location the lease ends with
+`create_failed`. There is no fallback to another provider. Servers have local NVMe and no
+volume. Every server gets the five Tag Manager tags `{prefix}-managed`, `-owner`, `-gen`,
+`-kind` and `-until`, which the Worker creates on first use, and is deprovisioned with its
+IP block.
+
+A Worker without `PNAP_CLIENT_ID` and `PNAP_CLIENT_SECRET` refuses a run or machine on a
+phoenixNAP class with `400 unknown_class`, and reports `"phoenixnap": false` on health
+when a class needs them.
 
 ## Spend caps
 
-Prices come from the class table in `MACHINES_CONFIG`, in US dollars per hour. DigitalOcean
-bills droplets per second with a minimum of 60 seconds or $0.01, whichever is higher, and a
-powered-off droplet still bills;
-volumes bill hourly whether or not they are attached (DigitalOcean's billing docs, read
-2026-11-24). A class with a volume should include the volume's price in its hourly price.
+Prices come from the class table in `MACHINES_CONFIG`, in US dollars per hour. Every
+started billing increment is billed in full:
+
+- DigitalOcean bills droplets per second with a minimum of 60 seconds or $0.01, whichever
+  is higher, and a powered-off droplet still bills; volumes bill hourly whether or not
+  they are attached (DigitalOcean's billing docs, read 2026-11-24). A class with a volume
+  should include the volume's price in its hourly price.
+- phoenixNAP bills every started hour in full, with a minimum of one hour, until the
+  server is deleted, so a server deleted after 5 minutes costs an hour (phoenixNAP's
+  billing docs, read 2026-11-24).
+
+A class may set a coarser `billing_increment_secs` than its provider's, never a finer one.
 
 - **Per run**: the run's accrued spend is each machine's price times its billed life, from
-  create until it was confirmed gone, and at least that minimum. Each create still waiting
+  create until it was confirmed gone, in whole increments and at least the minimum. On
+  phoenixNAP the spend steps up at each hour from create, and the run object checks it
+  then; a run can pass its cap by up to one hour of each machine, since the hour that
+  crosses it is billed as it starts. Each create still waiting
   on the gate reserves one minimum, so simultaneous creates cannot pass the cap together. A
   run's cap is the client's `spend_cap_cents`, or else `run_spend_cap_usd`. A create that
   would take the run past it is refused with `spend_cap_reached`, and is checked again
@@ -99,9 +130,10 @@ volumes bill hourly whether or not they are attached (DigitalOcean's billing doc
   permit would take the total past `HOURLY_SPEND_CAP_CENTS` is refused with
   `spend_cap_reached`, and alerts. A permit is returned once its machine is confirmed gone.
 
-A run counts every machine at the class price stored when the run was created. If the
-class is repriced or removed from the config while the run is open, the run takes no new
-machines (`409 run_ended`) and the client starts a new run.
+A run counts every machine at the class price and billing stored when the run was
+created. If the class is repriced, rebilled, moved to another provider or removed from the
+config while the run is open, the run takes no new machines (`409 run_ended`) and the
+client starts a new run.
 
 ## Alerts
 
@@ -121,31 +153,47 @@ the Worker log either way:
 | Name | Kind | What |
 | --- | --- | --- |
 | `DIGITALOCEAN_TOKEN` | secret | droplet and volume create, read and delete |
+| `PNAP_CLIENT_ID`, `PNAP_CLIENT_SECRET` | secrets, optional | phoenixNAP OAuth client credentials (BMC servers and Tag Manager); set both or neither |
 | `CLIENT_TOKENS` | secret | JSON `{app: sha256 hex of its client token}` |
 | `NTFY_URL` | secret | the alert topic URL |
 | `NTFY_TOKEN` | secret, optional | an ntfy access token |
 | `CLOUDLEASE_TAG_PREFIX` | var | the tag prefix; no other cloudlease app may share it |
 | `HOURLY_SPEND_CAP_CENTS` | var | the hourly cap, default 100 |
-| `MACHINES_CONFIG` | var, JSON | `api_base`, `max_run_hours`, `max_machines_per_run`, `run_spend_cap_usd`, `heartbeat_ttl_secs` (default 180, at least 60), `boot_grace_secs` (default 480, at least the heartbeat window), `classes` and the classes each app may use |
+| `MACHINES_CONFIG` | var, JSON | `api_base`, `max_run_hours`, `max_machines_per_run`, `run_spend_cap_usd`, `heartbeat_ttl_secs` (default 180, at least 60), `boot_grace_secs` (the boot grace of DigitalOcean classes, default 480, at least the heartbeat window), `classes` and the classes each app may use |
 
-A class is `{region, size, image, price_per_hour_usd, max_hours, volume?: {size_gib,
-mount}, ssh_key_ids?, vpc_uuid?}`. `api_base` is the URL machines renew at, written into
-their `lease.json`. See `wrangler.jsonc` for an example.
+Every class has `price_per_hour_usd`, `max_hours`, and optionally `boot_grace_secs` and
+`billing_increment_secs`, which default to its provider's. Then by `provider`:
+
+- `digitalocean`, the default when `provider` is absent: `{region, size, image, volume?:
+  {size_gib, mount}, ssh_key_ids?, vpc_uuid?}`
+- `phoenixnap`: `{server_type, locations, os, ssh_key_ids?}`, with `locations` such as
+  `["SEA", "NLD"]` and `ssh_key_ids` the IDs of account SSH keys
+
+`api_base` is the URL machines renew at, written into their `lease.json`. See
+`wrangler.jsonc` for an example.
 
 ## Boot
 
-The droplet's user data is a POSIX `sh` script that logs to `/var/log/cloudlease-boot.log`.
-It writes `/etc/cloudlease/lease.json` (`lease_id`, `token`, `api_base`,
-`hard_deadline_at`, `heartbeat_ttl_secs`) with mode `0600`, formats and mounts the volume
-when the class has one, writes the client's files under a `077` umask, and runs its
-commands in order.
+The machine's user data is a POSIX `sh` script, which DigitalOcean runs at first boot and
+phoenixNAP passes to cloud-init. It logs to `/var/log/cloudlease-boot.log`, writes
+`/etc/cloudlease/lease.json` (`lease_id`, `token`, `api_base`, `hard_deadline_at`,
+`heartbeat_ttl_secs`) with mode `0600`, formats and mounts the volume when the class has
+one, writes the client's files under a `077` umask, and runs its commands in order.
 
 ## Tests
 
-`just test-worker` builds this Worker and runs `test/machines.worker.test.ts` in miniflare
-against the fake DigitalOcean API in `tests/worker/test` and a fake ntfy topic. It covers
+`just test-worker` builds this Worker and runs `test/machines.worker.test.ts` and
+`test/phoenixnap.worker.test.ts` in miniflare against the fake DigitalOcean API in
+`tests/worker/test`, a fake phoenixNAP API and a fake ntfy topic, then
+`test/phoenixnap.bare.test.ts` against the same Worker without phoenixNAP credentials. It covers
 run and machine create idempotency, renew by lease token and refusal on another lease, a
 lapsed heartbeat, an immediate release, the hard deadline, `released` only after the droplet
 and volume are gone, `max_machines`, both spend caps and a client's lower run cap, a failed
 create, a create whose pending record expired while it waited on the gate, a stalled run
 object whose droplet is past its hard deadline, and the sweep's orphan and failure alerts.
+The phoenixNAP suite covers a server's create with its location, tags and boot data, a
+location out of stock falling through to the next and the last failing the create, renew,
+release, heartbeat lapse and hard deadline each deleting the server and confirming it
+gone, the sweep deleting unclaimed servers and keeping a claimed one, and hourly billing:
+a 5 minute server costs an hour, and the second hour takes a run past its cap. The bare
+suite covers a phoenixNAP class refused without credentials.

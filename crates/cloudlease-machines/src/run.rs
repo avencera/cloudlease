@@ -24,13 +24,13 @@ use cloudlease_core::{
     lease::Lease,
     time::UnixMillis,
 };
-use cloudlease_provider::digitalocean::DoKind;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     config::Heartbeat,
     ids::{AppName, ClassName, Hostname, MachineId, RequestId, RunId, RunName},
-    money::{BilledLife, MicroUsd, Spend, billed},
+    money::{BilledLife, Billing, MicroUsd, Spend},
+    provider::{MachineKind, ProviderName},
     time::Timestamp,
     token::TokenHash,
     wire::{
@@ -78,9 +78,14 @@ pub struct RunRecord {
     pub price_per_hour: MicroUsd,
     /// The class's weight in the hourly spend gate when the run was created
     pub gate_units: PermitUnits,
+    /// The class's provider when the run was created
+    pub provider: ProviderName,
+    /// How the class's provider billed when the run was created
+    pub billing: Billing,
     /// What the run may spend, fixed at create
     pub spend_cap: MicroUsd,
-    /// The heartbeat window and boot grace of the run's leases, from the config at create
+    /// The heartbeat window and boot grace of the run's leases, from the config and the
+    /// class at create
     pub heartbeat: Heartbeat,
     /// The cap the client asked for, if any, which a retried create must repeat
     #[serde(default)]
@@ -231,7 +236,7 @@ pub struct MachineEntry<'a> {
     /// The request
     pub record: &'a MachineRecord,
     /// Its holding, present once admitted
-    pub holding: Option<&'a Holding<DoKind>>,
+    pub holding: Option<&'a Holding<MachineKind>>,
 }
 
 impl MachineEntry<'_> {
@@ -263,6 +268,7 @@ impl MachineEntry<'_> {
 #[must_use]
 pub fn run_spend(run: &RunRecord, machines: &[MachineEntry<'_>], now: UnixMillis) -> Spend {
     Spend::of(
+        run.billing,
         run.price_per_hour,
         machines.iter().filter_map(MachineEntry::billed_life),
         now,
@@ -272,7 +278,7 @@ pub fn run_spend(run: &RunRecord, machines: &[MachineEntry<'_>], now: UnixMillis
 /// Returns what the run has committed to spend: its machines' accrued spend, plus the minimum
 /// charge of each create still pending, which may become a machine at any moment
 fn committed(run: &RunRecord, machines: &[MachineEntry<'_>], now: UnixMillis) -> MicroUsd {
-    let minimum = billed(run.price_per_hour, now, now);
+    let minimum = run.billing.minimum(run.price_per_hour);
     let pending = machines
         .iter()
         .filter(|machine| matches!(machine.record.admission, Admission::Pending { .. }));
@@ -318,7 +324,8 @@ pub fn admit(
         ));
     }
 
-    let after = committed(run, machines, now).saturating_add(billed(run.price_per_hour, now, now));
+    let after =
+        committed(run, machines, now).saturating_add(run.billing.minimum(run.price_per_hour));
     if after > run.spend_cap {
         return Err(spend_cap_reached(run, after));
     }
@@ -389,11 +396,11 @@ pub enum LeaseEnd<'a> {
 /// Every lease ending goes through here, so the record always says who ended it and why,
 /// with the heartbeat deadline it had.
 pub fn end_lease(
-    holding: &Holding<DoKind>,
+    holding: &Holding<MachineKind>,
     admitted: &Admitted,
     end: LeaseEnd<'_>,
     now: UnixMillis,
-) -> Result<Option<(Holding<DoKind>, Admitted)>, HoldingError> {
+) -> Result<Option<(Holding<MachineKind>, Admitted)>, HoldingError> {
     let Some(lease) = holding.lease() else {
         return Ok(None);
     };
@@ -446,11 +453,17 @@ pub fn lease_view(
     run: &RunRecord,
     record: &MachineRecord,
     admitted: &Admitted,
-    holding: &Holding<DoKind>,
+    holding: &Holding<MachineKind>,
 ) -> LeaseView {
     let (state, heartbeat_deadline_at, gone_at) = match holding.state() {
         HoldingState::Leased { lease, slots } => (
-            leased_state(lease, slots.get(&DoKind::Droplet)),
+            leased_state(
+                lease,
+                slots
+                    .iter()
+                    .find(|(kind, _)| kind.is_machine())
+                    .map(|(_, slot)| slot),
+            ),
             lease.heartbeat_due_at(),
             None,
         ),
@@ -487,10 +500,10 @@ pub fn lease_view(
     }
 }
 
-fn leased_state(lease: &Lease, droplet: Option<&Slot>) -> LeaseState {
-    // a droplet whose create response was lost still boots and renews, so a renew proves it
+fn leased_state(lease: &Lease, machine: Option<&Slot>) -> LeaseState {
+    // a machine whose create response was lost still boots and renews, so a renew proves it
     // exists as well as a recorded ID does
-    let created = matches!(droplet, Some(Slot::Created { .. }));
+    let created = matches!(machine, Some(Slot::Created { .. }));
     if created || lease.last_sequence() > 0 {
         return LeaseState::Running;
     }
@@ -508,7 +521,7 @@ fn last_heartbeat_deadline(admitted: &Admitted) -> UnixMillis {
 
 /// The release of a lease that ended without passing through [`end_lease`], which only a
 /// cleanup pass racing a request can cause; it names cloudlease and the core's reason
-fn fallback_release(holding: &Holding<DoKind>) -> Option<ReleaseView> {
+fn fallback_release(holding: &Holding<MachineKind>) -> Option<ReleaseView> {
     let (reason, at) = match holding.state() {
         HoldingState::Leased { .. } => return None,
         HoldingState::Releasing { reason, since, .. } => (*reason, *since),
@@ -556,15 +569,6 @@ pub fn run_view(run: &RunRecord, machines: &[MachineEntry<'_>], now: UnixMillis)
 mod tests {
     use std::time::Duration;
 
-    use cloudlease_core::{
-        capacity::PermitUnits,
-        holding::Holding,
-        ids::{Generation, PermitId, ResourceId},
-        lease::{Lease, LeasePolicy},
-        time::UnixMillis,
-    };
-    use cloudlease_provider::digitalocean::DoKind;
-
     use super::{
         Admission, Admitted, LeaseEnd, MachineEntry, MachineRecord, RunEnd, RunRecord, admit,
         confirm, end_lease, lease_view, run_spend, run_state,
@@ -573,9 +577,17 @@ mod tests {
         boot::BootPayload,
         config::Heartbeat,
         ids::{AppName, ClassName, Hostname, MachineId, RequestId, RunId, RunName},
-        money::MicroUsd,
+        money::{Billing, MicroUsd},
+        provider::{MachineKind, ProviderName},
         token::TokenHash,
         wire::{CreateMachineRequest, ErrorCode, LeaseState, ReleaseReason, ReleasedBy, RunState},
+    };
+    use cloudlease_core::{
+        capacity::PermitUnits,
+        holding::Holding,
+        ids::{Generation, PermitId, ResourceId},
+        lease::{Lease, LeasePolicy},
+        time::UnixMillis,
     };
 
     const MINUTE: u64 = 60_000;
@@ -599,6 +611,8 @@ mod tests {
             // a cent a second, so a minute costs $0.60
             price_per_hour: MicroUsd::parse_dollars("36").unwrap(),
             gate_units: PermitUnits::new(3_600).unwrap(),
+            provider: ProviderName::DigitalOcean,
+            billing: Billing::DIGITALOCEAN,
             spend_cap: MicroUsd::parse_dollars("2").unwrap(),
             heartbeat: Heartbeat::default(),
             requested_spend_cap_cents: None,
@@ -628,7 +642,7 @@ mod tests {
     fn admitted_machine(
         generation: u64,
         started: UnixMillis,
-    ) -> (MachineRecord, Admitted, Holding<DoKind>) {
+    ) -> (MachineRecord, Admitted, Holding<MachineKind>) {
         let run = run();
         let record = MachineRecord::pending(
             Generation::new(generation).unwrap(),
@@ -665,7 +679,7 @@ mod tests {
     }
 
     fn entries<'a>(
-        list: &[(&'a MachineRecord, Option<&'a Holding<DoKind>>)],
+        list: &[(&'a MachineRecord, Option<&'a Holding<MachineKind>>)],
     ) -> Vec<MachineEntry<'a>> {
         list.iter()
             .map(|(record, holding)| MachineEntry {
@@ -715,7 +729,8 @@ mod tests {
         );
         assert_eq!(run_state(&ended, &one, at(2)), RunState::Releasing);
         assert_eq!(run_state(&ended, &[], at(2)), RunState::Released);
-        assert_eq!(run_spend(&run, &one, at(90_000)).accrued.micros(), 900_000);
+        // the 91st second has started, and DigitalOcean bills it
+        assert_eq!(run_spend(&run, &one, at(90_000)).accrued.micros(), 910_000);
     }
 
     #[test]
@@ -827,10 +842,10 @@ mod tests {
     }
 
     #[test]
-    fn a_lease_runs_once_its_droplet_exists_or_its_machine_renews() {
+    fn a_lease_runs_once_its_machine_exists_or_renews() {
         let run = run();
         let (record, admitted, holding) = admitted_machine(1, at(0));
-        let view = |holding: &Holding<DoKind>| lease_view(&run, &record, &admitted, holding);
+        let view = |holding: &Holding<MachineKind>| lease_view(&run, &record, &admitted, holding);
         assert_eq!(view(&holding).state, LeaseState::Provisioning);
         assert_eq!(view(&holding).heartbeat_deadline_at.0, at(15 * MINUTE));
         assert_eq!(
@@ -841,10 +856,14 @@ mod tests {
             }
         );
 
-        let requested = holding.request(DoKind::Droplet, at(1)).unwrap();
+        let requested = holding.request(MachineKind::Droplet, at(1)).unwrap();
         assert_eq!(view(&requested).state, LeaseState::Provisioning);
         let created = requested
-            .record_created(DoKind::Droplet, ResourceId::parse("101").unwrap(), at(2))
+            .record_created(
+                MachineKind::Droplet,
+                ResourceId::parse("101").unwrap(),
+                at(2),
+            )
             .unwrap();
         assert_eq!(view(&created).state, LeaseState::Running);
 

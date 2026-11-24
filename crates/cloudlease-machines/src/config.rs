@@ -1,9 +1,13 @@
-//! Classes, prices, caps and the lease policy
+//! Classes, providers, prices, caps and the lease policy
 //!
 //! The Worker reads one JSON object, `MACHINES_CONFIG`, and checks all of it before serving a
 //! request, so a bad price or class fails loudly instead of creating a machine. The hourly
 //! spend cap is the capacity gate's limit (`HOURLY_SPEND_CAP_CENTS`), not part of this
 //! object, so it can be lowered with the gate's override without a deploy.
+//!
+//! Each class names its provider (`digitalocean` when it names none) and that provider's
+//! machine, its price, its billing increment and its boot grace; the last two default to the
+//! provider's.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -16,21 +20,32 @@ use cloudlease_core::{
     ids::ResourceId,
     lease::{LeaseError, LeasePolicy},
 };
-use cloudlease_provider::digitalocean::{DropletImage, Slug};
-use serde::{Deserialize, Serialize};
+use cloudlease_provider::{
+    digitalocean::{DropletImage, Slug},
+    phoenixnap::{Location, OsImage, ServerType},
+};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
     boot::MountPath,
     ids::{AppName, ClassName},
-    money::MicroUsd,
+    money::{Billing, MicroUsd},
+    provider::{Locations, ProviderName},
 };
 
 /// The heartbeat window when `MACHINES_CONFIG` sets none; machines renew every 30 seconds
 pub const DEFAULT_HEARTBEAT_TTL: Duration = Duration::from_secs(3 * 60);
 
-/// The boot grace when `MACHINES_CONFIG` sets none
+/// The boot grace of a DigitalOcean class when neither it nor `MACHINES_CONFIG` sets one
 pub const DEFAULT_BOOT_GRACE: Duration = Duration::from_secs(8 * 60);
+
+/// The boot grace of a phoenixNAP class that sets none
+///
+/// phoenixNAP quotes 60 seconds to 15 minutes to provision, by OS, and applies cloud-init
+/// with a reboot on top.
+pub const PHOENIXNAP_BOOT_GRACE: Duration = Duration::from_secs(20 * 60);
 
 /// The shortest heartbeat window a config may set, so a few lost renews do not end a lease
 pub const MIN_HEARTBEAT_TTL: Duration = Duration::from_secs(60);
@@ -74,26 +89,54 @@ struct RawConfig {
     run_spend_cap_usd: String,
     #[serde(default)]
     heartbeat_ttl_secs: Option<u64>,
+    // the default of DigitalOcean classes only, which predates per-class boot graces
     #[serde(default)]
     boot_grace_secs: Option<u64>,
-    classes: BTreeMap<ClassName, RawClass>,
+    classes: BTreeMap<ClassName, Value>,
     apps: BTreeMap<AppName, RawApp>,
 }
 
+/// The fields every class has, whatever its provider
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawClass {
+struct RawCommon {
+    price_per_hour_usd: String,
+    max_hours: u64,
+    #[serde(default)]
+    boot_grace_secs: Option<u64>,
+    #[serde(default)]
+    billing_increment_secs: Option<u64>,
+}
+
+const COMMON_FIELDS: [&str; 4] = [
+    "price_per_hour_usd",
+    "max_hours",
+    "boot_grace_secs",
+    "billing_increment_secs",
+];
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDigitalOceanClass {
     region: String,
     size: String,
     image: String,
-    price_per_hour_usd: String,
-    max_hours: u64,
     #[serde(default)]
     volume: Option<RawVolume>,
     #[serde(default)]
     ssh_key_ids: Vec<NonZeroU64>,
     #[serde(default)]
     vpc_uuid: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPhoenixNapClass {
+    server_type: String,
+    locations: Vec<String>,
+    os: String,
+    #[serde(default)]
+    ssh_key_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,27 +161,80 @@ pub struct VolumeClass {
     pub mount: MountPath,
 }
 
-/// What one class of machine is and costs
+/// A DigitalOcean droplet, with an optional volume
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MachineClass {
+pub struct DigitalOceanClass {
     /// The region slug
     pub region: Slug,
     /// The droplet size slug
     pub size: Slug,
     /// The boot image
     pub image: DropletImage,
-    /// The droplet and its volume together, per hour
-    pub price_per_hour: MicroUsd,
-    /// The price in whole cents per hour, the machine's weight in the hourly spend gate
-    pub gate_units: PermitUnits,
-    /// The longest a machine of this class may live
-    pub max_lifetime: Duration,
     /// The volume each machine gets, if any; local disk is preferred
     pub volume: Option<VolumeClass>,
     /// SSH keys installed for break-glass access
     pub ssh_key_ids: Vec<NonZeroU64>,
     /// The VPC, when not the region default
     pub vpc_uuid: Option<ResourceId>,
+}
+
+/// A phoenixNAP Bare Metal Cloud server, billed hourly
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhoenixNapClass {
+    /// The server type, such as `s2.c2.large`
+    pub server_type: ServerType,
+    /// The locations to try in order; one without stock moves the create to the next
+    pub locations: Locations,
+    /// The OS image, which must support cloud-init, such as `ubuntu/jammy`
+    pub os: OsImage,
+    /// IDs of account SSH keys installed for break-glass access
+    pub ssh_key_ids: Vec<ResourceId>,
+}
+
+/// The provider a class uses and the machine it asks that provider for
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderClass {
+    /// A DigitalOcean droplet
+    DigitalOcean(DigitalOceanClass),
+    /// A phoenixNAP server
+    PhoenixNap(PhoenixNapClass),
+}
+
+impl ProviderClass {
+    /// Returns the provider's name
+    #[must_use]
+    pub const fn name(&self) -> ProviderName {
+        match self {
+            Self::DigitalOcean(_) => ProviderName::DigitalOcean,
+            Self::PhoenixNap(_) => ProviderName::PhoenixNap,
+        }
+    }
+
+    /// Returns where the boot script mounts the class's volume, if it has one
+    #[must_use]
+    pub fn volume_mount(&self) -> Option<&MountPath> {
+        match self {
+            Self::DigitalOcean(class) => class.volume.as_ref().map(|volume| &volume.mount),
+            Self::PhoenixNap(_) => None,
+        }
+    }
+}
+
+/// What one class of machine is and costs
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MachineClass {
+    /// The provider and its machine
+    pub provider: ProviderClass,
+    /// The machine and its volume together, per hour
+    pub price_per_hour: MicroUsd,
+    /// The price in whole cents per hour, the machine's weight in the hourly spend gate
+    pub gate_units: PermitUnits,
+    /// How the provider rounds a machine's life into billed time
+    pub billing: Billing,
+    /// The heartbeat window and this class's boot grace
+    pub heartbeat: Heartbeat,
+    /// The longest a machine of this class may live
+    pub max_lifetime: Duration,
 }
 
 /// How long a lease lives without a renew, fixed on a run when it is created
@@ -229,8 +325,8 @@ pub struct MachinesConfig {
     pub max_machines_per_run: u16,
     /// What one run may spend before its machines are released
     pub run_spend_cap: MicroUsd,
-    /// The heartbeat window and boot grace new runs take
-    pub heartbeat: Heartbeat,
+    /// The heartbeat window new runs take; each class adds its own boot grace
+    pub heartbeat_ttl: Duration,
     classes: BTreeMap<ClassName, MachineClass>,
     apps: BTreeMap<AppName, BTreeSet<ClassName>>,
 }
@@ -260,19 +356,24 @@ impl MachinesConfig {
         }
         let run_spend_cap = MicroUsd::parse_dollars(&raw.run_spend_cap_usd)
             .map_err(|error| ConfigError::invalid("run_spend_cap_usd", error))?;
-        let default = Heartbeat::default();
-        let heartbeat = Heartbeat::new(
-            raw.heartbeat_ttl_secs
-                .map_or(default.ttl(), Duration::from_secs),
-            raw.boot_grace_secs
-                .map_or(default.boot_grace(), Duration::from_secs),
-        )?;
+        let heartbeat_ttl = raw
+            .heartbeat_ttl_secs
+            .map_or(DEFAULT_HEARTBEAT_TTL, Duration::from_secs);
+        // checked on its own so a bad window is named even with no class to carry it
+        let digitalocean_boot_grace = raw
+            .boot_grace_secs
+            .map_or(DEFAULT_BOOT_GRACE, Duration::from_secs);
+        Heartbeat::new(heartbeat_ttl, digitalocean_boot_grace)?;
+        let defaults = ClassDefaults {
+            heartbeat_ttl,
+            digitalocean_boot_grace,
+        };
 
         let classes = raw
             .classes
             .into_iter()
             .map(|(name, class)| {
-                let class = machine_class(&name, class, heartbeat)?;
+                let class = machine_class(&name, class, defaults)?;
                 Ok((name, class))
             })
             .collect::<Result<BTreeMap<_, _>, ConfigError>>()?;
@@ -295,10 +396,19 @@ impl MachinesConfig {
             max_run_lifetime,
             max_machines_per_run: raw.max_machines_per_run,
             run_spend_cap,
-            heartbeat,
+            heartbeat_ttl,
             classes,
             apps,
         })
+    }
+
+    /// Returns every provider some class uses
+    #[must_use]
+    pub fn providers(&self) -> BTreeSet<ProviderName> {
+        self.classes
+            .values()
+            .map(|class| class.provider.name())
+            .collect()
     }
 
     /// Returns the class when `app` may use it
@@ -331,21 +441,53 @@ fn hours(field: &str, value: u64) -> Result<Duration, ConfigError> {
     Ok(duration)
 }
 
+/// What a class takes from the configuration's top level
+#[derive(Clone, Copy)]
+struct ClassDefaults {
+    heartbeat_ttl: Duration,
+    digitalocean_boot_grace: Duration,
+}
+
 fn machine_class(
     name: &ClassName,
-    raw: RawClass,
-    heartbeat: Heartbeat,
+    raw: Value,
+    defaults: ClassDefaults,
 ) -> Result<MachineClass, ConfigError> {
     let field = |key: &str| format!("classes.{name}.{key}");
-    let slug = |key: &str, value: String| {
-        Slug::parse(value).map_err(|error| ConfigError::invalid(field(key), error))
+    let Value::Object(mut raw) = raw else {
+        return Err(ConfigError::invalid(
+            format!("classes.{name}"),
+            "must be an object",
+        ));
+    };
+    let provider = match raw.remove("provider") {
+        None => ProviderName::DigitalOcean,
+        Some(value) => ProviderName::deserialize(value).map_err(|_| {
+            ConfigError::invalid(field("provider"), "must be digitalocean or phoenixnap")
+        })?,
+    };
+    // the common fields are split off, so each part is checked for unknown fields alone
+    let common = COMMON_FIELDS
+        .iter()
+        .filter_map(|key| raw.remove_entry(*key))
+        .collect();
+    let common: RawCommon = parse_class(name, Value::Object(common))?;
+    let raw = Value::Object(raw);
+
+    let (provider, billing, boot_grace) = match provider {
+        ProviderName::DigitalOcean => (
+            ProviderClass::DigitalOcean(digitalocean_class(name, parse_class(name, raw)?)?),
+            Billing::DIGITALOCEAN,
+            defaults.digitalocean_boot_grace,
+        ),
+        ProviderName::PhoenixNap => (
+            ProviderClass::PhoenixNap(phoenixnap_class(name, parse_class(name, raw)?)?),
+            Billing::PHOENIXNAP,
+            PHOENIXNAP_BOOT_GRACE,
+        ),
     };
 
-    let image = match raw.image.parse::<u64>().ok().and_then(NonZeroU64::new) {
-        Some(id) => DropletImage::Id(id),
-        None => DropletImage::Slug(slug("image", raw.image)?),
-    };
-    let price_per_hour = MicroUsd::parse_dollars(&raw.price_per_hour_usd)
+    let price_per_hour = MicroUsd::parse_dollars(&common.price_per_hour_usd)
         .map_err(|error| ConfigError::invalid(field("price_per_hour_usd"), error))?;
     if price_per_hour == MicroUsd::ZERO {
         return Err(ConfigError::invalid(
@@ -356,6 +498,58 @@ fn machine_class(
     let gate_units = price_per_hour
         .cents_per_hour()
         .map_err(|error| ConfigError::invalid(field("price_per_hour_usd"), error))?;
+    let billing = match common.billing_increment_secs {
+        None => billing,
+        Some(secs) => billing
+            .with_increment(Duration::from_secs(secs))
+            .map_err(|error| ConfigError::invalid(field("billing_increment_secs"), error))?,
+    };
+    let boot_grace = common
+        .boot_grace_secs
+        .map_or(boot_grace, Duration::from_secs);
+    let heartbeat = Heartbeat::new(defaults.heartbeat_ttl, boot_grace).map_err(|error| {
+        // a class's own boot grace is named as the class's field
+        match (error, common.boot_grace_secs) {
+            (ConfigError::Invalid { message, .. }, Some(_)) => {
+                ConfigError::invalid(field("boot_grace_secs"), message)
+            }
+            (error, _) => error,
+        }
+    })?;
+
+    let class = MachineClass {
+        provider,
+        price_per_hour,
+        gate_units,
+        billing,
+        heartbeat,
+        max_lifetime: hours(&field("max_hours"), common.max_hours)?,
+    };
+    heartbeat
+        .lease_policy(class.max_lifetime)
+        .map_err(|error| ConfigError::invalid(field("max_hours"), error))?;
+
+    Ok(class)
+}
+
+fn parse_class<T: DeserializeOwned>(name: &ClassName, raw: Value) -> Result<T, ConfigError> {
+    serde_json::from_value(raw)
+        .map_err(|error| ConfigError::invalid(format!("classes.{name}"), error))
+}
+
+fn digitalocean_class(
+    name: &ClassName,
+    raw: RawDigitalOceanClass,
+) -> Result<DigitalOceanClass, ConfigError> {
+    let field = |key: &str| format!("classes.{name}.{key}");
+    let slug = |key: &str, value: String| {
+        Slug::parse(value).map_err(|error| ConfigError::invalid(field(key), error))
+    };
+
+    let image = match raw.image.parse::<u64>().ok().and_then(NonZeroU64::new) {
+        Some(id) => DropletImage::Id(id),
+        None => DropletImage::Slug(slug("image", raw.image)?),
+    };
     let volume = raw
         .volume
         .map(|volume| {
@@ -373,22 +567,46 @@ fn machine_class(
         })
         .transpose()?;
 
-    let class = MachineClass {
+    Ok(DigitalOceanClass {
         region: slug("region", raw.region)?,
         size: slug("size", raw.size)?,
         image,
-        price_per_hour,
-        gate_units,
-        max_lifetime: hours(&field("max_hours"), raw.max_hours)?,
         volume,
         ssh_key_ids: raw.ssh_key_ids,
         vpc_uuid,
-    };
-    heartbeat
-        .lease_policy(class.max_lifetime)
-        .map_err(|error| ConfigError::invalid(field("max_hours"), error))?;
+    })
+}
 
-    Ok(class)
+fn phoenixnap_class(
+    name: &ClassName,
+    raw: RawPhoenixNapClass,
+) -> Result<PhoenixNapClass, ConfigError> {
+    let field = |key: &str| format!("classes.{name}.{key}");
+
+    let locations = raw
+        .locations
+        .into_iter()
+        .map(|location| {
+            Location::parse(location)
+                .map_err(|error| ConfigError::invalid(field("locations"), error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let ssh_key_ids = raw
+        .ssh_key_ids
+        .into_iter()
+        .map(|id| {
+            ResourceId::parse(id).map_err(|error| ConfigError::invalid(field("ssh_key_ids"), error))
+        })
+        .collect::<Result<_, _>>()?;
+
+    Ok(PhoenixNapClass {
+        server_type: ServerType::parse(raw.server_type)
+            .map_err(|error| ConfigError::invalid(field("server_type"), error))?,
+        locations: Locations::new(locations)
+            .map_err(|error| ConfigError::invalid(field("locations"), error))?,
+        os: OsImage::parse(raw.os).map_err(|error| ConfigError::invalid(field("os"), error))?,
+        ssh_key_ids,
+    })
 }
 
 #[cfg(test)]
@@ -397,8 +615,11 @@ pub(crate) mod tests {
 
     use serde_json::{Value, json};
 
-    use super::{ConfigError, Heartbeat, MachinesConfig, UnknownClass};
-    use crate::ids::{AppName, ClassName};
+    use super::{ConfigError, Heartbeat, MachinesConfig, ProviderClass, UnknownClass};
+    use crate::{
+        ids::{AppName, ClassName},
+        money::Billing,
+    };
 
     pub(crate) fn sample() -> Value {
         json!({
@@ -415,15 +636,24 @@ pub(crate) mod tests {
                     "max_hours": 12
                 },
                 "do-c16-disk": {
+                    "provider": "digitalocean",
                     "region": "nyc3",
                     "size": "c-16",
                     "image": "212345678",
                     "price_per_hour_usd": "0.514",
                     "max_hours": 12,
                     "volume": { "size_gib": 100, "mount": "/mnt/data" }
+                },
+                "pnap-s2": {
+                    "provider": "phoenixnap",
+                    "server_type": "s2.c2.large",
+                    "locations": ["SEA", "NLD"],
+                    "os": "ubuntu/jammy",
+                    "price_per_hour_usd": "0.40",
+                    "max_hours": 12
                 }
             },
-            "apps": { "homebased": { "classes": ["do-c16", "do-c16-disk"] } }
+            "apps": { "homebased": { "classes": ["do-c16", "do-c16-disk", "pnap-s2"] } }
         })
     }
 
@@ -433,12 +663,35 @@ pub(crate) mod tests {
         let homebased = AppName::parse("homebased").unwrap();
         let class = ClassName::parse("do-c16-disk").unwrap();
 
-        assert_eq!(config.heartbeat.ttl(), Duration::from_secs(180));
-        assert_eq!(config.heartbeat.boot_grace(), Duration::from_secs(480));
+        assert_eq!(config.heartbeat_ttl, Duration::from_secs(180));
 
         let disk = config.class_for(&homebased, &class).unwrap();
         assert_eq!(disk.gate_units.get(), 52);
-        assert_eq!(disk.volume.as_ref().unwrap().size_gib.get(), 100);
+        assert_eq!(disk.heartbeat.boot_grace(), Duration::from_secs(480));
+        assert_eq!(disk.billing, Billing::DIGITALOCEAN);
+        let ProviderClass::DigitalOcean(droplet) = &disk.provider else {
+            panic!("do-c16-disk is a DigitalOcean class");
+        };
+        assert_eq!(droplet.volume.as_ref().unwrap().size_gib.get(), 100);
+
+        // a phoenixNAP class bills by the started hour and waits 20 minutes for its boot
+        let pnap = config
+            .class_for(&homebased, &ClassName::parse("pnap-s2").unwrap())
+            .unwrap();
+        assert_eq!(pnap.billing, Billing::PHOENIXNAP);
+        assert_eq!(pnap.heartbeat.boot_grace(), Duration::from_secs(1_200));
+        assert_eq!(pnap.heartbeat.ttl(), Duration::from_secs(180));
+        let ProviderClass::PhoenixNap(server) = &pnap.provider else {
+            panic!("pnap-s2 is a phoenixNAP class");
+        };
+        let locations: Vec<&str> = server
+            .locations
+            .as_slice()
+            .iter()
+            .map(|l| l.as_str())
+            .collect();
+        assert_eq!(locations, ["SEA", "NLD"]);
+        assert_eq!(pnap.provider.volume_mount(), None);
         assert_eq!(
             config.class_for(&AppName::parse("other").unwrap(), &class),
             Err(UnknownClass)
@@ -480,6 +733,17 @@ pub(crate) mod tests {
             .is_err()
         );
         assert!(broken(&["apps", "homebased", "classes"], json!(["do-gpu"])).is_err());
+        assert!(broken(&["classes", "do-c16", "provider"], json!("aws")).is_err());
+        // a provider's fields do not fit another's class
+        assert!(broken(&["classes", "do-c16", "provider"], json!("phoenixnap")).is_err());
+        assert!(broken(&["classes", "pnap-s2", "region"], json!("nyc3")).is_err());
+        assert!(broken(&["classes", "pnap-s2", "locations"], json!([])).is_err());
+        assert!(broken(&["classes", "pnap-s2", "locations"], json!(["SEA", "SEA"])).is_err());
+        assert!(broken(&["classes", "pnap-s2", "locations"], json!(["sea"])).is_err());
+        assert!(broken(&["classes", "pnap-s2", "server_type"], json!("S2 C2")).is_err());
+        // billing finer than phoenixNAP's hour would undercount
+        assert!(broken(&["classes", "pnap-s2", "billing_increment_secs"], json!(60)).is_err());
+        assert!(broken(&["classes", "pnap-s2", "boot_grace_secs"], json!(30)).is_err());
         assert!(broken(&["heartbeat_ttl_secs"], json!(30)).is_err());
         // the boot grace may not be shorter than the window it precedes
         assert!(broken(&["heartbeat_ttl_secs"], json!(600)).is_err());
@@ -490,8 +754,40 @@ pub(crate) mod tests {
             config["boot_grace_secs"] = json!(300);
             MachinesConfig::parse(&config.to_string()).unwrap()
         };
-        assert_eq!(tuned.heartbeat.ttl(), Duration::from_secs(120));
-        assert_eq!(tuned.heartbeat.boot_grace(), Duration::from_secs(300));
+        let class = |name: &str| {
+            tuned
+                .class_for(
+                    &AppName::parse("homebased").unwrap(),
+                    &ClassName::parse(name).unwrap(),
+                )
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(tuned.heartbeat_ttl, Duration::from_secs(120));
+        assert_eq!(class("do-c16").heartbeat.ttl(), Duration::from_secs(120));
+        // the top-level boot grace is DigitalOcean's default only
+        assert_eq!(
+            class("do-c16").heartbeat.boot_grace(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            class("pnap-s2").heartbeat.boot_grace(),
+            Duration::from_secs(1_200)
+        );
+
+        let mut config = sample();
+        config["classes"]["pnap-s2"]["boot_grace_secs"] = json!(900);
+        config["classes"]["do-c16"]["billing_increment_secs"] = json!(3_600);
+        let own = MachinesConfig::parse(&config.to_string()).unwrap();
+        let homebased = AppName::parse("homebased").unwrap();
+        let pnap = own
+            .class_for(&homebased, &ClassName::parse("pnap-s2").unwrap())
+            .unwrap();
+        assert_eq!(pnap.heartbeat.boot_grace(), Duration::from_secs(900));
+        let hourly = own
+            .class_for(&homebased, &ClassName::parse("do-c16").unwrap())
+            .unwrap();
+        assert_eq!(hourly.billing.increment(), Duration::from_secs(3_600));
 
         // a run created with a two hour boot grace still starts leases of a class a later
         // config cut to one hour

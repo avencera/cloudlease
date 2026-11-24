@@ -1,5 +1,5 @@
-//! The cloudlease machines Worker: temporary DigitalOcean machines whose lifetime Cloudflare
-//! enforces, so no machine depends on an agent to be deleted
+//! The cloudlease machines Worker: temporary DigitalOcean and phoenixNAP machines whose
+//! lifetime Cloudflare enforces, so no machine depends on an agent to be deleted
 //!
 //! It serves the temporary machines contract (`/v1/runs`, `/v1/leases`) to homebased:
 //!
@@ -13,10 +13,12 @@
 //! - **`Monitor`** Durable Object: consecutive sweep failures, so a failing owner alerts on
 //!   its third sweep in a row rather than on every one.
 //! - A cron sweep every 5 minutes that deletes every resource with the app's tag prefix that
-//!   no live lease claims, droplets and volumes alike, and alerts on orphans.
+//!   no live lease claims, droplets, volumes and phoenixNAP servers alike, and alerts on
+//!   orphans.
 //!
-//! Alerts go to the ntfy topic in `NTFY_URL`. The Worker has its own DigitalOcean token and
-//! tag prefix, so it cannot touch another app's resources.
+//! Each machine class names its provider. Alerts go to the ntfy topic in `NTFY_URL`. The
+//! Worker has its own DigitalOcean token, optional phoenixNAP credentials and its own tag
+//! prefix, so it cannot touch another app's resources.
 
 #[cfg(target_arch = "wasm32")]
 mod app;
@@ -26,7 +28,8 @@ use std::time::Duration;
 use cloudlease_machines::config::MAX_RUN_LIFETIME;
 use cloudlease_provider::sweep::ConfirmPolicy;
 use cloudlease_worker::{
-    capacity::CapacityConfig, digitalocean::DigitalOceanBindings, sweep::SweepConfig,
+    capacity::CapacityConfig, digitalocean::DigitalOceanBindings, phoenixnap::PhoenixNapBindings,
+    sweep::SweepConfig,
 };
 
 /// The namespace binding of the run objects
@@ -53,6 +56,15 @@ pub const NTFY_TOKEN: &str = "NTFY_TOKEN";
 pub const DIGITALOCEAN: DigitalOceanBindings<'static> = DigitalOceanBindings {
     token: "DIGITALOCEAN_TOKEN",
     api_url: Some("DIGITALOCEAN_API_URL"),
+    tag_prefix: "CLOUDLEASE_TAG_PREFIX",
+};
+
+/// The phoenixNAP bindings; a Worker without the two secrets refuses phoenixNAP classes
+pub const PHOENIXNAP: PhoenixNapBindings<'static> = PhoenixNapBindings {
+    client_id: "PNAP_CLIENT_ID",
+    client_secret: "PNAP_CLIENT_SECRET",
+    api_url: Some("PNAP_API_URL"),
+    token_url: Some("PNAP_TOKEN_URL"),
     tag_prefix: "CLOUDLEASE_TAG_PREFIX",
 };
 

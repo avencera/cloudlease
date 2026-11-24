@@ -11,16 +11,17 @@ use cloudlease_core::{
     alarm::{Backoff, Wake},
     capacity::{AbsenceProof, AcquireRequest, Permit, ReleaseRequest},
     holding::{Holding, HoldingError},
-    ids::Generation,
+    ids::{Generation, ResourceId},
     lease::{Lease, LeaseError},
     time::UnixMillis,
 };
 use cloudlease_machines::{
     alert::{Alert, Priority},
     boot::{Boot, LeaseFile, VolumeMount, check_fits, render_user_data},
-    config::{MachineClass, MachinesConfig},
-    ids::{AppName, RunId},
+    config::{DigitalOceanClass, MachineClass, MachinesConfig, PhoenixNapClass, ProviderClass},
+    ids::{AppName, ClassName, RunId},
     money::MicroUsd,
+    provider::{MachineKind, MachineSpec, PnapPlacement, ProviderName},
     run::{
         Admission, Admitted, LeaseEnd, MachineEntry, MachineRecord, RunEnd, RunRecord, admit,
         confirm, end_lease, lease_view, run_spend, run_view,
@@ -32,7 +33,10 @@ use cloudlease_machines::{
         ReleaseLeaseRequest, ReleaseReason, ReleasedBy, RenewView, RunAction, RunCall, RunView,
     },
 };
-use cloudlease_provider::digitalocean::{DoKind, DoSpec, DropletSpec, ResourceName, VolumeSpec};
+use cloudlease_provider::{
+    digitalocean::{BootScript, DoSpec, DropletSpec, ResourceName, VolumeSpec},
+    phoenixnap::{self, ServerSpec},
+};
 use cloudlease_worker::{
     alarm::{rearm, rearm_after_failure},
     capacity::{Acquired, CapacityClient},
@@ -49,7 +53,9 @@ use crate::{
     app::{
         alerts::notify,
         api::CALL_PATH,
-        settings::{answer, config, error_response, internal, provider},
+        settings::{
+            MachineProviders, answer, config, error_response, internal, phoenixnap, provider,
+        },
     },
 };
 
@@ -71,7 +77,8 @@ impl DurableObject for Run {
         let path = request.path();
         if request.method() == Method::Post && path == SWEEP_PATH {
             let holdings = HoldingStore::open(self.state.storage().sql())?;
-            return owner::answer_sweep::<DoKind>(&holdings, &mut request, runtime::now()).await;
+            return owner::answer_sweep::<MachineKind>(&holdings, &mut request, runtime::now())
+                .await;
         }
         if request.method() != Method::Post || path != CALL_PATH {
             return error_response(&ApiError::new(ErrorCode::NotFound, "no such route"));
@@ -123,7 +130,7 @@ impl Stores {
         };
         let holdings = self
             .holdings
-            .list::<DoKind>()?
+            .list::<MachineKind>()?
             .into_iter()
             .map(|holding| (holding.generation(), holding))
             .collect();
@@ -146,13 +153,13 @@ impl Stores {
 struct Loaded {
     run: RunRecord,
     records: Vec<MachineRecord>,
-    holdings: BTreeMap<Generation, Holding<DoKind>>,
+    holdings: BTreeMap<Generation, Holding<MachineKind>>,
 }
 
 struct Machine<'a> {
     record: &'a MachineRecord,
     admitted: &'a Admitted,
-    holding: &'a Holding<DoKind>,
+    holding: &'a Holding<MachineKind>,
 }
 
 impl Loaded {
@@ -290,6 +297,7 @@ impl Run {
             )
         })?;
         check_run_request(&config, &request, now)?;
+        require_provider(env, &request.class, class)?;
         let spend_cap = run_spend_cap(&config, request.spend_cap_cents)?;
 
         let run = RunRecord {
@@ -303,8 +311,10 @@ impl Run {
             created_at: now,
             price_per_hour: class.price_per_hour,
             gate_units: class.gate_units,
+            provider: class.provider.name(),
+            billing: class.billing,
             spend_cap,
-            heartbeat: config.heartbeat,
+            heartbeat: class.heartbeat,
             requested_spend_cap_cents: request.spend_cap_cents,
             ended: None,
             create_failure_alerted: false,
@@ -375,8 +385,8 @@ impl Run {
 
         let config = config(&self.env)?;
         let class = run_class(&config, &loaded.run)?;
-        let mount = class.volume.as_ref().map(|volume| &volume.mount);
-        check_fits(&boot, &config.api_base, mount)
+        require_provider(&self.env, &loaded.run.class, class)?;
+        check_fits(&boot, &config.api_base, class.provider.volume_mount())
             .map_err(|error| ApiError::new(ErrorCode::InvalidBoot, error.to_string()))?;
 
         let record = match existing {
@@ -503,7 +513,7 @@ impl Run {
         stores
             .put_admitted(&current, admitted.clone())
             .map_err(internal)?;
-        let holding = Holding::<DoKind>::leased(owner, generation, lease);
+        let holding = Holding::<MachineKind>::leased(owner, generation, lease);
         owner::save(&stores.storage, &stores.holdings, &holding, now)
             .await
             .map_err(internal)?;
@@ -550,67 +560,27 @@ impl Run {
         boot: &Boot,
     ) -> CloudleaseResult<()> {
         let provider = provider(&self.env)?;
-        let generation = record.generation;
-
-        let mut volume_ids = Vec::new();
-        let volume_name = volume_name(&run.run_id, generation)?;
-        let mut mount = None;
-        if let Some(volume) = &class.volume {
-            let spec = DoSpec::Volume(VolumeSpec {
-                name: volume_name.clone(),
-                region: class.region.clone(),
-                size_gib: volume.size_gib,
-            });
-            let (id, _) = owner::create(
-                &stores.storage,
-                &stores.holdings,
-                &provider,
-                generation,
-                &spec,
-                runtime::now(),
-            )
-            .await?;
-            volume_ids.push(id);
-            mount = Some(VolumeMount {
-                name: &volume_name,
-                mount: &volume.mount,
-            });
-        }
-
         let lease_id = record.machine_id(&run.run_id).to_string();
-        let user_data = render_user_data(
-            &LeaseFile {
-                lease_id: &lease_id,
-                token: token.expose(),
-                api_base: &config.api_base,
-                hard_deadline_at: Timestamp(admitted.hard_deadline_at),
-                heartbeat_ttl_secs: run.heartbeat.ttl().as_secs(),
-            },
-            mount,
+        let lease = LeaseFile {
+            lease_id: &lease_id,
+            token: token.expose(),
+            api_base: &config.api_base,
+            hard_deadline_at: Timestamp(admitted.hard_deadline_at),
+            heartbeat_ttl_secs: run.heartbeat.ttl().as_secs(),
+        };
+        let provisioning = Provisioning {
+            stores,
+            provider: &provider,
+            run,
+            record,
+            lease: &lease,
             boot,
-        )
-        .map_err(|error| CloudleaseError::Config(error.to_string()))?;
-        let spec = DoSpec::Droplet(DropletSpec {
-            name: ResourceName::parse(record.hostname.as_str())?,
-            region: class.region.clone(),
-            size: class.size.clone(),
-            image: class.image.clone(),
-            boot: user_data,
-            ssh_key_ids: class.ssh_key_ids.clone(),
-            volume_ids,
-            vpc_uuid: class.vpc_uuid.clone(),
-        });
-        owner::create(
-            &stores.storage,
-            &stores.holdings,
-            &provider,
-            generation,
-            &spec,
-            runtime::now(),
-        )
-        .await?;
+        };
 
-        Ok(())
+        match &class.provider {
+            ProviderClass::DigitalOcean(droplet) => provisioning.droplet(droplet).await,
+            ProviderClass::PhoenixNap(server) => provisioning.server(server).await,
+        }
     }
 
     /// Ends a lease whose create failed, so its cleanup finds anything that was created
@@ -809,7 +779,7 @@ impl Run {
         }
 
         let provider = provider(&self.env)?;
-        let processed = owner::run_alarm::<DoKind, _>(
+        let processed = owner::run_alarm::<MachineKind, _>(
             &stores.storage,
             &stores.holdings,
             &provider,
@@ -948,10 +918,12 @@ struct Create<'a> {
     boot: &'a Boot,
 }
 
-/// Returns the run's class as configured now, if it still costs what the run was opened at
+/// Returns the run's class as configured now, if it still costs and bills what the run was
+/// opened at, with the same provider
 ///
-/// Both caps count every machine of a run at the price stored when the run was created, so a
-/// class repriced since then would be undercounted; such a run takes no new machines.
+/// Both caps count every machine of a run at the price and billing stored when the run was
+/// created, so a class repriced since then would be undercounted; such a run takes no new
+/// machines.
 fn run_class<'a>(
     config: &'a MachinesConfig,
     run: &RunRecord,
@@ -965,11 +937,17 @@ fn run_class<'a>(
             ),
         )
     })?;
-    if class.price_per_hour != run.price_per_hour || class.gate_units != run.gate_units {
+    let repriced = class.price_per_hour != run.price_per_hour
+        || class.gate_units != run.gate_units
+        || class.billing != run.billing;
+    // the run's boot grace came from the class's provider, so it would not fit another one
+    let moved = class.provider.name() != run.provider;
+    if repriced || moved {
         return Err(ApiError::new(
             ErrorCode::RunEnded,
             format!(
-                "class {} was repriced since the run started; start a new run",
+                "class {} was repriced or moved to another provider since the run started; \
+                 start a new run",
                 run.class
             ),
         ));
@@ -1120,6 +1098,116 @@ fn mint_token() -> Result<LeaseToken, ApiError> {
     getrandom::fill(&mut bytes).map_err(|error| internal(format!("random bytes: {error}")))?;
 
     Ok(LeaseToken::from_random(bytes))
+}
+
+/// One admitted machine's resources being created, each saved as requested before its
+/// provider call
+struct Provisioning<'a> {
+    stores: &'a Stores,
+    provider: &'a MachineProviders,
+    run: &'a RunRecord,
+    record: &'a MachineRecord,
+    lease: &'a LeaseFile<'a>,
+    boot: &'a Boot,
+}
+
+impl Provisioning<'_> {
+    async fn create(&self, spec: &MachineSpec) -> CloudleaseResult<ResourceId> {
+        let (id, _) = owner::create(
+            &self.stores.storage,
+            &self.stores.holdings,
+            self.provider,
+            self.record.generation,
+            spec,
+            runtime::now(),
+        )
+        .await?;
+
+        Ok(id)
+    }
+
+    fn user_data(&self, volume: Option<VolumeMount<'_>>) -> CloudleaseResult<BootScript> {
+        render_user_data(self.lease, volume, self.boot)
+            .map_err(|error| CloudleaseError::Config(error.to_string()))
+    }
+
+    /// Creates the class's volume, if it has one, then the droplet that mounts it
+    async fn droplet(&self, class: &DigitalOceanClass) -> CloudleaseResult<()> {
+        let volume_name = volume_name(&self.run.run_id, self.record.generation)?;
+        let mut volume_ids = Vec::new();
+        let mut mount = None;
+        if let Some(volume) = &class.volume {
+            let spec = MachineSpec::DigitalOcean(DoSpec::Volume(VolumeSpec {
+                name: volume_name.clone(),
+                region: class.region.clone(),
+                size_gib: volume.size_gib,
+            }));
+            volume_ids.push(self.create(&spec).await?);
+            mount = Some(VolumeMount {
+                name: &volume_name,
+                mount: &volume.mount,
+            });
+        }
+
+        let spec = MachineSpec::DigitalOcean(DoSpec::Droplet(DropletSpec {
+            name: ResourceName::parse(self.record.hostname.as_str())?,
+            region: class.region.clone(),
+            size: class.size.clone(),
+            image: class.image.clone(),
+            boot: self.user_data(mount)?,
+            ssh_key_ids: class.ssh_key_ids.clone(),
+            volume_ids,
+            vpc_uuid: class.vpc_uuid.clone(),
+        }));
+        self.create(&spec).await?;
+
+        Ok(())
+    }
+
+    /// Creates the server in the first of the class's locations that has stock
+    async fn server(&self, class: &PhoenixNapClass) -> CloudleaseResult<()> {
+        let user_data = self.user_data(None)?;
+        let first = class
+            .locations
+            .as_slice()
+            .first()
+            .ok_or_else(|| CloudleaseError::Config("a class has no locations".to_owned()))?;
+        let spec = MachineSpec::PhoenixNap(PnapPlacement {
+            server: ServerSpec {
+                hostname: phoenixnap::Hostname::parse(self.record.hostname.as_str())?,
+                location: first.clone(),
+                server_type: class.server_type.clone(),
+                os: class.os.clone(),
+                boot: phoenixnap::BootScript::parse(user_data.as_str())?,
+                ssh_key_ids: class.ssh_key_ids.clone(),
+            },
+            locations: class.locations.clone(),
+        });
+        self.create(&spec).await?;
+
+        Ok(())
+    }
+}
+
+/// Refuses a class whose provider this Worker has no credentials for, before anything is
+/// stored or created
+fn require_provider(env: &Env, name: &ClassName, class: &MachineClass) -> Result<(), ApiError> {
+    let configured = match class.provider.name() {
+        ProviderName::DigitalOcean => true,
+        ProviderName::PhoenixNap => phoenixnap(env).map_err(internal)?.is_some(),
+    };
+    if configured {
+        return Ok(());
+    }
+
+    Err(ApiError::new(
+        ErrorCode::UnknownClass,
+        format!(
+            "class {name} uses {}, which this Worker has no credentials for \
+             (PNAP_CLIENT_ID and PNAP_CLIENT_SECRET)",
+            class.provider.name()
+        ),
+    ))
 }
 
 fn volume_name(run: &RunId, generation: Generation) -> CloudleaseResult<ResourceName> {

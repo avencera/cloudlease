@@ -4,17 +4,23 @@ use std::fmt::Display;
 
 use cloudlease_machines::{
     config::MachinesConfig,
+    provider::Providers,
     token::ClientTokens,
     wire::{ApiError, ErrorCode},
 };
 use cloudlease_worker::{
     digitalocean::{self, WorkersDigitalOcean},
+    error::CloudleaseResult,
     http::{HttpError, json_response},
+    phoenixnap::{self, WorkersPhoenixNap},
 };
 use serde::Serialize;
 use worker::{Env, Response};
 
-use crate::{CLIENT_TOKENS, CONFIG_VAR, DIGITALOCEAN};
+use crate::{CLIENT_TOKENS, CONFIG_VAR, DIGITALOCEAN, PHOENIXNAP};
+
+/// Every provider the Worker has credentials for
+pub type MachineProviders = Providers<WorkersDigitalOcean, WorkersPhoenixNap>;
 
 /// Turns any failure into a retryable `500 internal`
 pub fn internal(error: impl Display) -> ApiError {
@@ -51,8 +57,26 @@ pub fn client_tokens(env: &Env) -> Result<ClientTokens, ApiError> {
 }
 
 /// Builds the DigitalOcean adapter
-pub fn provider(env: &Env) -> cloudlease_worker::error::CloudleaseResult<WorkersDigitalOcean> {
+pub fn digitalocean(env: &Env) -> CloudleaseResult<WorkersDigitalOcean> {
     digitalocean::from_env(env, DIGITALOCEAN)
+}
+
+/// Builds the phoenixNAP adapter, or `None` when the Worker has no phoenixNAP credentials
+pub fn phoenixnap(env: &Env) -> CloudleaseResult<Option<WorkersPhoenixNap>> {
+    phoenixnap::from_env(env, PHOENIXNAP)
+}
+
+/// Builds the provider of every class: DigitalOcean always, phoenixNAP when configured
+///
+/// Broken phoenixNAP credentials, such as one secret set without the other, leave phoenixNAP
+/// out rather than failing, so they never stop DigitalOcean deletes; health reports them.
+pub fn provider(env: &Env) -> CloudleaseResult<MachineProviders> {
+    let phoenixnap = phoenixnap(env).unwrap_or_else(|error| {
+        worker::console_error!("cloudlease machines: phoenixNAP left out: {error}");
+        None
+    });
+
+    Ok(Providers::new(digitalocean(env)?, phoenixnap))
 }
 
 /// Answers with a JSON body

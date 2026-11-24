@@ -1,4 +1,10 @@
 {
   "extends": "../../tests/worker/tsconfig.json",
-  "include": ["test/**/*.ts", "../../tests/worker/test/fake-digitalocean.ts", "../../vitest.machines.config.ts"]
+  "include": [
+    "test/**/*.ts",
+    "../../tests/worker/test/fake-digitalocean.ts",
+    "../../vitest.machines.config.ts",
+    "../../vitest.machines-bare.config.ts",
+    "../../vitest.machines.shared.ts"
+  ]
 }
