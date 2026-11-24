@@ -35,6 +35,9 @@ export class FakePhoenixNap {
   listsAfterDeprovision = 0;
   // answers every server list with HTTP 503
   failLists = false;
+  // answers every server create with HTTP 503, an outcome cloudlease cannot tell from a
+  // create that went through
+  failCreates = false;
   private nextId = 1;
 
   addServer(tags: Tag[], hostname = `server-${this.nextId}`): string {
@@ -121,6 +124,9 @@ export class FakePhoenixNap {
           { message: `Server type ${body.type} is out of stock at ${body.location}` },
           { status: 406 },
         );
+      }
+      if (this.failCreates) {
+        return Response.json({ message: "service unavailable" }, { status: 503 });
       }
       const missing = body.tags.find((tag) => !this.tagNames.has(tag.name));
       if (missing !== undefined) {

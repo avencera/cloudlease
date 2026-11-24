@@ -1,4 +1,4 @@
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeDigitalOcean, tags as doTags } from "../../../tests/worker/test/fake-digitalocean";
 import { FakeNtfy } from "./fake-ntfy";
@@ -18,6 +18,7 @@ import {
   permits,
   readLease,
   readRun,
+  runStub,
   scheduled,
   settle,
 } from "./support";
@@ -41,6 +42,15 @@ function leaseToken(hostname: string): string {
   return JSON.parse(atob(match?.[1] ?? "")).token;
 }
 
+// overrides the hourly cap in cents, or restores the configured one with null
+async function gateLimit(limit: number | null): Promise<void> {
+  const response = await gateStub().fetch("https://gate/cloudlease/capacity/limit", {
+    method: "PUT",
+    body: JSON.stringify({ limit }),
+  });
+  expect(response.status).toBe(200);
+}
+
 async function metalRun(overrides: Record<string, unknown> = {}) {
   return createRun({ class: "metal", name: "pool-metal", ...overrides });
 }
@@ -60,6 +70,7 @@ describe("phoenixNAP machines in miniflare", () => {
     await runInDurableObject(gateStub(), (_instance, state) => {
       state.storage.sql.exec("DELETE FROM cloudlease_permits");
     });
+    await gateLimit(null);
   });
 
   afterEach(() => {
@@ -108,6 +119,55 @@ describe("phoenixNAP machines in miniflare", () => {
     pnap.outOfStock.clear();
     await createMachine(run, "hb-metal-stock-3");
     expect(serverOf("hb-metal-stock-3").location).toBe("SEA");
+  });
+
+  it("returns the permit of a create refused for stock at once, so another run fits the hourly cap", async () => {
+    // a 2 cent hourly cap holds one $0.02 server
+    await gateLimit(2);
+    pnap.outOfStock.add("SEA");
+    pnap.outOfStock.add("NLD");
+    const refused = await metalRun({ name: "pool-refused" });
+    const response = await call("POST", `/v1/runs/${refused.run_id}/machines`, CLIENT, machineBody("hb-metal-refused"));
+    expect(response.status).toBe(201);
+    expect(((await response.json()) as LeaseView).release).toMatchObject({ reason: "create_failed" });
+
+    // its holding still waits out the two minute tag search, but its permit is back
+    expect(await permits()).toEqual([]);
+    pnap.outOfStock.clear();
+    const other = await metalRun({ name: "pool-other" });
+    await createMachine(other, "hb-metal-other");
+    expect(serverOf("hb-metal-other").location).toBe("SEA");
+    expect(await permits()).toEqual([expect.objectContaining({ ownerId: other.run_id, generation: 1 })]);
+  });
+
+  it("keeps the permit of a create whose outcome is unknown until its cleanup confirms it", async () => {
+    await gateLimit(2);
+    pnap.failCreates = true;
+    const failed = await metalRun({ name: "pool-unknown" });
+    const response = await call("POST", `/v1/runs/${failed.run_id}/machines`, CLIENT, machineBody("hb-metal-unknown"));
+    expect(response.status).toBe(201);
+    const lease = (await response.json()) as LeaseView;
+    expect(lease.release).toMatchObject({ reason: "create_failed" });
+
+    // a 503 may still have created the server, so the empty tag search proves nothing yet
+    await runDurableObjectAlarm(runStub(failed.run_id));
+    expect((await readLease(lease.lease_id)).state).toBe("releasing");
+    expect(await permits()).toEqual([expect.objectContaining({ ownerId: failed.run_id, generation: 1 })]);
+
+    pnap.failCreates = false;
+    const other = await metalRun({ name: "pool-blocked" });
+    await expectError(
+      await call("POST", `/v1/runs/${other.run_id}/machines`, CLIENT, machineBody("hb-metal-blocked")),
+      429,
+      "spend_cap_reached",
+    );
+
+    // past the settle window the empty search is proof, and the permit goes back
+    await editHolding(lease, (holding) => {
+      holding.state.since -= 2 * MINUTE;
+    });
+    expect((await settle(lease)).state).toBe("released");
+    expect(await permits()).toEqual([]);
   });
 
   it("renews, and deletes a released server and confirms it gone", async () => {

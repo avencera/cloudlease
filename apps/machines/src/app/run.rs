@@ -627,6 +627,12 @@ impl Run {
             };
             end_machine(stores, &machine, end, now).await?;
         }
+        // nothing was created, so the permit goes back now instead of after the tag search's
+        // settle window, where repeated refusals during a stock outage would fill the hourly
+        // cap; if the gate call fails, the alarm retries it
+        if out_of_stock {
+            self.return_permits(stores).await.map_err(internal)?;
+        }
 
         if loaded.run.create_failure_alerted {
             worker::console_error!("create of {} failed: {error}", record.hostname);
@@ -854,7 +860,8 @@ impl Run {
         Ok(())
     }
 
-    /// Returns the gate permit of every machine whose resources are confirmed gone
+    /// Returns the gate permit of every machine whose resources are confirmed gone or whose
+    /// create was refused for stock
     async fn return_permits(&self, stores: &Stores) -> CloudleaseResult<()> {
         let Some(loaded) = stores.load()? else {
             return Ok(());
@@ -862,7 +869,7 @@ impl Run {
         let owner = loaded.run.run_id.owner()?;
         let due: Vec<_> = loaded
             .machines()
-            .filter(|machine| machine.holding.is_released() && !machine.admitted.permit_returned)
+            .filter(|machine| machine.admitted.permit_due(machine.holding))
             .map(|machine| (machine.record.clone(), machine.admitted.clone()))
             .collect();
         if due.is_empty() {
@@ -916,7 +923,7 @@ impl Run {
         }
         let unreturned = loaded
             .machines()
-            .any(|machine| machine.holding.is_released() && !machine.admitted.permit_returned);
+            .any(|machine| machine.admitted.permit_due(machine.holding));
         if unreturned {
             wakes.push(Wake::At(now.saturating_add(PERMIT_RETRY)));
         }

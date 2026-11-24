@@ -161,7 +161,8 @@ pub struct Admitted {
     pub created_at: UnixMillis,
     /// When the lease ends whatever happens
     pub hard_deadline_at: UnixMillis,
-    /// The hourly spend gate permit the machine holds until its resources are gone
+    /// The hourly spend gate permit the machine holds until its resources are gone, or until
+    /// the provider refuses its create for stock
     pub permit: PermitId,
     /// Whether the permit was returned to the gate
     pub permit_returned: bool,
@@ -171,6 +172,18 @@ pub struct Admitted {
     /// of it existed or was billed and it adds nothing to the run's spend
     #[serde(default)]
     pub out_of_stock: bool,
+}
+
+impl Admitted {
+    /// Reports whether the machine's gate permit is due back to the gate
+    ///
+    /// A stock refusal is the provider's answer that nothing was created, so its permit is due
+    /// at once; any other machine's permit waits until its holding confirms every resource
+    /// gone, which for a create of unknown outcome includes the tag search's settle window.
+    #[must_use]
+    pub fn permit_due(&self, holding: &Holding<MachineKind>) -> bool {
+        !self.permit_returned && (self.out_of_stock || holding.is_released())
+    }
 }
 
 /// Where a create request is in admission

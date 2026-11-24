@@ -93,8 +93,9 @@ A phoenixNAP class names a `server_type`, an ordered list of up to 3 `locations`
 `os` with cloud-init support (`ubuntu/jammy`). A create tries each location in turn and
 moves on only when phoenixNAP answers that the type is out of stock there (HTTP 406),
 which means nothing was created; after the last location the lease ends with
-`create_failed` and adds nothing to the run's spend. Any other failed create counts its
-minimum, since it may have left a server behind. There is no fallback to another provider. Servers have local NVMe and no
+`create_failed`, adds nothing to the run's spend and returns its hourly-cap permit at once.
+Any other failed create counts its minimum and keeps its permit until cleanup, since it may
+have left a server behind. There is no fallback to another provider. Servers have local NVMe and no
 volume. Every server gets the five Tag Manager tags `{prefix}-managed`, `-owner`, `-gen`,
 `-kind` and `-until`, which the Worker creates on first use, and is deprovisioned with its
 IP block.
@@ -133,7 +134,10 @@ A class may set a `billing_increment_secs` that is a whole multiple of its provi
 - **Per hour**: a rate cap. Every machine not yet confirmed gone holds a permit in the
   `Gate` object weighted by its class's price in cents per hour, rounded up. A create whose
   permit would take the total past `HOURLY_SPEND_CAP_CENTS` is refused with
-  `spend_cap_reached`, and alerts. A permit is returned once its machine is confirmed gone.
+  `spend_cap_reached`, and alerts. A permit is returned once its machine is confirmed gone,
+  or at once when phoenixNAP refused the create for stock in every location, since nothing
+  was created. A create that failed any other way keeps its permit until cleanup confirms
+  the machine gone, which takes at least the two minute tag search.
 
 A run counts every machine at the class price and billing stored when the run was
 created. If the class is repriced, rebilled, moved to another provider or removed from the
@@ -202,7 +206,8 @@ create, a create whose pending record expired while it waited on the gate, a sta
 object whose droplet is past its hard deadline, and the sweep's orphan and failure alerts.
 The phoenixNAP suite covers a server's create with its location, tags and boot data, a
 location out of stock falling through to the next and the last failing the create with no
-spend counted, renew,
+spend counted, the permit of a create refused for stock coming back at once while one
+refused with a 503 stays held until cleanup, renew,
 release, heartbeat lapse and hard deadline each deleting the server and confirming it
 gone, the sweep deleting unclaimed servers and keeping a claimed one, the sweep still
 deleting a DigitalOcean orphan while phoenixNAP fails to list, and hourly billing:
