@@ -35,8 +35,8 @@ pub enum MoneyError {
     /// The hourly price is too large to weigh a capacity permit
     #[error("an hourly price above $655.35 cannot weigh a capacity permit")]
     TooLarge,
-    /// A billing increment finer than the provider's, not whole seconds, or over a day
-    #[error("the billing increment must be whole seconds, at least {0} and at most 86400")]
+    /// A billing increment that is not a whole number of the provider's, or over a day
+    #[error("the billing increment must be a whole multiple of {0} seconds, at most 86400")]
     Increment(u64),
 }
 
@@ -153,13 +153,15 @@ impl Billing {
 
     /// Bills in a coarser increment than the provider's, such as a class priced by the hour
     ///
-    /// The increment is whole seconds, at least the provider's and at most
-    /// [`MAX_BILLING_INCREMENT`]; a finer one would undercount. The minimum is rounded up to
-    /// a whole number of the new increments.
+    /// The increment is a whole number of the provider's increments, at most
+    /// [`MAX_BILLING_INCREMENT`]. Only a whole multiple never undercounts: a finer one bills
+    /// less than the provider, and so does 90 minutes over hourly billing at minute 61. The
+    /// minimum is rounded up to a whole number of the new increments.
     pub fn with_increment(self, increment: Duration) -> Result<Self, MoneyError> {
         let secs = increment.as_secs();
-        let whole = increment.subsec_nanos() == 0;
-        if !whole || secs < self.increment_secs || increment > MAX_BILLING_INCREMENT {
+        let whole =
+            increment.subsec_nanos() == 0 && secs > 0 && secs.is_multiple_of(self.increment_secs);
+        if !whole || increment > MAX_BILLING_INCREMENT {
             return Err(MoneyError::Increment(self.increment_secs));
         }
 
@@ -424,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn a_class_may_bill_coarser_but_never_finer_than_its_provider() {
+    fn a_class_may_bill_in_whole_multiples_of_its_providers_increment() {
         let hourly = DO.with_increment(Duration::from_secs(3_600)).unwrap();
         // the minute minimum becomes a whole hour
         assert_eq!(hourly.billed(dollars("1"), at(0), at(1_000)), dollars("1"));
@@ -438,6 +440,12 @@ mod tests {
             PNAP.with_increment(Duration::from_secs(60)),
             Err(MoneyError::Increment(3_600))
         );
+        // 90 minutes would bill $0.60 at minute 61, when phoenixNAP has billed two $0.40 hours
+        assert_eq!(
+            PNAP.with_increment(Duration::from_secs(5_400)),
+            Err(MoneyError::Increment(3_600))
+        );
+        assert!(PNAP.with_increment(Duration::from_secs(7_200)).is_ok());
         assert!(DO.with_increment(Duration::from_millis(1_500)).is_err());
         assert!(
             DO.with_increment(Duration::from_secs(2 * 24 * 3_600))

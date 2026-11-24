@@ -113,7 +113,8 @@ started billing increment is billed in full:
   server is deleted, so a server deleted after 5 minutes costs an hour (phoenixNAP's
   billing docs, read 2026-11-24).
 
-A class may set a coarser `billing_increment_secs` than its provider's, never a finer one.
+A class may set a `billing_increment_secs` that is a whole multiple of its provider's, such as
+7200 for phoenixNAP, never a finer or uneven one, since either could bill less than the provider.
 
 - **Per run**: the run's accrued spend is each machine's price times its billed life, from
   create until it was confirmed gone, in whole increments and at least the minimum. On
