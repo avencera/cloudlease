@@ -471,11 +471,27 @@ pub fn presence_wake(
             entry.holding.filter(|holding| holding.is_live(now))?;
             let admitted = entry.record.admitted()?;
             // a create still in flight has no ID to read yet, so a later wake checks it
-            let next = now.saturating_add(PRESENCE_CHECK_INTERVAL);
+            let first = admitted.created_at.saturating_add(PRESENCE_GRACE);
 
-            Some(next.max(admitted.created_at.saturating_add(PRESENCE_GRACE)))
+            Some(next_presence_check(first, now))
         })
         .min()
+}
+
+/// Returns the first check after `now` on the grid that starts at `first` and steps by
+/// [`PRESENCE_CHECK_INTERVAL`]
+///
+/// The grid is fixed rather than counted from `now`, because every renew rearms the run
+/// object: counted from `now`, a run whose other machines renew every 30 seconds would push
+/// the check of an interrupted machine back until its heartbeat lapsed.
+fn next_presence_check(first: UnixMillis, now: UnixMillis) -> UnixMillis {
+    let Some(elapsed) = now.as_millis().checked_sub(first.as_millis()) else {
+        return first;
+    };
+    let interval = PRESENCE_CHECK_INTERVAL.as_secs() * 1_000;
+    let steps = u32::try_from(elapsed / interval + 1).unwrap_or(u32::MAX);
+
+    first.saturating_add(PRESENCE_CHECK_INTERVAL.saturating_mul(steps))
 }
 
 /// How a lease is being ended
@@ -703,7 +719,7 @@ mod tests {
 
     use super::{
         Admission, Admitted, LeaseEnd, MachineEntry, MachineRecord, RunEnd, RunRecord, admit,
-        confirm, end_lease, lease_view, run_spend, run_state,
+        confirm, end_lease, lease_view, presence_wake, run_spend, run_state,
     };
     use crate::{
         boot::BootPayload,
@@ -798,6 +814,29 @@ mod tests {
             ..record
         };
         (record, admitted, holding)
+    }
+
+    #[test]
+    fn presence_checks_keep_a_fixed_minute_grid_whatever_wakes_the_run() {
+        let aws = RunRecord {
+            provider: ProviderName::Aws,
+            ..run()
+        };
+        let (record, _, holding) = admitted_machine(1, at(0));
+        let machines = entries(&[(&record, Some(&holding))]);
+        let wake = |now: u64| presence_wake(&aws, &machines, at(now)).unwrap();
+
+        // the first check waits out the grace for EC2's eventually consistent lists
+        assert_eq!(wake(30_000), at(2 * MINUTE));
+        // renews of other machines rearm the run between checks without moving the next one
+        assert_eq!(wake(2 * MINUTE + 1), at(3 * MINUTE));
+        assert_eq!(wake(2 * MINUTE + 30_000), at(3 * MINUTE));
+        assert_eq!(wake(3 * MINUTE - 1), at(3 * MINUTE));
+        // a pass at a check moves on to the next one
+        assert_eq!(wake(3 * MINUTE), at(4 * MINUTE));
+
+        // DigitalOcean never takes a droplet back, so its runs are not watched
+        assert_eq!(presence_wake(&run(), &machines, at(3 * MINUTE)), None);
     }
 
     #[test]

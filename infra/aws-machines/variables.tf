@@ -9,7 +9,7 @@ variable "aws_account_id" {
 }
 
 variable "aws_region" {
-  description = "Region the machines Worker launches Spot instances in; one state per region"
+  description = "Region the machines Worker launches Spot instances in; one state per account, since the IAM user is account-wide"
   type        = string
 
   validation {

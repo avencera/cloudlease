@@ -810,7 +810,6 @@ impl Run {
         }
 
         let provider = provider(&self.env)?;
-        self.end_interrupted(stores, &provider, now).await?;
         let processed = owner::run_alarm::<MachineKind, _>(
             &stores.storage,
             &stores.holdings,
@@ -824,6 +823,9 @@ impl Run {
         }
 
         self.return_permits(stores).await?;
+        // last, so slow presence reads never hold up a delete or permit already due; a lease
+        // ended here is cleaned up on the next pass, which its releasing holding asks for now
+        self.end_interrupted(stores, &provider, now).await?;
         self.rearm(stores, now).await
     }
 
@@ -842,36 +844,63 @@ impl Run {
         let Some(loaded) = stores.load()? else {
             return Ok(());
         };
+        let targets: Vec<_> = loaded
+            .machines()
+            .filter_map(|machine| {
+                let (kind, id) =
+                    presence_target(&loaded.run, machine.admitted, machine.holding, now)?;
+                Some((machine.record.generation, kind, id.clone()))
+            })
+            .collect();
 
-        for machine in loaded.machines() {
-            let Some((kind, id)) =
-                presence_target(&loaded.run, machine.admitted, machine.holding, now)
-            else {
-                continue;
-            };
-            match provider.presence(kind, id).await {
+        for (generation, kind, id) in targets {
+            match provider.presence(kind, &id).await {
                 Ok(Presence::Present) => {}
-                Ok(Presence::Absent) => {
-                    let end = LeaseEnd::Revoke {
-                        reason: ReleaseReason::Interrupted,
-                        by: ReleasedBy::Cloudlease,
-                    };
-                    end_machine(stores, &machine, end, now)
-                        .await
-                        .map_err(api_failure)?;
-                    worker::console_warn!(
-                        "machine {} of run {} is gone from {}; its lease ended as interrupted",
-                        machine.record.hostname,
-                        loaded.run.run_id,
-                        loaded.run.provider
-                    );
+                Ok(Presence::Absent) => self.end_absent(stores, generation, &id, now).await?,
+                Err(error) => {
+                    worker::console_warn!("presence check of {id} will retry: {error}");
                 }
-                Err(error) => worker::console_warn!(
-                    "presence check of {} will retry: {error}",
-                    machine.record.hostname
-                ),
             }
         }
+
+        Ok(())
+    }
+
+    /// Ends the lease of `generation` as interrupted if it still holds the absent `id`
+    ///
+    /// The run object serves other requests while a presence read is in flight, so the lease
+    /// is read again here: a release or expiry that landed meanwhile keeps its own reason.
+    async fn end_absent(
+        &self,
+        stores: &Stores,
+        generation: Generation,
+        id: &ResourceId,
+        now: UnixMillis,
+    ) -> CloudleaseResult<()> {
+        let Some(loaded) = stores.load()? else {
+            return Ok(());
+        };
+        let Some(machine) = loaded.machine(generation) else {
+            return Ok(());
+        };
+        let current = presence_target(&loaded.run, machine.admitted, machine.holding, now);
+        if current.is_none_or(|(_, current)| current != id) {
+            return Ok(());
+        }
+
+        let end = LeaseEnd::Revoke {
+            reason: ReleaseReason::Interrupted,
+            by: ReleasedBy::Cloudlease,
+        };
+        end_machine(stores, &machine, end, now)
+            .await
+            .map_err(api_failure)?;
+        worker::console_warn!(
+            "machine {} of run {} is gone from {}; its lease ended as interrupted",
+            machine.record.hostname,
+            loaded.run.run_id,
+            loaded.run.provider
+        );
 
         Ok(())
     }

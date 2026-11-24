@@ -47,6 +47,8 @@ export class FakeEc2 {
   readonly noCapacity = new Set<string>();
   // fails every instance list, as during an EC2 outage
   failLists = false;
+  // awaited before the next call is answered, then cleared
+  beforeAnswer: ((action: string) => Promise<void>) | undefined;
   private readonly tokens = new Map<string, string>();
   private nextId = 1;
 
@@ -122,6 +124,12 @@ export class FakeEc2 {
       }
 
       const params = new URLSearchParams(new TextDecoder().decode(await request.arrayBuffer()));
+      const pause = this.beforeAnswer;
+      if (pause !== undefined) {
+        // runs once, while the Worker waits on this call, so a test can act in between
+        this.beforeAnswer = undefined;
+        await pause(params.get("Action") ?? "");
+      }
       return this.handle(params);
     });
   }

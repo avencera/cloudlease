@@ -179,7 +179,8 @@ are deleted with it, so neither can be left behind.
 The Worker uses its own IAM user, never rembuild's. `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY` are optional secrets, and `AWS_REGIONS` lists every region the Worker
 launches in and sweeps; it comes from the Worker's settings rather than its classes, so
-removing a class never takes its region out of the sweep. A Worker without the keys, or whose
+removing a class never takes its region out of the sweep. `infra/aws-machines` covers one
+region, so `AWS_REGIONS` lists only that one until the Terraform covers more. A Worker without the keys, or whose
 `AWS_REGIONS` omits a class's region, refuses that class with `400 unknown_class`, and
 reports `"aws": false` on health when a class needs them. `infra/aws-machines` holds the
 network, security group and IAM policy as Terraform.

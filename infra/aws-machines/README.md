@@ -71,6 +71,12 @@ terraform apply
 terraform output -json class_fields
 ```
 
+Apply it once per account, for one region. The IAM user is account-wide, so a second state for
+another region fails on the existing user, and a second user would reach only its own region
+while the Worker signs every region in `AWS_REGIONS` with one key. A second region needs this
+configuration extended (its network, and that region in the policies' `ec2:Region`
+conditions) rather than applied again; until then `AWS_REGIONS` lists only this region.
+
 Account-wide prerequisites this does not manage:
 
 - the Spot service-linked role `AWSServiceRoleForEC2Spot`, which the account already has

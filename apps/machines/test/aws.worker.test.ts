@@ -218,6 +218,29 @@ describe("AWS Spot machines in miniflare", () => {
     await expectError(await call("POST", `/v1/leases/${lease.lease_id}/renew`, token, {}), 410, "lease_ended");
   });
 
+  it("keeps the reason of a release that lands while a presence check is in flight", async () => {
+    const run = await spotRun();
+    const lease = await createMachine(run, "hb-spot-race");
+    const token = leaseToken("hb-spot-race");
+    const id = instanceOf("hb-spot-race").id;
+    await backdateMachine(lease, 3 * MINUTE);
+
+    // the machine finishes and releases its lease, and EC2 terminates the instance, while the
+    // alarm waits on its DescribeInstances
+    let release: Response | undefined;
+    ec2.beforeAnswer = async (action) => {
+      expect(action).toBe("DescribeInstances");
+      release = await call("POST", `/v1/leases/${lease.lease_id}/release`, token, { reason: "done" });
+      ec2.interrupt(id);
+    };
+    await runDurableObjectAlarm(runStub(run.run_id));
+    expect(release?.status).toBe(202);
+
+    const released = await settle(lease);
+    expect(released.release).toMatchObject({ reason: "done", by: "machine" });
+    expect(await permits()).toEqual([]);
+  });
+
   it("keeps a running instance's lease across presence checks", async () => {
     const run = await spotRun();
     const lease = await createMachine(run, "hb-spot-present");
