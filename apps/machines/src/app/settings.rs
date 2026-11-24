@@ -9,6 +9,7 @@ use cloudlease_machines::{
     wire::{ApiError, ErrorCode},
 };
 use cloudlease_worker::{
+    aws::{self, WorkersAws},
     digitalocean::{self, WorkersDigitalOcean},
     error::CloudleaseResult,
     http::{HttpError, json_response},
@@ -18,10 +19,11 @@ use cloudlease_worker::{
 use serde::Serialize;
 use worker::{Env, Response};
 
-use crate::{CLIENT_TOKENS, CONFIG_VAR, DIGITALOCEAN, LATITUDE, PHOENIXNAP};
+use crate::{AWS, CLIENT_TOKENS, CONFIG_VAR, DIGITALOCEAN, LATITUDE, PHOENIXNAP};
 
 /// Every provider the Worker has credentials for
-pub type MachineProviders = Providers<WorkersDigitalOcean, WorkersPhoenixNap, WorkersLatitude>;
+pub type MachineProviders =
+    Providers<WorkersDigitalOcean, WorkersPhoenixNap, WorkersLatitude, WorkersAws>;
 
 /// Turns any failure into a retryable `500 internal`
 pub fn internal(error: impl Display) -> ApiError {
@@ -73,8 +75,14 @@ pub fn latitude(env: &Env) -> CloudleaseResult<Option<WorkersLatitude>> {
     latitude::from_env(env, LATITUDE)
 }
 
-/// Builds the provider of every class: DigitalOcean always, phoenixNAP and Latitude.sh when
-/// configured
+/// Builds the AWS adapter over every region in `AWS_REGIONS`, or `None` when the Worker has
+/// no AWS keys
+pub fn aws(env: &Env) -> CloudleaseResult<Option<WorkersAws>> {
+    aws::from_env(env, AWS)
+}
+
+/// Builds the provider of every class: DigitalOcean always, phoenixNAP, Latitude.sh and AWS
+/// when configured
 ///
 /// Broken optional settings, such as one secret set without the other, leave that provider
 /// out rather than failing, so they never stop the other providers' deletes; health reports
@@ -89,7 +97,17 @@ pub fn provider(env: &Env) -> CloudleaseResult<MachineProviders> {
         None
     });
 
-    Ok(Providers::new(digitalocean(env)?, phoenixnap, latitude))
+    let aws = aws(env).unwrap_or_else(|error| {
+        worker::console_error!("cloudlease machines: AWS left out: {error}");
+        None
+    });
+
+    Ok(Providers::new(
+        digitalocean(env)?,
+        phoenixnap,
+        latitude,
+        aws,
+    ))
 }
 
 /// Answers with a JSON body

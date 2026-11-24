@@ -11,7 +11,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    num::{NonZeroU32, NonZeroU64},
+    num::{NonZeroU16, NonZeroU32, NonZeroU64},
     time::Duration,
 };
 
@@ -21,6 +21,10 @@ use cloudlease_core::{
     lease::{LeaseError, LeasePolicy},
 };
 use cloudlease_provider::{
+    aws::{
+        AmiId, AvailabilityZone, AwsRegion, InstanceType, InstanceTypeCandidates, SecurityGroupId,
+        SpotMaxPrice, SubnetId, UserData,
+    },
     digitalocean::{BootScript, DropletImage, Slug},
     latitude,
     phoenixnap::{Location, OsImage, ServerType, SshKeyIds},
@@ -33,7 +37,7 @@ use crate::{
     boot::{BootError, MountPath},
     ids::{AppName, ClassName},
     money::{Billing, MicroUsd},
-    provider::{Locations, ProviderName},
+    provider::{AwsZone, Locations, MAX_INSTANCE_TYPES, ProviderName},
 };
 
 /// The heartbeat window when `MACHINES_CONFIG` sets none; machines renew every 30 seconds
@@ -53,6 +57,19 @@ pub const PHOENIXNAP_BOOT_GRACE: Duration = Duration::from_secs(20 * 60);
 /// Latitude.sh deploys in under 10 seconds when the plan, site and OS are listed in the
 /// plan's `deploys_instantly`, and in about 10 minutes otherwise.
 pub const LATITUDE_BOOT_GRACE: Duration = Duration::from_secs(15 * 60);
+
+/// The boot grace of an AWS class that sets none
+///
+/// A Spot instance from a stock Ubuntu AMI is usually running a minute after launch and
+/// has run its user data a minute or two later.
+pub const AWS_BOOT_GRACE: Duration = Duration::from_secs(8 * 60);
+
+/// The root device of Canonical's Ubuntu AMIs, used when an AWS class names none
+pub const UBUNTU_ROOT_DEVICE: &str = "/dev/sda1";
+
+/// The smallest root volume an AWS class may ask for, the size of Canonical's Ubuntu AMI
+/// snapshots
+pub const MIN_ROOT_VOLUME_GIB: u16 = 8;
 
 /// The shortest heartbeat window a config may set, so a few lost renews do not end a lease
 pub const MIN_HEARTBEAT_TTL: Duration = Duration::from_secs(60);
@@ -158,6 +175,27 @@ struct RawLatitudeClass {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawAwsClass {
+    region: String,
+    instance_types: Vec<String>,
+    zones: Vec<RawAwsZone>,
+    image_id: String,
+    #[serde(default)]
+    root_device_name: Option<String>,
+    root_volume_gib: u16,
+    security_group_id: String,
+    spot_max_price_usd: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAwsZone {
+    zone: String,
+    subnet_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawVolume {
     size_gib: NonZeroU32,
     mount: String,
@@ -226,6 +264,34 @@ pub struct LatitudeClass {
     pub ssh_key_ids: Vec<ResourceId>,
 }
 
+/// An AWS EC2 Spot instance, billed per second
+///
+/// Each machine is a one-time Spot request that EC2 terminates when it needs the capacity
+/// back, with its root volume. The instance has a public IPv4 address and the class's
+/// security group, which should allow no inbound traffic: machines reach their
+/// coordinator outbound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AwsClass {
+    /// The region, which the Worker's `AWS_REGIONS` must list, such as `us-east-1`
+    pub region: AwsRegion,
+    /// The instance types to try, cheapest per unit of work first; each is tried in every
+    /// zone before the next
+    pub instance_types: InstanceTypeCandidates,
+    /// The zones to try for each type, each with the subnet to launch into
+    pub zones: Locations<AwsZone>,
+    /// The AMI, such as Canonical's Ubuntu 24.04 from the SSM public parameter
+    pub image_id: AmiId,
+    /// The AMI's root device name
+    pub root_device_name: String,
+    /// The gp3 root volume size, deleted with the instance
+    pub root_volume_gib: NonZeroU16,
+    /// The security group
+    pub security_group_id: SecurityGroupId,
+    /// The most EC2 may charge for the instance per hour; at most the class's price, so the
+    /// Worker's spend never counts less than EC2 bills for the instance
+    pub spot_max_price: SpotMaxPrice,
+}
+
 /// The provider a class uses and the machine it asks that provider for
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderClass {
@@ -235,6 +301,8 @@ pub enum ProviderClass {
     PhoenixNap(PhoenixNapClass),
     /// A Latitude.sh server
     Latitude(LatitudeClass),
+    /// An AWS Spot instance
+    Aws(AwsClass),
 }
 
 impl ProviderClass {
@@ -245,6 +313,7 @@ impl ProviderClass {
             Self::DigitalOcean(_) => ProviderName::DigitalOcean,
             Self::PhoenixNap(_) => ProviderName::PhoenixNap,
             Self::Latitude(_) => ProviderName::Latitude,
+            Self::Aws(_) => ProviderName::Aws,
         }
     }
 
@@ -261,6 +330,10 @@ impl ProviderClass {
             Self::Latitude(_) => latitude::BootScript::shell(script.as_str())
                 .map(drop)
                 .map_err(|_| BootError::UserDataTooLarge),
+            // EC2 takes at most 16 KiB of user data before its base64 encoding
+            Self::Aws(_) => UserData::parse(script.as_str())
+                .map(drop)
+                .map_err(|_| BootError::UserDataTooLarge),
         }
     }
 
@@ -269,7 +342,7 @@ impl ProviderClass {
     pub fn volume_mount(&self) -> Option<&MountPath> {
         match self {
             Self::DigitalOcean(class) => class.volume.as_ref().map(|volume| &volume.mount),
-            Self::PhoenixNap(_) | Self::Latitude(_) => None,
+            Self::PhoenixNap(_) | Self::Latitude(_) | Self::Aws(_) => None,
         }
     }
 }
@@ -465,6 +538,18 @@ impl MachinesConfig {
             .collect()
     }
 
+    /// Returns every AWS region some class launches in
+    #[must_use]
+    pub fn aws_regions(&self) -> BTreeSet<&AwsRegion> {
+        self.classes
+            .values()
+            .filter_map(|class| match &class.provider {
+                ProviderClass::Aws(aws) => Some(&aws.region),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Returns the class when `app` may use it
     pub fn class_for(
         &self,
@@ -519,7 +604,7 @@ fn machine_class(
         Some(value) => ProviderName::deserialize(value).map_err(|_| {
             ConfigError::invalid(
                 field("provider"),
-                "must be digitalocean, phoenixnap or latitude",
+                "must be digitalocean, phoenixnap, latitude or aws",
             )
         })?,
     };
@@ -547,6 +632,11 @@ fn machine_class(
             Billing::LATITUDE,
             LATITUDE_BOOT_GRACE,
         ),
+        ProviderName::Aws => (
+            ProviderClass::Aws(aws_class(name, parse_class(name, raw)?)?),
+            Billing::AWS,
+            AWS_BOOT_GRACE,
+        ),
     };
 
     let price_per_hour = MicroUsd::parse_dollars(&common.price_per_hour_usd)
@@ -556,6 +646,17 @@ fn machine_class(
             field("price_per_hour_usd"),
             "must be positive",
         ));
+    }
+    if let ProviderClass::Aws(aws) = &provider {
+        let cap = MicroUsd::parse_dollars(aws.spot_max_price.as_str())
+            .map_err(|error| ConfigError::invalid(field("spot_max_price_usd"), error))?;
+        // a cap above the counted price would let EC2 bill more than the run's spend shows
+        if cap > price_per_hour {
+            return Err(ConfigError::invalid(
+                field("spot_max_price_usd"),
+                "must be at most price_per_hour_usd",
+            ));
+        }
     }
     let gate_units = price_per_hour
         .cents_per_hour()
@@ -701,6 +802,71 @@ fn latitude_class(name: &ClassName, raw: RawLatitudeClass) -> Result<LatitudeCla
     })
 }
 
+fn aws_class(name: &ClassName, raw: RawAwsClass) -> Result<AwsClass, ConfigError> {
+    let field = |key: &str| format!("classes.{name}.{key}");
+    let invalid = |key: &str| {
+        let field = field(key);
+        move |error: cloudlease_provider::error::ProviderError| {
+            ConfigError::invalid(field, error.message())
+        }
+    };
+
+    if raw.instance_types.len() > MAX_INSTANCE_TYPES {
+        return Err(ConfigError::invalid(
+            field("instance_types"),
+            format!("must name at most {MAX_INSTANCE_TYPES} instance types"),
+        ));
+    }
+    let instance_types = raw
+        .instance_types
+        .into_iter()
+        .map(InstanceType::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(InstanceTypeCandidates::new)
+        .map_err(invalid("instance_types"))?;
+    let zones = raw
+        .zones
+        .into_iter()
+        .map(|zone| {
+            Ok(AwsZone {
+                zone: AvailabilityZone::parse(zone.zone).map_err(invalid("zones"))?,
+                subnet_id: SubnetId::parse(zone.subnet_id).map_err(invalid("zones"))?,
+            })
+        })
+        .collect::<Result<Vec<_>, ConfigError>>()?;
+    let root_device_name = raw
+        .root_device_name
+        .unwrap_or_else(|| UBUNTU_ROOT_DEVICE.to_owned());
+    if !root_device_name.starts_with("/dev/") {
+        return Err(ConfigError::invalid(
+            field("root_device_name"),
+            "must be a device path such as /dev/sda1",
+        ));
+    }
+    let root_volume_gib = NonZeroU16::new(raw.root_volume_gib)
+        .filter(|size| size.get() >= MIN_ROOT_VOLUME_GIB)
+        .ok_or_else(|| {
+            ConfigError::invalid(
+                field("root_volume_gib"),
+                format!("must be at least {MIN_ROOT_VOLUME_GIB}"),
+            )
+        })?;
+
+    Ok(AwsClass {
+        region: AwsRegion::parse(raw.region).map_err(invalid("region"))?,
+        instance_types,
+        zones: Locations::new(zones)
+            .map_err(|error| ConfigError::invalid(field("zones"), error))?,
+        image_id: AmiId::parse(raw.image_id).map_err(invalid("image_id"))?,
+        root_device_name,
+        root_volume_gib,
+        security_group_id: SecurityGroupId::parse(raw.security_group_id)
+            .map_err(invalid("security_group_id"))?,
+        spot_max_price: SpotMaxPrice::parse(raw.spot_max_price_usd)
+            .map_err(invalid("spot_max_price_usd"))?,
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::time::Duration;
@@ -752,10 +918,27 @@ pub(crate) mod tests {
                     "operating_system": "ubuntu_24_04_x64_lts",
                     "price_per_hour_usd": "1.25",
                     "max_hours": 12
+                },
+                "aws-c8a": {
+                    "provider": "aws",
+                    "region": "us-east-1",
+                    "instance_types": ["c8a.4xlarge", "c7a.4xlarge"],
+                    "zones": [
+                        { "zone": "us-east-1a", "subnet_id": "subnet-0123456789abcdef0" },
+                        { "zone": "us-east-1b", "subnet_id": "subnet-0123456789abcdef1" }
+                    ],
+                    "image_id": "ami-0123456789abcdef0",
+                    "root_volume_gib": 150,
+                    "security_group_id": "sg-0123456789abcdef0",
+                    "spot_max_price_usd": "0.45",
+                    "price_per_hour_usd": "0.48",
+                    "max_hours": 12
                 }
             },
             "apps": {
-                "homebased": { "classes": ["do-c16", "do-c16-disk", "pnap-s2", "lat-m4"] }
+                "homebased": {
+                    "classes": ["do-c16", "do-c16-disk", "pnap-s2", "lat-m4", "aws-c8a"]
+                }
             }
         })
     }
@@ -808,6 +991,23 @@ pub(crate) mod tests {
         };
         let sites: Vec<&str> = server.sites.as_slice().iter().map(|s| s.as_str()).collect();
         assert_eq!(sites, ["DAL", "CHI"]);
+
+        // an AWS class bills per second, boots in 8 minutes and caps its Spot price
+        let spot = config
+            .class_for(&homebased, &ClassName::parse("aws-c8a").unwrap())
+            .unwrap();
+        assert_eq!(spot.billing, Billing::AWS);
+        assert_eq!(spot.heartbeat.boot_grace(), Duration::from_secs(480));
+        assert_eq!(spot.gate_units.get(), 48);
+        let ProviderClass::Aws(instance) = &spot.provider else {
+            panic!("aws-c8a is an AWS class");
+        };
+        assert_eq!(instance.root_device_name, "/dev/sda1");
+        assert_eq!(instance.spot_max_price.as_str(), "0.45");
+        assert_eq!(instance.instance_types.as_slice().len(), 2);
+        assert_eq!(instance.zones.as_slice()[1].zone.as_str(), "us-east-1b");
+        let regions: Vec<&str> = config.aws_regions().iter().map(|r| r.as_str()).collect();
+        assert_eq!(regions, ["us-east-1"]);
         assert_eq!(
             config.class_for(&AppName::parse("other").unwrap(), &class),
             Err(UnknownClass)
@@ -867,6 +1067,35 @@ pub(crate) mod tests {
         assert!(broken(&["classes", "lat-m4", "plan"], json!("m4 metal")).is_err());
         assert!(broken(&["classes", "lat-m4", "locations"], json!(["DAL"])).is_err());
         assert!(broken(&["classes", "lat-m4", "billing_increment_secs"], json!(60)).is_err());
+        // a Spot cap above the counted price would let EC2 bill more than the spend shows
+        assert!(broken(&["classes", "aws-c8a", "spot_max_price_usd"], json!("0.49")).is_err());
+        assert!(broken(&["classes", "aws-c8a", "spot_max_price_usd"], json!("0")).is_err());
+        assert!(broken(&["classes", "aws-c8a", "instance_types"], json!([])).is_err());
+        assert!(
+            broken(
+                &["classes", "aws-c8a", "instance_types"],
+                json!([
+                    "c8a.4xlarge",
+                    "c7a.4xlarge",
+                    "m7a.4xlarge",
+                    "c7i.4xlarge",
+                    "c6a.4xlarge"
+                ])
+            )
+            .is_err()
+        );
+        assert!(
+            broken(
+                &["classes", "aws-c8a", "instance_types"],
+                json!(["c8a.4xlarge", "c8a.4xlarge"])
+            )
+            .is_err()
+        );
+        assert!(broken(&["classes", "aws-c8a", "zones"], json!([])).is_err());
+        assert!(broken(&["classes", "aws-c8a", "root_volume_gib"], json!(4)).is_err());
+        assert!(broken(&["classes", "aws-c8a", "image_id"], json!("ubuntu")).is_err());
+        assert!(broken(&["classes", "aws-c8a", "region"], json!("US East")).is_err());
+        assert!(broken(&["classes", "aws-c8a", "root_device_name"], json!("sda1")).is_err());
         assert!(broken(&["heartbeat_ttl_secs"], json!(30)).is_err());
         // the boot grace may not be shorter than the window it precedes
         assert!(broken(&["heartbeat_ttl_secs"], json!(600)).is_err());

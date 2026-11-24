@@ -19,15 +19,15 @@ use cloudlease_machines::{
     alert::{Alert, Priority},
     boot::{Boot, LeaseFile, VolumeMount, check_fits, render_user_data},
     config::{
-        DigitalOceanClass, LatitudeClass, MachineClass, MachinesConfig, PhoenixNapClass,
+        AwsClass, DigitalOceanClass, LatitudeClass, MachineClass, MachinesConfig, PhoenixNapClass,
         ProviderClass,
     },
     ids::{AppName, ClassName, RunId},
     money::MicroUsd,
-    provider::{LatPlacement, LatitudeSpec, MachineKind, MachineSpec, PnapPlacement, ProviderName},
+    provider::{AwsPlacement, LatPlacement, LatitudeSpec, MachineKind, MachineSpec, PnapPlacement},
     run::{
         Admission, Admitted, LeaseEnd, MachineEntry, MachineRecord, RunEnd, RunRecord, admit,
-        confirm, end_lease, lease_view, run_spend, run_view,
+        confirm, end_lease, lease_view, presence_target, presence_wake, run_spend, run_view,
     },
     time::Timestamp,
     token::LeaseToken,
@@ -37,11 +37,12 @@ use cloudlease_machines::{
     },
 };
 use cloudlease_provider::{
+    aws::{AwsInstanceSpec, IdempotencyKey, InstanceName, SpotMarket, UserData},
     digitalocean::{BootScript, DoSpec, DropletSpec, ResourceName, VolumeSpec},
     error::ProviderErrorCode,
     latitude::{self, UserDataSpec},
     phoenixnap::{self, ServerSpec},
-    provider::CreateSpec,
+    provider::{CloudProvider, CreateSpec, Presence},
 };
 use cloudlease_worker::{
     alarm::{rearm, rearm_after_failure},
@@ -60,7 +61,7 @@ use crate::{
         alerts::notify,
         api::CALL_PATH,
         settings::{
-            MachineProviders, answer, config, error_response, internal, latitude, phoenixnap,
+            MachineProviders, answer, aws, config, error_response, internal, latitude, phoenixnap,
             provider,
         },
     },
@@ -591,6 +592,7 @@ impl Run {
             ProviderClass::DigitalOcean(droplet) => provisioning.droplet(droplet).await,
             ProviderClass::PhoenixNap(server) => provisioning.server(server).await,
             ProviderClass::Latitude(server) => provisioning.latitude(server).await,
+            ProviderClass::Aws(instance) => provisioning.aws(instance).await,
         };
         provisioned.map_err(|error| CreateFailure {
             out_of_stock: !provisioning.created.get() && is_out_of_stock(&error),
@@ -808,6 +810,7 @@ impl Run {
         }
 
         let provider = provider(&self.env)?;
+        self.end_interrupted(stores, &provider, now).await?;
         let processed = owner::run_alarm::<MachineKind, _>(
             &stores.storage,
             &stores.holdings,
@@ -822,6 +825,55 @@ impl Run {
 
         self.return_permits(stores).await?;
         self.rearm(stores, now).await
+    }
+
+    /// Ends the lease of every watched machine the provider no longer has, such as an AWS
+    /// Spot instance EC2 took back
+    ///
+    /// The ended lease is cleaned up like any other: its delete finds the instance gone,
+    /// its holding is released and its permit returned. A failed read is logged and left to
+    /// the next check, and the heartbeat still ends a lease whose machine stopped renewing.
+    async fn end_interrupted(
+        &self,
+        stores: &Stores,
+        provider: &MachineProviders,
+        now: UnixMillis,
+    ) -> CloudleaseResult<()> {
+        let Some(loaded) = stores.load()? else {
+            return Ok(());
+        };
+
+        for machine in loaded.machines() {
+            let Some((kind, id)) =
+                presence_target(&loaded.run, machine.admitted, machine.holding, now)
+            else {
+                continue;
+            };
+            match provider.presence(kind, id).await {
+                Ok(Presence::Present) => {}
+                Ok(Presence::Absent) => {
+                    let end = LeaseEnd::Revoke {
+                        reason: ReleaseReason::Interrupted,
+                        by: ReleasedBy::Cloudlease,
+                    };
+                    end_machine(stores, &machine, end, now)
+                        .await
+                        .map_err(api_failure)?;
+                    worker::console_warn!(
+                        "machine {} of run {} is gone from {}; its lease ended as interrupted",
+                        machine.record.hostname,
+                        loaded.run.run_id,
+                        loaded.run.provider
+                    );
+                }
+                Err(error) => worker::console_warn!(
+                    "presence check of {} will retry: {error}",
+                    machine.record.hostname
+                ),
+            }
+        }
+
+        Ok(())
     }
 
     async fn hit_spend_cap(
@@ -929,6 +981,7 @@ impl Run {
                 wakes.push(Wake::At(since.saturating_add(PENDING_EXPIRY)));
             }
         }
+        wakes.extend(presence_wake(&loaded.run, &loaded.entries(), now).map(Wake::At));
         let unreturned = loaded
             .machines()
             .any(|machine| machine.admitted.permit_due(machine.holding));
@@ -1162,8 +1215,9 @@ impl From<CloudleaseError> for CreateFailure {
 }
 
 fn is_out_of_stock(error: &CloudleaseError) -> bool {
-    // phoenixNAP and Latitude.sh answer no stock before they create anything, and the
-    // adapters report it only once every location or site of the class refused
+    // phoenixNAP, Latitude.sh and EC2 answer no stock before they create anything, and the
+    // adapters report it only once every location, site, or instance type and zone of the
+    // class refused
     matches!(error, CloudleaseError::Provider(error) if error.code == ProviderErrorCode::NoCapacity)
 }
 
@@ -1277,24 +1331,65 @@ impl Provisioning<'_> {
 
         Ok(())
     }
+
+    /// Launches the Spot instance with the first of the class's instance types and zones
+    /// that has capacity under its price cap
+    async fn aws(&self, class: &AwsClass) -> CloudleaseResult<()> {
+        let user_data = self.user_data(None)?;
+        let first = class
+            .zones
+            .as_slice()
+            .first()
+            .ok_or_else(|| CloudleaseError::Config("a class has no zones".to_owned()))?;
+        let spec = MachineSpec::Aws(AwsPlacement {
+            region: class.region.clone(),
+            instance: AwsInstanceSpec {
+                name: InstanceName::parse(self.record.hostname.as_str())?,
+                instance_types: class.instance_types.clone(),
+                image_id: class.image_id.clone(),
+                root_device_name: class.root_device_name.clone(),
+                root_volume_gib: class.root_volume_gib,
+                subnet_id: first.subnet_id.clone(),
+                availability_zone: first.zone.clone(),
+                security_group_id: class.security_group_id.clone(),
+                user_data: UserData::parse(user_data.as_str())?,
+                idempotency_key: IdempotencyKey::parse(self.lease.lease_id)?,
+                // one-time and terminated on interruption, so EC2 never relaunches a machine
+                // whose lease has ended
+                market: SpotMarket::one_time_terminate(Some(class.spot_max_price.clone())),
+            },
+            zones: class.zones.clone(),
+        });
+        self.create(&spec).await?;
+
+        Ok(())
+    }
 }
 
 /// Refuses a class whose provider this Worker has no credentials for, before anything is
 /// stored or created
 fn require_provider(env: &Env, name: &ClassName, class: &MachineClass) -> Result<(), ApiError> {
-    let configured = match class.provider.name() {
-        ProviderName::DigitalOcean => true,
-        ProviderName::PhoenixNap => phoenixnap(env).map_err(internal)?.is_some(),
-        ProviderName::Latitude => latitude(env).map_err(internal)?.is_some(),
+    let configured = match &class.provider {
+        ProviderClass::DigitalOcean(_) => true,
+        ProviderClass::PhoenixNap(_) => phoenixnap(env).map_err(internal)?.is_some(),
+        ProviderClass::Latitude(_) => latitude(env).map_err(internal)?.is_some(),
+        // a region the Worker does not list would escape the sweep
+        ProviderClass::Aws(instance) => aws(env)
+            .map_err(internal)?
+            .is_some_and(|aws| aws.has_region(&instance.region)),
     };
     if configured {
         return Ok(());
     }
 
-    let settings = match class.provider.name() {
-        ProviderName::DigitalOcean => "DIGITALOCEAN_TOKEN",
-        ProviderName::PhoenixNap => "PNAP_CLIENT_ID and PNAP_CLIENT_SECRET",
-        ProviderName::Latitude => "LATITUDE_API_KEY and LATITUDE_PROJECT",
+    let settings = match &class.provider {
+        ProviderClass::DigitalOcean(_) => "DIGITALOCEAN_TOKEN".to_owned(),
+        ProviderClass::PhoenixNap(_) => "PNAP_CLIENT_ID and PNAP_CLIENT_SECRET".to_owned(),
+        ProviderClass::Latitude(_) => "LATITUDE_API_KEY and LATITUDE_PROJECT".to_owned(),
+        ProviderClass::Aws(instance) => format!(
+            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, with {} in AWS_REGIONS",
+            instance.region
+        ),
     };
     Err(ApiError::new(
         ErrorCode::UnknownClass,

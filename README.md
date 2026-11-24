@@ -12,7 +12,7 @@ existed, such as leftovers from a crashed create.
 | --- | --- | --- |
 | `cloudlease-core` | Lease, holding, tag, capacity and sweep rules. No I/O, no clock | any |
 | `cloudlease-provider` | The `CloudProvider` trait, the reaper, the sweep executor, the DigitalOcean, phoenixNAP, Latitude.sh and AWS adapters, and the `IngressPolicy` firewall extension | any, given an HTTP transport |
-| `cloudlease-worker` | workers-rs glue: owner alarms, holding storage, the capacity gate, the sweep driver, and building the DigitalOcean, phoenixNAP and Latitude.sh adapters from bindings | Cloudflare Workers (`worker =0.8.5`) |
+| `cloudlease-worker` | workers-rs glue: owner alarms, holding storage, the capacity gate, the sweep driver, and building the DigitalOcean, phoenixNAP, Latitude.sh and AWS adapters from bindings | Cloudflare Workers (`worker =0.8.5`) |
 
 The app declares its own Durable Object classes and wraps the handlers in
 `cloudlease-worker`, so it keeps its own class names, bindings and settings.
@@ -22,7 +22,7 @@ The app declares its own Durable Object classes and wraps the handlers in
 
 | App | What it is |
 | --- | --- |
-| `apps/machines` (rules in `crates/cloudlease-machines`) | Temporary DigitalOcean, phoenixNAP and Latitude.sh machines for client apps such as homebased: runs, leases renewed by the machine, a provider per machine class, spend caps and ntfy alerts. See its [README](apps/machines/README.md) |
+| `apps/machines` (rules in `crates/cloudlease-machines`) | Temporary DigitalOcean, phoenixNAP, Latitude.sh and AWS Spot machines for client apps such as homebased: runs, leases renewed by the machine, a provider per machine class, spend caps and ntfy alerts. See its [README](apps/machines/README.md) |
 
 ## Lifetime rules
 
@@ -121,8 +121,10 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
 
 - Live bare metal. The machines Worker runs phoenixNAP and Latitude.sh classes against
   fake APIs in miniflare; their live tests are tracked in the deploy runbook
-- A Worker on AWS in this repository. rembuild runs the AWS adapter; here it is tested only
-  against a fake EC2 API in `crates/cloudlease-provider/tests/aws.rs`
+- Live AWS in this repository. rembuild runs the AWS adapter in production; the machines
+  Worker's AWS classes are tested only against fake EC2 APIs (`crates/cloudlease-provider/tests/aws.rs`
+  and `apps/machines/test/fake-ec2.ts`), and the IAM setup in `infra/aws-machines` has not
+  been applied
 - Firewalls on DigitalOcean, phoenixNAP and Latitude.sh. `firewall::IngressPolicy` has only
   the AWS shared security group implementation
 - Batch-job records and exit status. These belong to the app, which builds on holdings

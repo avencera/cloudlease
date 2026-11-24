@@ -19,6 +19,15 @@ export const LATITUDE_BINDINGS = {
   LATITUDE_API_URL: "https://api.latitude.test/",
 };
 
+// the machines Worker's own AWS keys, its one region and the fake EC2 endpoint; a Worker
+// without them refuses AWS classes
+export const AWS_BINDINGS = {
+  AWS_ACCESS_KEY_ID: "test-aws-key",
+  AWS_SECRET_ACCESS_KEY: "test-aws-secret",
+  AWS_REGIONS: "us-east-1",
+  AWS_EC2_URL: "https://ec2.aws.test/",
+};
+
 // the machines Worker in miniflare against the fake providers, with the suite's classes and
 // client tokens "client-homebased" and "client-other"
 export function machinesConfig(include: string[], extraBindings: Record<string, string>) {
@@ -89,9 +98,25 @@ export function machinesConfig(include: string[], extraBindings: Record<string, 
                   price_per_hour_usd: "0.02",
                   max_hours: 12,
                 },
+                // an AWS Spot instance, billed per second; two types tried in two zones
+                spot: {
+                  provider: "aws",
+                  region: "us-east-1",
+                  instance_types: ["c8a.4xlarge", "c7a.4xlarge"],
+                  zones: [
+                    { zone: "us-east-1a", subnet_id: "subnet-0123456789abcdef0" },
+                    { zone: "us-east-1b", subnet_id: "subnet-0123456789abcdef1" },
+                  ],
+                  image_id: "ami-0123456789abcdef0",
+                  root_volume_gib: 150,
+                  security_group_id: "sg-0123456789abcdef0",
+                  spot_max_price_usd: "0.025",
+                  price_per_hour_usd: "0.03",
+                  max_hours: 12,
+                },
               },
               apps: {
-                homebased: { classes: ["small", "disk", "huge", "metal", "lat"] },
+                homebased: { classes: ["small", "disk", "huge", "metal", "lat", "spot"] },
                 other: { classes: ["small"] },
               },
             },

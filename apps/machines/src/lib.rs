@@ -1,5 +1,5 @@
-//! The cloudlease machines Worker: temporary DigitalOcean, phoenixNAP and Latitude.sh
-//! machines whose lifetime Cloudflare enforces, so no machine depends on an agent to be
+//! The cloudlease machines Worker: temporary DigitalOcean, phoenixNAP, Latitude.sh and AWS
+//! Spot machines whose lifetime Cloudflare enforces, so no machine depends on an agent to be
 //! deleted
 //!
 //! It serves the temporary machines contract (`/v1/runs`, `/v1/leases`) to homebased:
@@ -14,13 +14,14 @@
 //! - **`Monitor`** Durable Object: consecutive sweep failures, so a failing owner alerts on
 //!   its third sweep in a row rather than on every one.
 //! - A cron sweep every 5 minutes that deletes every resource with the app's tag prefix that
-//!   no live lease claims, droplets, volumes, phoenixNAP servers and Latitude.sh servers and
-//!   their user data alike, and alerts on orphans.
+//!   no live lease claims, droplets, volumes, phoenixNAP servers, Latitude.sh servers and
+//!   their user data, and EC2 instances in every region of `AWS_REGIONS` alike, and alerts
+//!   on orphans.
 //!
 //! Each machine class names its provider. Alerts go to the ntfy topic in `NTFY_URL`. The
 //! Worker has its own DigitalOcean token, optional phoenixNAP credentials, an optional
-//! Latitude.sh key and project, and its own tag prefix, so it cannot touch another app's
-//! resources.
+//! Latitude.sh key and project, optional AWS keys for its own IAM user, and its own tag
+//! prefix, so it cannot touch another app's resources.
 
 #[cfg(target_arch = "wasm32")]
 mod app;
@@ -30,8 +31,8 @@ use std::time::Duration;
 use cloudlease_machines::config::MAX_RUN_LIFETIME;
 use cloudlease_provider::sweep::ConfirmPolicy;
 use cloudlease_worker::{
-    capacity::CapacityConfig, digitalocean::DigitalOceanBindings, latitude::LatitudeBindings,
-    phoenixnap::PhoenixNapBindings, sweep::SweepConfig,
+    aws::AwsBindings, capacity::CapacityConfig, digitalocean::DigitalOceanBindings,
+    latitude::LatitudeBindings, phoenixnap::PhoenixNapBindings, sweep::SweepConfig,
 };
 
 /// The namespace binding of the run objects
@@ -75,6 +76,16 @@ pub const LATITUDE: LatitudeBindings<'static> = LatitudeBindings {
     api_key: "LATITUDE_API_KEY",
     project: "LATITUDE_PROJECT",
     api_url: Some("LATITUDE_API_URL"),
+    tag_prefix: "CLOUDLEASE_TAG_PREFIX",
+};
+
+/// The AWS bindings; a Worker without the two key secrets refuses AWS classes, and one whose
+/// `AWS_REGIONS` does not list a class's region refuses that class
+pub const AWS: AwsBindings<'static> = AwsBindings {
+    access_key_id: "AWS_ACCESS_KEY_ID",
+    secret_access_key: "AWS_SECRET_ACCESS_KEY",
+    regions: "AWS_REGIONS",
+    endpoint: Some("AWS_EC2_URL"),
     tag_prefix: "CLOUDLEASE_TAG_PREFIX",
 };
 

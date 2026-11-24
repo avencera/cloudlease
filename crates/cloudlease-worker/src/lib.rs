@@ -9,11 +9,13 @@
 //! - [`digitalocean`]: builds the DigitalOcean adapter from Worker bindings
 //! - [`phoenixnap`]: builds the phoenixNAP adapter from Worker bindings, when it has them
 //! - [`latitude`]: builds the Latitude.sh adapter from Worker bindings, when it has them
+//! - [`aws`]: builds the AWS EC2 adapter, one client per region, when it has keys
 //!
 //! Durable Object classes are declared by the app, which wraps the handlers here, so each
 //! app keeps its own class names, bindings and settings.
 
 pub mod alarm;
+pub mod aws;
 pub mod capacity;
 pub mod digitalocean;
 pub mod error;

@@ -16,6 +16,7 @@
 //! with the lease's stored hash; only the run object knows lease tokens.
 
 use cloudlease_machines::{
+    config::MachinesConfig,
     ids::{MachineId, RunId},
     provider::ProviderName,
     token::TokenHash,
@@ -28,7 +29,8 @@ use worker::{Env, Headers, Method, Request, RequestInit, Response};
 use crate::{
     NTFY_URL, RUNS,
     app::settings::{
-        client_tokens, config, digitalocean, error_response, internal, latitude, phoenixnap, secret,
+        aws, client_tokens, config, digitalocean, error_response, internal, latitude, phoenixnap,
+        secret,
     },
 };
 
@@ -218,6 +220,25 @@ fn health(env: &Env) -> Result<Response, ApiError> {
         needs(ProviderName::Latitude),
         "a class uses Latitude.sh, but LATITUDE_API_KEY and LATITUDE_PROJECT are not set",
     );
+    // the keys must work and every AWS class's region must be one the sweep lists
+    let aws = optional(
+        "aws",
+        aws(env).map_err(|e| e.to_string()).and_then(|built| {
+            let Some(aws) = built else {
+                return Ok(false);
+            };
+            let regions = parsed
+                .as_ref()
+                .map(MachinesConfig::aws_regions)
+                .unwrap_or_default();
+            match regions.into_iter().find(|region| !aws.has_region(region)) {
+                Some(region) => Err(format!("a class uses {region}, which AWS_REGIONS omits")),
+                None => Ok(true),
+            }
+        }),
+        needs(ProviderName::Aws),
+        "a class uses AWS, but AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not set",
+    );
     let config = check("config", parsed.map(drop).map_err(|e| e.message));
     let tokens = check(
         "client_tokens",
@@ -229,8 +250,12 @@ fn health(env: &Env) -> Result<Response, ApiError> {
     );
     let ntfy = secret(env, NTFY_URL).is_some();
     // ntfy is reported but not required: without it alerts still reach the log
-    let ok =
-        config && tokens && digitalocean && phoenixnap != Some(false) && latitude != Some(false);
+    let ok = config
+        && tokens
+        && digitalocean
+        && phoenixnap != Some(false)
+        && latitude != Some(false)
+        && aws != Some(false);
     let checks = serde_json::json!({
         "ok": ok,
         "config": config,
@@ -238,6 +263,7 @@ fn health(env: &Env) -> Result<Response, ApiError> {
         "digitalocean": digitalocean,
         "phoenixnap": phoenixnap,
         "latitude": latitude,
+        "aws": aws,
         "ntfy": ntfy,
     });
 

@@ -1,11 +1,11 @@
-// the Worker without phoenixNAP or Latitude.sh credentials (vitest.machines-bare.config.ts)
+// the Worker without phoenixNAP, Latitude.sh or AWS credentials (vitest.machines-bare.config.ts)
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeDigitalOcean } from "../../../tests/worker/test/fake-digitalocean";
 import { FakeNtfy } from "./fake-ntfy";
 import { call, CLIENT, createMachine, createRun, expectError, runBody } from "./support";
 
-describe("a Worker without phoenixNAP or Latitude.sh credentials", () => {
+describe("a Worker without phoenixNAP, Latitude.sh or AWS credentials", () => {
   let digitalocean: FakeDigitalOcean;
 
   beforeEach(() => {
@@ -38,6 +38,15 @@ describe("a Worker without phoenixNAP or Latitude.sh credentials", () => {
     expect(body.error.message).toContain("LATITUDE_API_KEY");
   });
 
+  it("refuses an AWS class with a clear error", async () => {
+    const response = await call("POST", "/v1/runs", CLIENT, runBody({ class: "spot" }));
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("unknown_class");
+    expect(body.error.message).toContain("AWS_ACCESS_KEY_ID");
+    expect(body.error.message).toContain("us-east-1 in AWS_REGIONS");
+  });
+
   it("reports the missing credentials on health, since a class needs them", async () => {
     const response = await call("GET", "/v1/health", null);
     expect(response.status).toBe(503);
@@ -46,6 +55,7 @@ describe("a Worker without phoenixNAP or Latitude.sh credentials", () => {
       digitalocean: true,
       phoenixnap: false,
       latitude: false,
+      aws: false,
     });
     await expectError(await call("POST", "/v1/runs", CLIENT, runBody({ class: "metal" })), 400, "unknown_class");
   });

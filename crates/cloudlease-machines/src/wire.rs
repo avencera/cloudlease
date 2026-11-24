@@ -138,6 +138,9 @@ pub enum ReleaseReason {
     SpendCap,
     /// The provider refused to create the machine
     CreateFailed,
+    /// The provider took the machine back while its lease was live, such as an AWS Spot
+    /// interruption, or it disappeared some other way
+    Interrupted,
 }
 
 impl From<LeaseReleaseReason> for ReleaseReason {

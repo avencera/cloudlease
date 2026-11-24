@@ -1,6 +1,7 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeDigitalOcean, tags as doTags } from "../../../tests/worker/test/fake-digitalocean";
+import { FakeEc2 } from "./fake-ec2";
 import { FakeLatitude } from "./fake-latitude";
 import { FakeNtfy } from "./fake-ntfy";
 import { FakePhoenixNap, pnapTags, type Server } from "./fake-phoenixnap";
@@ -63,6 +64,7 @@ describe("phoenixNAP machines in miniflare", () => {
     digitalocean.install();
     // the sweep lists Latitude.sh servers too
     new FakeLatitude().install();
+    new FakeEc2().install();
     pnap = new FakePhoenixNap();
     pnap.install();
     ntfy = new FakeNtfy();

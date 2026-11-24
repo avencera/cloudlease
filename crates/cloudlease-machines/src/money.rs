@@ -10,6 +10,11 @@
 //!   the server is deleted (phoenixNAP billing knowledge base, checked 2026-11-24).
 //! - Latitude.sh documents an hourly price but not how it rounds a partial hour, so it is
 //!   counted like phoenixNAP until a live test shows otherwise.
+//! - AWS bills a Linux instance per second with a minimum of 60 seconds, and charges nothing
+//!   for a Spot instance it interrupts in its first hour (EC2 pricing and Spot billing pages,
+//!   as cited in the batch-compute-providers research of 2026-11-24). The root volume and
+//!   public IPv4 address bill separately, so an AWS class's price includes them. Data sent
+//!   out to the internet, about $0.09 per GB, is billed too but not counted here.
 //!
 //! Spend counts from the lease's creation, before the provider create, until its resources
 //! are confirmed gone, so it never undercounts what the provider bills.
@@ -155,6 +160,13 @@ impl Billing {
 
     /// Latitude.sh: every started hour, at least one hour, until its rounding is known
     pub const LATITUDE: Self = Self::PHOENIXNAP;
+
+    /// AWS EC2 on Linux: every started second, at least 60 seconds, with no minimum charge
+    pub const AWS: Self = Self {
+        increment_secs: 1,
+        minimum_secs: 60,
+        minimum_charge: MicroUsd::ZERO,
+    };
 
     /// Bills in a coarser increment than the provider's, such as a class priced by the hour
     ///

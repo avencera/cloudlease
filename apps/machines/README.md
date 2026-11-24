@@ -1,8 +1,8 @@
 # cloudlease machines
 
 A Cloudflare Worker that creates temporary machines on DigitalOcean, phoenixNAP Bare Metal
-Cloud or Latitude.sh bare metal for a client app and deletes them when their lease ends. Each machine class
-names its provider. homebased uses it for batch pools: the client opens a
+Cloud, Latitude.sh bare metal or AWS EC2 Spot for a client app and deletes them when their
+lease ends. Each machine class names its provider. homebased uses it for batch pools: the client opens a
 run, asks for machines in it, and each machine renews its own lease. Cloudflare enforces
 every machine's lifetime, so a client or agent that dies leaves nothing running.
 
@@ -23,7 +23,7 @@ app and sees only that app's runs; a lease token is written into its machine's
 | `GET /v1/leases/{lease_id}` | client, or the lease's token | `200` lease; `410` to the lease token once the lease ended |
 | `POST /v1/leases/{lease_id}/release` | client, or the lease's token | `202` lease, `200` if it had already ended |
 | `POST /v1/leases/{lease_id}/renew` | the lease's token only | `200` with the new heartbeat deadline; `410` once ended |
-| `GET /v1/health` | none | `200` or `503` with one boolean per setting; `phoenixnap` and `latitude` are `null` when the Worker has no settings for that provider and no class needs them |
+| `GET /v1/health` | none | `200` or `503` with one boolean per setting; `phoenixnap`, `latitude` and `aws` are `null` when the Worker has no settings for that provider and no class needs them |
 
 Bodies:
 
@@ -34,16 +34,19 @@ Bodies:
 - machine create: `{request_id, hostname, boot: {files: [{path, mode, content}], run: [[argv]]}}`.
   `boot` is at most 32 KiB as JSON, 16 files and 8 commands, and must render to at most
   64 KiB of user data (on Latitude.sh, once wrapped in base64 cloud-config, so about 48 KiB of
-  script); anything else is `400 invalid_boot` before a machine is admitted.
+  script; on AWS, 16 KiB, EC2's limit); anything else is `400 invalid_boot` before a machine
+  is admitted.
 - run release: `{"reason": "requested"}`
 - lease release: `{"reason": "requested" | "idle" | "done"}`
 - renew: `{}`
 
 A lease is `provisioning` until its droplet or server exists or it first renews, then
 `running`, `releasing` once it ended, and `released` only after the provider confirms every
-resource gone: the droplet and volume, or the server. Its `release` says why (`requested`, `idle`, `done`, `heartbeat_lapsed`,
-`hard_deadline`, `run_released`, `spend_cap`, `create_failed`) and who (`client`,
-`machine`, `cloudlease`). A run is `open` until its deadline or release, `releasing` while
+resource gone: the droplet and volume, the server, or the instance. Its `release` says why
+(`requested`, `idle`, `done`, `heartbeat_lapsed`, `hard_deadline`, `run_released`,
+`spend_cap`, `create_failed`, `interrupted`) and who (`client`, `machine`, `cloudlease`).
+`interrupted` means the provider took the machine back while its lease was live, such as an
+AWS Spot interruption. A run is `open` until its deadline or release, `releasing` while
 any machine is not yet released, then `released`.
 
 Errors are `{"error": {"code", "message", "retryable"}}`: `invalid_request`,
@@ -68,24 +71,31 @@ it, with a core holding.
    object is broken.
 2. **Heartbeat.** The machine must renew within the heartbeat window, 3 minutes by
    default, and first within its class's boot grace: 8 minutes after create for
-   DigitalOcean, 20 for phoenixNAP and 15 for Latitude.sh by default. A provisioning lease's
+   DigitalOcean and AWS, 20 for phoenixNAP and 15 for Latitude.sh by default. A provisioning lease's
    `heartbeat_deadline_at` is that boot deadline. homebased renews every 30 seconds. A run
    keeps the windows its config and class had when the run was created, so renews never
    read the config. A missed heartbeat ends the lease on the alarm, or on any earlier read
    or renew of it; a release ends it at once.
 3. **Tag sweep.** Every 5 minutes the cron trigger lists every droplet, volume and
-   phoenixNAP server tagged with `CLOUDLEASE_TAG_PREFIX`, and every Latitude.sh server and
-   user data record in `LATITUDE_PROJECT`. It first deletes every one past
+   phoenixNAP server tagged with `CLOUDLEASE_TAG_PREFIX`, every Latitude.sh server and
+   user data record in `LATITUDE_PROJECT`, and every EC2 instance carrying the
+   `{prefix}-managed` tag key in each region of `AWS_REGIONS`. It first deletes every one past
    its `until` tag, without asking any run object, then asks each run object which of the
    rest it claims and deletes those no live lease claims. A run object that does not answer
    within 5 seconds keeps its other resources until the next sweep. If one provider's list
    fails, the sweep still deletes what the others listed but returns no hourly-gate permit
    that pass, since a permit's resource may sit at the provider it could not see. Each
    provider that fails to list keeps its own alert streak.
-4. **Spend caps.** See below.
+4. **Presence.** On a provider that takes machines back, which is AWS only, the run object
+   reads each live lease's machine every minute, from 2 minutes after the lease began (EC2
+   reads are eventually consistent, so a describe just after the launch may miss it). A
+   machine the provider no longer has ends its lease as `interrupted` by `cloudlease`; its
+   cleanup confirms it gone and returns its permit. A failed read is retried a minute later,
+   and the heartbeat still ends a lease whose machine stopped renewing.
+5. **Spend caps.** See below.
 
 A machine is `released` only after the droplet, then the volume, or the server, then its
-Latitude.sh user data record, are confirmed absent; until then the run object retries with backoff. phoenixNAP shows a
+Latitude.sh user data record, or the EC2 instance, are confirmed absent; until then the run object retries with backoff. phoenixNAP shows a
 deprovisioned server as `deleting` for a while, and it counts as present until it leaves
 the server list.
 
@@ -141,6 +151,42 @@ and returns its permit at once; the user data record it made is deleted by its c
 A Worker without `LATITUDE_API_KEY` and `LATITUDE_PROJECT` refuses a Latitude.sh class with
 `400 unknown_class`, and reports `"latitude": false` on health when a class needs them.
 
+## AWS
+
+An AWS class names a `region`, up to 4 `instance_types` (cheapest per unit of work first),
+up to 3 `zones` each with the `subnet_id` to launch into, an `image_id` (Canonical's Ubuntu
+24.04, pinned; see `infra/aws-machines`), an optional `root_device_name` (`/dev/sda1`, as on
+Canonical's images, when absent), a `root_volume_gib` of at least 8, a `security_group_id`,
+and a `spot_max_price_usd` no higher than its `price_per_hour_usd`.
+
+Each machine is one Spot instance launched with `RunInstances` as a one-time request that EC2
+terminates when it needs the capacity back, so an interrupted instance is simply gone: EC2
+never stops it, keeps its volume or relaunches it. It has IMDSv2, a public IPv4 address and an
+encrypted gp3 root volume and network interface deleted with it, and carries the key-value
+tags `{prefix}-managed=true`, `-owner`, `-gen`, `-kind=instance`, `-until` and `Name` (the
+hostname), as does its Spot request. A create tries the first type in each zone, then the
+next type in each zone, and moves on only when EC2 answers that it has no Spot capacity for
+that type there or that the Spot price is above the max price, which launch nothing. After
+the last, the lease ends with `create_failed`, adds nothing to the run's spend and returns its
+permit at once. A quota error, such as too few Spot vCPUs, ends the create at once. A class's
+zones must offer every one of its types, or EC2 refuses the launch outright.
+
+The class's security group should allow no inbound traffic: a machine reaches its
+coordinator outbound. The Worker never changes a security group. The sweep lists instances
+only: a one-time request closes with its instance, and the root volume and network interface
+are deleted with it, so neither can be left behind.
+
+The Worker uses its own IAM user, never rembuild's. `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` are optional secrets, and `AWS_REGIONS` lists every region the Worker
+launches in and sweeps; it comes from the Worker's settings rather than its classes, so
+removing a class never takes its region out of the sweep. A Worker without the keys, or whose
+`AWS_REGIONS` omits a class's region, refuses that class with `400 unknown_class`, and
+reports `"aws": false` on health when a class needs them. `infra/aws-machines` holds the
+network, security group and IAM policy as Terraform.
+
+homebased sees an interrupted machine's lease released with reason `interrupted`, which it
+reads as an unknown reason that may have lost output, as for `heartbeat_lapsed`.
+
 ## Spend caps
 
 Prices come from the class table in `MACHINES_CONFIG`, in US dollars per hour. Every
@@ -155,6 +201,12 @@ started billing increment is billed in full:
   billing docs, read 2026-11-24).
 - Latitude.sh lists an hourly price but does not document how a partial hour rounds, so it
   is counted like phoenixNAP, every started hour in full, until that is measured.
+- AWS bills a Linux instance per second with a minimum of 60 seconds, and nothing for a Spot
+  instance it interrupts in its first hour. The root volume and public IPv4 address bill
+  separately, about $0.021 an hour for 150 GiB of gp3 and the address, so an AWS class's
+  price includes them; its `spot_max_price_usd` caps the instance alone. Data sent to the
+  internet, about $0.09 per GB after the account's first 100 GB a month, is billed by AWS
+  but not counted by either cap.
 
 A class may set a `billing_increment_secs` that is a whole multiple of its provider's, such as
 7200 for phoenixNAP, never a finer or uneven one, since either could bill less than the provider.
@@ -207,6 +259,8 @@ alarm for every priority 5 message.
 | `DIGITALOCEAN_TOKEN` | secret | droplet and volume create, read and delete |
 | `PNAP_CLIENT_ID`, `PNAP_CLIENT_SECRET` | secrets, optional | phoenixNAP OAuth client credentials (BMC servers and Tag Manager); set both or neither |
 | `LATITUDE_API_KEY`, `LATITUDE_PROJECT` | secrets, optional | a Latitude.sh API key and the project ID (`proj_…`) the Worker creates and sweeps in; set both or neither |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | secrets, optional | the access key of the Worker's own IAM user (`infra/aws-machines`); set both or neither |
+| `AWS_REGIONS` | var, with the AWS keys | the regions the Worker launches in and sweeps, comma separated, such as `us-east-1` |
 | `CLIENT_TOKENS` | secret | JSON `{app: sha256 hex of its client token}` |
 | `NTFY_URL` | secret | the alert topic URL |
 | `NTFY_TOKEN` | secret, optional | an ntfy access token |
@@ -226,6 +280,9 @@ Every class has `price_per_hour_usd`, `max_hours`, and optionally `boot_grace_se
 - `latitude`: `{plan, sites, operating_system, ssh_key_ids?}`, with `plan` such as
   `m4-metal-medium`, `sites` such as `["DAL", "CHI"]` and `ssh_key_ids` the IDs of project
   SSH keys
+- `aws`: `{region, instance_types, zones: [{zone, subnet_id}], image_id, root_device_name?,
+  root_volume_gib, security_group_id, spot_max_price_usd}`, such as `instance_types:
+  ["c8a.4xlarge", "c7a.4xlarge"]`; see AWS above
 
 `api_base` is the URL machines renew at, written into their `lease.json`. See
 `wrangler.jsonc` for an example.
@@ -233,7 +290,7 @@ Every class has `price_per_hour_usd`, `max_hours`, and optionally `boot_grace_se
 ## Boot
 
 The machine's user data is a POSIX `sh` script, which DigitalOcean runs at first boot and
-phoenixNAP and Latitude.sh pass to cloud-init. It logs to `/var/log/cloudlease-boot.log`, writes
+phoenixNAP, Latitude.sh and EC2 pass to cloud-init. It logs to `/var/log/cloudlease-boot.log`, writes
 `/etc/cloudlease/lease.json` (`lease_id`, `token`, `api_base`, `hard_deadline_at`,
 `heartbeat_ttl_secs`) with mode `0600`, formats and mounts the volume when the class has
 one, writes the client's files under a `077` umask, and runs its commands in order.
@@ -241,10 +298,11 @@ one, writes the client's files under a `077` umask, and runs its commands in ord
 ## Tests
 
 `just test-worker` builds this Worker and runs `test/machines.worker.test.ts`,
-`test/phoenixnap.worker.test.ts` and `test/latitude.worker.test.ts` in miniflare against the
-fake DigitalOcean API in `tests/worker/test`, fake phoenixNAP and Latitude.sh APIs and a fake
-ntfy topic, then `test/optional-providers.bare.test.ts` against the same Worker without
-phoenixNAP or Latitude.sh credentials. It covers
+`test/phoenixnap.worker.test.ts`, `test/latitude.worker.test.ts` and `test/aws.worker.test.ts`
+in miniflare against the fake DigitalOcean API in `tests/worker/test`, fake phoenixNAP,
+Latitude.sh and EC2 Query APIs and a fake ntfy topic, then
+`test/optional-providers.bare.test.ts` against the same Worker without phoenixNAP,
+Latitude.sh or AWS credentials. It covers
 run and machine create idempotency, renew by lease token and refusal on another lease, a
 lapsed heartbeat, an immediate release, the hard deadline, `released` only after the droplet
 and volume are gone, `max_machines`, both spend caps and a client's lower run cap, a failed
@@ -263,5 +321,12 @@ a site out of stock falling through and the last one failing the create with its
 back at once, release and heartbeat lapse each deleting the server, then its record, and
 confirming both gone, the sweep deleting an unclaimed record and server past their ceiling,
 and a server listed only after its lease's cleanup gave up, swept as an orphan once 10
-minutes old. The bare suite covers phoenixNAP and Latitude.sh classes refused without
-credentials.
+minutes old. The AWS suite covers a one-time Spot launch with its type, zone, max price,
+tags and boot data, capacity errors moving through every zone of a type before the next
+type and the last failing the create with its permit back at once, release, heartbeat lapse
+and hard deadline each terminating the instance and confirming it gone, an interrupted
+instance ending its lease as `interrupted` once past the 2 minute grace and returning its
+permit, a present instance's lease kept with its next check a minute away, the sweep
+terminating an unclaimed instance past its ceiling and keeping a claimed one and another
+app's, per-second billing, and boot data over EC2's 16 KiB refused. The bare suite covers
+phoenixNAP, Latitude.sh and AWS classes refused without credentials.

@@ -15,13 +15,14 @@
 //! needs on top: who ended a lease and why, its last deadlines, its capacity permit, and the
 //! spend of the run.
 
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, time::Duration};
 
 use cloudlease_core::{
     capacity::PermitUnits,
     holding::{Holding, HoldingError, HoldingState, ReleaseReason as CoreReason, Slot},
-    ids::{Generation, LeaseId, PermitId},
+    ids::{Generation, LeaseId, PermitId, ResourceId},
     lease::Lease,
+    tags::ResourceKind,
     time::UnixMillis,
 };
 use serde::{Deserialize, Serialize};
@@ -417,6 +418,64 @@ pub fn run_state(run: &RunRecord, machines: &[MachineEntry<'_>], now: UnixMillis
     }
 
     RunState::Released
+}
+
+/// How often a run object checks that each leased machine on a provider that
+/// [reclaims machines](ProviderName::reclaims_machines) still exists
+pub const PRESENCE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long after a lease starts its machine is first checked
+///
+/// EC2 reads are eventually consistent: a describe sent just after `RunInstances` may not
+/// find the new instance yet, which must not read as an interruption.
+pub const PRESENCE_GRACE: Duration = Duration::from_secs(2 * 60);
+
+/// Returns the machine resource a presence check reads, when one is due: the lease is live
+/// on a provider that reclaims machines, past [`PRESENCE_GRACE`], and its machine was
+/// created
+#[must_use]
+pub fn presence_target<'a>(
+    run: &RunRecord,
+    admitted: &Admitted,
+    holding: &'a Holding<MachineKind>,
+    now: UnixMillis,
+) -> Option<(MachineKind, &'a ResourceId)> {
+    let checked = run.provider.reclaims_machines()
+        && holding.is_live(now)
+        && now >= admitted.created_at.saturating_add(PRESENCE_GRACE);
+    if !checked {
+        return None;
+    }
+
+    <MachineKind as ResourceKind>::ALL
+        .iter()
+        .filter(|kind| kind.is_machine())
+        .find_map(|kind| holding.created(*kind).map(|id| (*kind, id)))
+}
+
+/// Returns when the run object next checks the presence of a live lease's machine, if any
+/// lease of the run is watched
+#[must_use]
+pub fn presence_wake(
+    run: &RunRecord,
+    machines: &[MachineEntry<'_>],
+    now: UnixMillis,
+) -> Option<UnixMillis> {
+    if !run.provider.reclaims_machines() {
+        return None;
+    }
+
+    machines
+        .iter()
+        .filter_map(|entry| {
+            entry.holding.filter(|holding| holding.is_live(now))?;
+            let admitted = entry.record.admitted()?;
+            // a create still in flight has no ID to read yet, so a later wake checks it
+            let next = now.saturating_add(PRESENCE_CHECK_INTERVAL);
+
+            Some(next.max(admitted.created_at.saturating_add(PRESENCE_GRACE)))
+        })
+        .min()
 }
 
 /// How a lease is being ended

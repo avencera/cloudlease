@@ -1,6 +1,7 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeDigitalOcean } from "../../../tests/worker/test/fake-digitalocean";
+import { FakeEc2 } from "./fake-ec2";
 import { FakeLatitude, LATITUDE_PROJECT, recordDescription, type Server } from "./fake-latitude";
 import { FakeNtfy } from "./fake-ntfy";
 import { FakePhoenixNap } from "./fake-phoenixnap";
@@ -86,6 +87,7 @@ describe("Latitude.sh machines in miniflare", () => {
     new FakePhoenixNap().install();
     latitude = new FakeLatitude();
     latitude.install();
+    new FakeEc2().install();
     ntfy = new FakeNtfy();
     ntfy.install();
 

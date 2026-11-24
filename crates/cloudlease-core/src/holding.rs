@@ -410,6 +410,19 @@ impl<K: ResourceKind> Holding<K> {
         }
     }
 
+    /// Returns the ID recorded for `kind` while the holding is leased
+    #[must_use]
+    pub fn created(&self, kind: K) -> Option<&ResourceId> {
+        let HoldingState::Leased { slots, .. } = &self.state else {
+            return None;
+        };
+
+        match slots.get(&kind) {
+            Some(Slot::Created { id }) => Some(id),
+            Some(Slot::Requested) | None => None,
+        }
+    }
+
     /// Reports whether a live lease holds this generation at `now`
     #[must_use]
     pub fn is_live(&self, now: UnixMillis) -> bool {

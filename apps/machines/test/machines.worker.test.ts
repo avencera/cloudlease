@@ -1,6 +1,7 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeDigitalOcean, tags } from "../../../tests/worker/test/fake-digitalocean";
+import { FakeEc2 } from "./fake-ec2";
 import { FakeLatitude } from "./fake-latitude";
 import { FakeNtfy } from "./fake-ntfy";
 import { FakePhoenixNap } from "./fake-phoenixnap";
@@ -59,6 +60,7 @@ describe("cloudlease machines in miniflare", () => {
     // the sweep lists phoenixNAP and Latitude.sh servers too
     new FakePhoenixNap().install();
     new FakeLatitude().install();
+    new FakeEc2().install();
     ntfy = new FakeNtfy();
     ntfy.install();
 
@@ -87,6 +89,7 @@ describe("cloudlease machines in miniflare", () => {
       digitalocean: true,
       phoenixnap: true,
       latitude: true,
+      aws: true,
       ntfy: true,
     });
   });

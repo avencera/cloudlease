@@ -17,8 +17,10 @@
   },
   "observability": { "enabled": true },
   // secrets, set with `wrangler secret put`: DIGITALOCEAN_TOKEN, CLIENT_TOKENS, NTFY_URL,
-  // optionally NTFY_TOKEN, PNAP_CLIENT_ID with PNAP_CLIENT_SECRET for phoenixNAP classes, and
-  // LATITUDE_API_KEY with LATITUDE_PROJECT (the project's proj_ ID) for Latitude.sh classes
+  // optionally NTFY_TOKEN, PNAP_CLIENT_ID with PNAP_CLIENT_SECRET for phoenixNAP classes,
+  // LATITUDE_API_KEY with LATITUDE_PROJECT (the project's proj_ ID) for Latitude.sh classes, and
+  // AWS_ACCESS_KEY_ID with AWS_SECRET_ACCESS_KEY (the cloudlease-machines IAM user from
+  // infra/aws-machines) for AWS classes, which also need the var AWS_REGIONS
   "vars": {
     // every resource this Worker creates or sweeps carries tags with this prefix; no other
     // cloudlease app may use it

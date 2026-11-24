@@ -11,6 +11,10 @@
 //!
 //! A Latitude.sh machine is two resources: the user data record that names its owner, then
 //! the server that boots from it. Only the server is billed.
+//!
+//! An AWS machine is one Spot instance whose root volume and network interface are deleted
+//! with it. It is a one-time request that terminates on interruption, so EC2 never leaves a
+//! stopped instance, a volume or an open Spot request behind for the sweep.
 
 use std::fmt;
 
@@ -20,6 +24,10 @@ use cloudlease_core::{
     tags::{ManagedTags, OwnerTags, ResourceKind},
 };
 use cloudlease_provider::{
+    aws::{
+        AvailabilityZone, AwsInstanceSpec, AwsKind, AwsRegion, IdempotencyKey,
+        InstanceTypeCandidates, RegionalSpec, SubnetId,
+    },
     digitalocean::{DoKind, DoSpec},
     error::{ProviderError, ProviderErrorCode, ProviderResult},
     latitude::{self, LatKind, LatSpec},
@@ -45,6 +53,8 @@ pub enum ProviderName {
     PhoenixNap,
     /// Latitude.sh bare metal servers
     Latitude,
+    /// AWS EC2 Spot instances
+    Aws,
 }
 
 impl ProviderName {
@@ -55,7 +65,18 @@ impl ProviderName {
             Self::DigitalOcean => "digitalocean",
             Self::PhoenixNap => "phoenixnap",
             Self::Latitude => "latitude",
+            Self::Aws => "aws",
         }
+    }
+
+    /// Reports whether the provider may take a machine back while its lease is live, as EC2
+    /// does with a Spot instance when it needs the capacity
+    ///
+    /// The run object checks such a machine's presence while it is leased, so a lease whose
+    /// machine was taken ends as `interrupted` instead of waiting for its heartbeat to lapse.
+    #[must_use]
+    pub const fn reclaims_machines(self) -> bool {
+        matches!(self, Self::Aws)
     }
 }
 
@@ -79,6 +100,8 @@ pub enum MachineKind {
     LatServer,
     /// The Latitude.sh user data record a server boots from, which names its owner
     LatUserData,
+    /// An AWS EC2 Spot instance, with its root volume
+    AwsInstance,
 }
 
 impl MachineKind {
@@ -89,13 +112,17 @@ impl MachineKind {
             Self::Droplet | Self::Volume => ProviderName::DigitalOcean,
             Self::PnapServer => ProviderName::PhoenixNap,
             Self::LatServer | Self::LatUserData => ProviderName::Latitude,
+            Self::AwsInstance => ProviderName::Aws,
         }
     }
 
     /// Reports whether this kind is the machine itself rather than its storage or records
     #[must_use]
     pub const fn is_machine(self) -> bool {
-        matches!(self, Self::Droplet | Self::PnapServer | Self::LatServer)
+        matches!(
+            self,
+            Self::Droplet | Self::PnapServer | Self::LatServer | Self::AwsInstance
+        )
     }
 
     /// Reports whether the provider bills for a resource of this kind
@@ -115,6 +142,7 @@ impl ResourceKind for MachineKind {
         Self::PnapServer,
         Self::LatServer,
         Self::LatUserData,
+        Self::AwsInstance,
     ];
 
     // each provider writes and parses its own kind tags, so these only have to match them;
@@ -127,6 +155,7 @@ impl ResourceKind for MachineKind {
             Self::PnapServer => PnapKind::Server.tag_name(),
             Self::LatServer => LatKind::Server.tag_name(),
             Self::LatUserData => LatKind::UserData.tag_name(),
+            Self::AwsInstance => AwsKind::Instance.tag_name(),
         }
     }
 
@@ -137,6 +166,7 @@ impl ResourceKind for MachineKind {
             Self::PnapServer => PnapKind::Server.delete_rank(),
             Self::LatServer => LatKind::Server.delete_rank(),
             Self::LatUserData => LatKind::UserData.delete_rank(),
+            Self::AwsInstance => AwsKind::Instance.delete_rank(),
         }
     }
 }
@@ -154,6 +184,14 @@ impl From<PnapKind> for MachineKind {
     fn from(kind: PnapKind) -> Self {
         match kind {
             PnapKind::Server => Self::PnapServer,
+        }
+    }
+}
+
+impl From<AwsKind> for MachineKind {
+    fn from(kind: AwsKind) -> Self {
+        match kind {
+            AwsKind::Instance => Self::AwsInstance,
         }
     }
 }
@@ -225,6 +263,33 @@ pub enum LatitudeSpec {
     Server(LatPlacement),
 }
 
+/// The most instance types an AWS class may try in turn
+///
+/// A create tries every type in every zone, so with [`MAX_LOCATIONS`] zones this bounds it
+/// at 12 launches; only quick capacity refusals move it on.
+pub const MAX_INSTANCE_TYPES: usize = 4;
+
+/// An Availability Zone and the subnet an instance is launched into there
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AwsZone {
+    /// The zone, such as `us-east-1a`
+    pub zone: AvailabilityZone,
+    /// A subnet in that zone, such as the default VPC's
+    pub subnet_id: SubnetId,
+}
+
+/// An AWS Spot instance and the zones and instance types it may be launched with
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AwsPlacement {
+    /// The region
+    pub region: AwsRegion,
+    /// The instance; its types, zone, subnet and idempotency key are replaced by each
+    /// attempt's
+    pub instance: AwsInstanceSpec,
+    /// Where to try, first to last, for each instance type in turn
+    pub zones: Locations<AwsZone>,
+}
+
 /// A create request for one resource of a machine
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MachineSpec {
@@ -234,6 +299,8 @@ pub enum MachineSpec {
     PhoenixNap(PnapPlacement),
     /// A Latitude.sh user data record or server
     Latitude(LatitudeSpec),
+    /// An AWS Spot instance, tried with each instance type in each zone until one launches
+    Aws(AwsPlacement),
 }
 
 impl CreateSpec for MachineSpec {
@@ -245,33 +312,42 @@ impl CreateSpec for MachineSpec {
             Self::PhoenixNap(_) => MachineKind::PnapServer,
             Self::Latitude(LatitudeSpec::UserData(_)) => MachineKind::LatUserData,
             Self::Latitude(LatitudeSpec::Server(_)) => MachineKind::LatServer,
+            Self::Aws(_) => MachineKind::AwsInstance,
         }
     }
 }
 
 /// Every provider the machines app can use, as one [`CloudProvider`]
 ///
-/// DigitalOcean is always configured. phoenixNAP and Latitude.sh are optional: without one,
-/// its creates, deletes, reads and tag searches fail with a validation error, and the
+/// DigitalOcean is always configured. phoenixNAP, Latitude.sh and AWS are optional: without
+/// one, its creates, deletes, reads and tag searches fail with a validation error, and the
 /// inventory holds the other providers' resources only.
-pub struct Providers<D, P, L> {
+pub struct Providers<D, P, L, A> {
     digitalocean: D,
     phoenixnap: Option<P>,
     latitude: Option<L>,
+    aws: Option<A>,
 }
 
-impl<D, P, L> Providers<D, P, L>
+impl<D, P, L, A> Providers<D, P, L, A>
 where
     D: CloudProvider<Kind = DoKind, Spec = DoSpec>,
     P: CloudProvider<Kind = PnapKind, Spec = PnapSpec>,
     L: CloudProvider<Kind = LatKind, Spec = LatSpec>,
+    A: CloudProvider<Kind = AwsKind, Spec = RegionalSpec>,
 {
     /// Combines the configured adapters
-    pub const fn new(digitalocean: D, phoenixnap: Option<P>, latitude: Option<L>) -> Self {
+    pub const fn new(
+        digitalocean: D,
+        phoenixnap: Option<P>,
+        latitude: Option<L>,
+        aws: Option<A>,
+    ) -> Self {
         Self {
             digitalocean,
             phoenixnap,
             latitude,
+            aws,
         }
     }
 
@@ -282,7 +358,74 @@ where
             ProviderName::DigitalOcean => true,
             ProviderName::PhoenixNap => self.phoenixnap.is_some(),
             ProviderName::Latitude => self.latitude.is_some(),
+            ProviderName::Aws => self.aws.is_some(),
         }
+    }
+
+    fn aws(&self) -> ProviderResult<&A> {
+        self.aws.as_ref().ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorCode::Validation,
+                false,
+                "AWS is not configured: set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and \
+                 AWS_REGIONS",
+            )
+        })
+    }
+
+    /// Launches the instance with each instance type in each zone in turn until one has
+    /// Spot capacity under the class's price cap
+    ///
+    /// Types are the outer loop, so a cheaper type is tried in every zone before a dearer
+    /// one. Only `NoCapacity` moves on, since EC2 launched nothing; any other failure may
+    /// have launched the instance, so it ends the create for the lease's cleanup. Each zone
+    /// gets its own idempotency key, so a type's client token never repeats with other
+    /// parameters.
+    async fn create_instance(
+        &self,
+        owner: &OwnerTags,
+        placement: &AwsPlacement,
+    ) -> ProviderResult<ResourceId> {
+        let aws = self.aws()?;
+        let mut refused = Vec::new();
+        for instance_type in placement.instance.instance_types.as_slice() {
+            for zone in placement.zones.as_slice() {
+                let key = format!(
+                    "{}-{}",
+                    placement.instance.idempotency_key.as_str(),
+                    zone.zone.as_str()
+                );
+                let spec = RegionalSpec {
+                    region: placement.region.clone(),
+                    instance: AwsInstanceSpec {
+                        instance_types: InstanceTypeCandidates::new(vec![instance_type.clone()])?,
+                        availability_zone: zone.zone.clone(),
+                        subnet_id: zone.subnet_id.clone(),
+                        idempotency_key: IdempotencyKey::parse(key)?,
+                        ..placement.instance.clone()
+                    },
+                };
+                match aws.create(owner, &spec).await {
+                    Err(error) if error.code == ProviderErrorCode::NoCapacity => {
+                        refused.push(format!(
+                            "{} in {}",
+                            instance_type.as_str(),
+                            zone.zone.as_str()
+                        ));
+                    }
+                    result => return result,
+                }
+            }
+        }
+
+        Err(ProviderError::new(
+            ProviderErrorCode::NoCapacity,
+            false,
+            format!(
+                "AWS has no Spot capacity under the price cap for {}",
+                refused.join(", ")
+            ),
+        ))
     }
 
     fn latitude(&self) -> ProviderResult<&L> {
@@ -381,6 +524,7 @@ enum ProviderKind {
     DigitalOcean(DoKind),
     PhoenixNap(PnapKind),
     Latitude(LatKind),
+    Aws(AwsKind),
 }
 
 impl From<MachineKind> for ProviderKind {
@@ -391,6 +535,7 @@ impl From<MachineKind> for ProviderKind {
             MachineKind::PnapServer => Self::PhoenixNap(PnapKind::Server),
             MachineKind::LatServer => Self::Latitude(LatKind::Server),
             MachineKind::LatUserData => Self::Latitude(LatKind::UserData),
+            MachineKind::AwsInstance => Self::Aws(AwsKind::Instance),
         }
     }
 }
@@ -426,11 +571,12 @@ fn add<K: Into<MachineKind>>(
     into.unlisted.extend(inventory.unlisted);
 }
 
-impl<D, P, L> CloudProvider for Providers<D, P, L>
+impl<D, P, L, A> CloudProvider for Providers<D, P, L, A>
 where
     D: CloudProvider<Kind = DoKind, Spec = DoSpec>,
     P: CloudProvider<Kind = PnapKind, Spec = PnapSpec>,
     L: CloudProvider<Kind = LatKind, Spec = LatSpec>,
+    A: CloudProvider<Kind = AwsKind, Spec = RegionalSpec>,
 {
     type Kind = MachineKind;
     type Spec = MachineSpec;
@@ -447,6 +593,7 @@ where
             MachineSpec::Latitude(LatitudeSpec::Server(placement)) => {
                 self.create_latitude_server(owner, placement).await
             }
+            MachineSpec::Aws(placement) => self.create_instance(owner, placement).await,
         }
     }
 
@@ -455,6 +602,7 @@ where
             ProviderKind::DigitalOcean(kind) => self.digitalocean.delete(kind, id).await,
             ProviderKind::PhoenixNap(kind) => self.phoenixnap()?.delete(kind, id).await,
             ProviderKind::Latitude(kind) => self.latitude()?.delete(kind, id).await,
+            ProviderKind::Aws(kind) => self.aws()?.delete(kind, id).await,
         }
     }
 
@@ -463,6 +611,7 @@ where
             ProviderKind::DigitalOcean(kind) => self.digitalocean.presence(kind, id).await,
             ProviderKind::PhoenixNap(kind) => self.phoenixnap()?.presence(kind, id).await,
             ProviderKind::Latitude(kind) => self.latitude()?.presence(kind, id).await,
+            ProviderKind::Aws(kind) => self.aws()?.presence(kind, id).await,
         }
     }
 
@@ -480,6 +629,7 @@ where
                 self.phoenixnap()?.find(owner, generation, kind).await
             }
             ProviderKind::Latitude(kind) => self.latitude()?.find(owner, generation, kind).await,
+            ProviderKind::Aws(kind) => self.aws()?.find(owner, generation, kind).await,
         }
     }
 
@@ -511,6 +661,9 @@ where
                 latitude.inventory().await,
             );
         }
+        if let Some(aws) = &self.aws {
+            add(&mut inventory, ProviderName::Aws, aws.inventory().await);
+        }
 
         Ok(inventory)
     }
@@ -539,6 +692,8 @@ mod tests {
         assert!(MachineKind::Droplet.delete_rank() < MachineKind::Volume.delete_rank());
         assert_eq!(MachineKind::from(DoKind::Volume), MachineKind::Volume);
         assert!(MachineKind::PnapServer.is_machine() && !MachineKind::Volume.is_machine());
+        assert_eq!(MachineKind::AwsInstance.tag_name(), "instance");
+        assert!(MachineKind::AwsInstance.is_machine() && MachineKind::AwsInstance.is_billed());
     }
 
     #[test]
