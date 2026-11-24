@@ -30,6 +30,8 @@ pub enum ProviderErrorCode {
     ///
     /// Not retryable as-is; a caller may try another location, type or provider.
     NoCapacity,
+    /// An account quota or limit blocks the request, such as a vCPU or Spot instance limit
+    QuotaExceeded,
     /// The provider response did not match the expected schema
     InvalidResponse,
     /// Provider state broke an ownership invariant

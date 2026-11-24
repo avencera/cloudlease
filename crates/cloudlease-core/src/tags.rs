@@ -7,6 +7,12 @@
 //! - `{p}-gen-{generation}`
 //! - `{p}-kind-{kind}`
 //! - optionally `{p}-until-{unix seconds}`, the resource's ceiling
+//! - with [`TagScheme::with_selector`], `{p}-sel-{owner}-{generation}`, which a provider
+//!   object that selects resources by tag (a DigitalOcean firewall) can name on its own
+//!
+//! Providers with key and value tags (AWS) use [`TagScheme::render_pairs`] and
+//! [`TagScheme::classify_pairs`]: each tag above becomes the key `{p}-{field}` with the rest
+//! as its value, and `{p}-managed` takes the value [`MANAGED_VALUE`].
 //!
 //! A resource carrying `{p}-managed` with any other shape is [`TagMatch::Unrecognized`]: it
 //! is reported and never deleted automatically, because something other than this app may
@@ -181,17 +187,69 @@ pub enum TagMatch<K> {
     Unrecognized(UnrecognizedReason),
 }
 
+/// The value of the `{p}-managed` key in the key and value encoding
+pub const MANAGED_VALUE: &str = "true";
+
+// the fields after `{p}-` that carry a value; `managed` carries none
+const VALUE_FIELDS: [&str; 5] = ["owner", "gen", "kind", "until", "sel"];
+
 /// One app's tag prefix and the rules for rendering and matching its tags
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TagScheme {
     prefix: TagPrefix,
+    selector: bool,
 }
 
 impl TagScheme {
     /// Creates a scheme for one app prefix
     #[must_use]
     pub const fn new(prefix: TagPrefix) -> Self {
-        Self { prefix }
+        Self {
+            prefix,
+            selector: false,
+        }
+    }
+
+    /// Makes every managed resource carry `{p}-sel-{owner}-{generation}`
+    ///
+    /// A provider object that applies to resources by tag, such as a DigitalOcean firewall,
+    /// can then select exactly one generation's resources and carry that one tag as its own
+    /// identity. The selector is part of the exact set: once enabled, a resource without it
+    /// is unrecognized, and without it, a resource carrying one is.
+    #[must_use]
+    pub fn with_selector(self) -> Self {
+        Self {
+            selector: true,
+            ..self
+        }
+    }
+
+    /// Returns whether managed resources carry a selector tag
+    #[must_use]
+    pub const fn has_selector(&self) -> bool {
+        self.selector
+    }
+
+    /// Returns the selector tag for one owner and generation
+    #[must_use]
+    pub fn selector_tag(&self, owner: &OwnerId, generation: Generation) -> String {
+        format!("{}-sel-{owner}-{generation}", self.prefix)
+    }
+
+    /// Reads the owner and generation back from a selector tag
+    ///
+    /// Owners may contain dashes but generations never do, so the last dash splits them;
+    /// only a tag that renders back exactly is accepted.
+    #[must_use]
+    pub fn parse_selector(&self, tag: &str) -> Option<(OwnerId, Generation)> {
+        let rest = tag
+            .strip_prefix(self.prefix.as_str())?
+            .strip_prefix("-sel-")?;
+        let (owner, generation) = rest.rsplit_once('-')?;
+        let owner = OwnerId::parse(owner).ok()?;
+        let generation = Generation::new(parse_canonical_u64(generation)?).ok()?;
+
+        (self.selector_tag(&owner, generation) == tag).then_some((owner, generation))
     }
 
     /// Returns the app prefix
@@ -228,8 +286,68 @@ impl TagScheme {
         if let Some(ceiling) = owner.ceiling {
             rendered.push(format!("{prefix}-until-{}", ceiling.as_unix_seconds()));
         }
+        if self.selector {
+            rendered.push(self.selector_tag(&owner.owner, owner.generation));
+        }
 
         rendered
+    }
+
+    /// Renders the exact tag set as keys and values, for providers whose tags are pairs
+    #[must_use]
+    pub fn render_pairs<K: ResourceKind>(
+        &self,
+        owner: &OwnerTags,
+        kind: K,
+    ) -> Vec<(String, String)> {
+        let managed = self.managed_tag();
+
+        self.render(owner, kind)
+            .into_iter()
+            .map(|tag| {
+                if tag == managed {
+                    return (tag, MANAGED_VALUE.to_owned());
+                }
+
+                // every rendered tag other than the managed one is `{p}-{field}-{value}`
+                let rest = &tag[self.prefix.as_str().len() + 1..];
+                let (field, value) = rest.split_once('-').unwrap_or((rest, ""));
+                (format!("{}-{field}", self.prefix), value.to_owned())
+            })
+            .collect()
+    }
+
+    /// Classifies key and value tags as foreign, exactly managed or unrecognized
+    ///
+    /// The caller leaves out keys the provider reserves for display, such as AWS `Name`.
+    #[must_use]
+    pub fn classify_pairs<K: ResourceKind>(&self, pairs: &[(String, String)]) -> TagMatch<K> {
+        let managed = self.managed_tag();
+        let Some((_, marker)) = pairs.iter().find(|(key, _)| key == &managed) else {
+            return TagMatch::Foreign;
+        };
+        if marker != MANAGED_VALUE {
+            return TagMatch::Unrecognized(UnrecognizedReason::InvalidValue);
+        }
+
+        let mut tags = Vec::with_capacity(pairs.len());
+        for (key, value) in pairs {
+            if key == &managed {
+                tags.push(managed.clone());
+                continue;
+            }
+
+            let field = key
+                .strip_prefix(self.prefix.as_str())
+                .and_then(|rest| rest.strip_prefix('-'));
+            match field {
+                // with exact field keys, `{key}-{value}` maps back to exactly one pair
+                Some(field) if VALUE_FIELDS.contains(&field) => tags.push(format!("{key}-{value}")),
+                _ => return TagMatch::Unrecognized(UnrecognizedReason::ExtraTag),
+            }
+        }
+
+        self.classify(&tags)
     }
 
     /// Classifies a provider tag list as foreign, exactly managed or unrecognized
@@ -275,6 +393,9 @@ impl TagScheme {
                 (&mut kind, value)
             } else if let Some(value) = rest.strip_prefix("until-") {
                 ceilings.push(value);
+                continue;
+            } else if self.selector && rest.starts_with("sel-") {
+                // the round trip below checks it names this owner and generation
                 continue;
             } else {
                 return Err(UnrecognizedReason::ExtraTag);
@@ -540,5 +661,96 @@ mod tests {
         assert_eq!(ceiling.as_unix_seconds(), 10);
         assert!(!ceiling.is_reached_at(UnixMillis::new(9_999).unwrap()));
         assert!(ceiling.is_reached_at(UnixMillis::new(10_000).unwrap()));
+    }
+
+    #[test]
+    fn a_selector_scheme_requires_its_own_selector_and_names_it_alone() {
+        let plain = scheme();
+        let selecting = scheme().with_selector();
+        let owner = OwnerTags {
+            owner: OwnerId::parse("prj_a-1").unwrap(),
+            generation: Generation::new(12).unwrap(),
+            ceiling: None,
+        };
+        let rendered = selecting.render(&owner, Kind::Machine);
+        assert!(rendered.contains(&"cl-sel-prj_a-1-12".to_owned()));
+        assert_eq!(
+            selecting.classify::<Kind>(&rendered),
+            TagMatch::Managed(owner.with_kind(Kind::Machine))
+        );
+
+        // the selector is part of the exact set in both directions
+        assert_eq!(
+            plain.classify::<Kind>(&rendered),
+            TagMatch::Unrecognized(UnrecognizedReason::ExtraTag)
+        );
+        let without = plain.render(&owner, Kind::Machine);
+        assert!(matches!(
+            selecting.classify::<Kind>(&without),
+            TagMatch::Unrecognized(_)
+        ));
+        let mut other = rendered.clone();
+        other.retain(|tag| !tag.starts_with("cl-sel-"));
+        other.push("cl-sel-prj_a-1-13".to_owned());
+        assert!(matches!(
+            selecting.classify::<Kind>(&other),
+            TagMatch::Unrecognized(_)
+        ));
+
+        assert_eq!(
+            selecting.parse_selector("cl-sel-prj_a-1-12"),
+            Some((owner.owner.clone(), owner.generation))
+        );
+        assert_eq!(selecting.parse_selector("cl-sel-prj_a-1-012"), None);
+        assert_eq!(selecting.parse_selector("cl-sel-12"), None);
+        assert_eq!(selecting.parse_selector("rb-sel-prj_a-1-12"), None);
+    }
+
+    #[test]
+    fn pairs_round_trip_and_reject_foreign_keys_and_markers() {
+        let scheme = scheme();
+        let ceiling = Ceiling::at_or_before(UnixMillis::new(1_764_000_000_999).unwrap());
+        let pairs = scheme.render_pairs(&owner(Some(ceiling)), Kind::Disk);
+        let pair = |key: &str, value: &str| (key.to_owned(), value.to_owned());
+        assert_eq!(
+            pairs,
+            vec![
+                pair("cl-managed", "true"),
+                pair("cl-owner", "job_1"),
+                pair("cl-gen", "7"),
+                pair("cl-kind", "disk"),
+                pair("cl-until", "1764000000"),
+            ]
+        );
+        assert_eq!(
+            scheme.classify_pairs::<Kind>(&pairs),
+            TagMatch::Managed(tags(Some(ceiling)))
+        );
+
+        let mut foreign_key = pairs.clone();
+        foreign_key.push(pair("cl-lane", "lane_1"));
+        assert_eq!(
+            scheme.classify_pairs::<Kind>(&foreign_key),
+            TagMatch::Unrecognized(UnrecognizedReason::ExtraTag)
+        );
+
+        // an older shape that reused the managed key keeps its resources visible
+        let legacy = vec![pair("cl-managed", "rembuild"), pair("cl-project", "x")];
+        assert_eq!(
+            scheme.classify_pairs::<Kind>(&legacy),
+            TagMatch::Unrecognized(UnrecognizedReason::InvalidValue)
+        );
+        assert_eq!(
+            scheme.classify_pairs::<Kind>(&[pair("Name", "x")]),
+            TagMatch::Foreign
+        );
+
+        // a value that would only split differently as a string is still exact
+        let mut moved = pairs;
+        moved[1] = pair("cl-owner", "job_1-gen-8");
+        assert!(matches!(
+            scheme.classify_pairs::<Kind>(&moved),
+            TagMatch::Managed(parsed) if parsed.owner.as_str() == "job_1-gen-8"
+        ));
     }
 }

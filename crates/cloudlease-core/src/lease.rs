@@ -264,21 +264,44 @@ impl Lease {
     }
 }
 
-#[derive(Deserialize)]
+/// The stored fields of a [`Lease`], for apps that keep a lease in their own record shape
+///
+/// [`Lease::try_from`] checks the same invariants as deserializing a lease, so a record
+/// written by an app under its own field names cannot produce an inconsistent lease.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct LeaseWire {
-    id: LeaseId,
-    started_at: UnixMillis,
-    last_heartbeat_at: UnixMillis,
-    last_sequence: u64,
-    heartbeat_due_at: UnixMillis,
-    hard_deadline: UnixMillis,
+pub struct LeaseParts {
+    /// The lease identifier
+    pub id: LeaseId,
+    /// When the lease started
+    pub started_at: UnixMillis,
+    /// When the last heartbeat was accepted, or the start time
+    pub last_heartbeat_at: UnixMillis,
+    /// The last accepted heartbeat sequence number, or zero
+    pub last_sequence: u64,
+    /// When the lease expires without another heartbeat
+    pub heartbeat_due_at: UnixMillis,
+    /// When the lease expires regardless of heartbeats
+    pub hard_deadline: UnixMillis,
 }
 
-impl TryFrom<LeaseWire> for Lease {
+impl From<&Lease> for LeaseParts {
+    fn from(lease: &Lease) -> Self {
+        Self {
+            id: lease.id.clone(),
+            started_at: lease.started_at,
+            last_heartbeat_at: lease.last_heartbeat_at,
+            last_sequence: lease.last_sequence,
+            heartbeat_due_at: lease.heartbeat_due_at,
+            hard_deadline: lease.hard_deadline,
+        }
+    }
+}
+
+impl TryFrom<LeaseParts> for Lease {
     type Error = LeaseError;
 
-    fn try_from(wire: LeaseWire) -> Result<Self, Self::Error> {
+    fn try_from(wire: LeaseParts) -> Result<Self, Self::Error> {
         if wire.started_at > wire.last_heartbeat_at || wire.heartbeat_due_at > wire.hard_deadline {
             return Err(LeaseError::Inconsistent);
         }
@@ -299,7 +322,7 @@ impl<'de> Deserialize<'de> for Lease {
     where
         D: serde::Deserializer<'de>,
     {
-        Self::try_from(LeaseWire::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+        Self::try_from(LeaseParts::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -307,7 +330,7 @@ impl<'de> Deserialize<'de> for Lease {
 mod tests {
     use std::time::Duration;
 
-    use super::{Expiry, Lease, LeaseError, LeasePolicy};
+    use super::{Expiry, Lease, LeaseError, LeaseParts, LeasePolicy};
     use crate::{ids::LeaseId, time::UnixMillis};
 
     const MINUTE: Duration = Duration::from_secs(60);
@@ -466,5 +489,15 @@ mod tests {
         let mut broken = json;
         broken["heartbeatDueAt"] = (lease.hard_deadline().as_millis() + 1).into();
         assert!(serde_json::from_value::<Lease>(broken).is_err());
+
+        // an app's own record converts through the same checks
+        let parts = LeaseParts::from(&lease);
+        assert_eq!(Lease::try_from(parts.clone()), Ok(lease.clone()));
+        let backwards = LeaseParts {
+            last_heartbeat_at: at(0),
+            started_at: at(1),
+            ..parts
+        };
+        assert_eq!(Lease::try_from(backwards), Err(LeaseError::Inconsistent));
     }
 }
