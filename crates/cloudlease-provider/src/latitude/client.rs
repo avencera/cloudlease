@@ -152,11 +152,18 @@ impl<T: HttpTransport, R: Runtime> LatitudeClient<T, R> {
         &self.runtime
     }
 
-    /// Lists every server in the team, or those Latitude.sh matches to `hostname`
+    /// Lists every server in `project`, or those Latitude.sh matches to `hostname`
     ///
-    /// The filter only narrows the list; callers still compare hostnames themselves.
-    pub async fn list_servers(&self, hostname: Option<&str>) -> ProviderResult<Vec<WireServer>> {
+    /// The hostname filter only narrows the list; callers still compare hostnames themselves.
+    /// Without the project filter Latitude.sh lists the whole team's servers.
+    pub async fn list_servers(
+        &self,
+        project: &str,
+        hostname: Option<&str>,
+    ) -> ProviderResult<Vec<WireServer>> {
         let mut url = self.url_for("servers")?;
+        url.query_pairs_mut()
+            .append_pair("filter[project]", project);
         if let Some(hostname) = hostname {
             url.query_pairs_mut()
                 .append_pair("filter[hostname][eql]", hostname);
@@ -187,9 +194,11 @@ impl<T: HttpTransport, R: Runtime> LatitudeClient<T, R> {
         self.delete(url, "delete server").await
     }
 
-    /// Lists every user data resource the key can see
-    pub async fn list_user_data(&self) -> ProviderResult<Vec<WireUserData>> {
-        let url = self.url_for("user_data")?;
+    /// Lists every user data resource in `project`
+    pub async fn list_user_data(&self, project: &str) -> ProviderResult<Vec<WireUserData>> {
+        let mut url = self.url_for("user_data")?;
+        url.query_pairs_mut()
+            .append_pair("filter[project]", project);
 
         self.list(url, "list user data").await
     }

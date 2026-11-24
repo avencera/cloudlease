@@ -2,7 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     rc::Rc,
     task::{Context, Poll, Waker},
@@ -41,6 +41,8 @@ struct FakeApi {
     servers: BTreeMap<String, String>,
     // user data ID to description
     user_data: BTreeMap<String, String>,
+    // servers and user data in another project of the same team
+    other_project: BTreeSet<String>,
     next_id: u64,
     log: Vec<String>,
     bodies: Vec<Value>,
@@ -118,16 +120,32 @@ impl FakeApi {
         json!({ "id": id, "type": "user_data", "attributes": { "description": description } })
     }
 
-    fn list_servers(&self, request: &HttpRequest) -> HttpResponse {
-        let hostname = request
+    fn filter(request: &HttpRequest, name: &str) -> Option<String> {
+        request
             .url
             .query_pairs()
-            .find(|(key, _)| key == "filter[hostname][eql]")
-            .map(|(_, value)| value.into_owned());
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+    }
+
+    // like Latitude.sh, an unfiltered list returns the whole team
+    fn in_project(&self, request: &HttpRequest, id: &str) -> bool {
+        match Self::filter(request, "filter[project]").as_deref() {
+            None => true,
+            Some("proj_test") => !self.other_project.contains(id),
+            Some(_) => self.other_project.contains(id),
+        }
+    }
+
+    fn list_servers(&self, request: &HttpRequest) -> HttpResponse {
+        let hostname = Self::filter(request, "filter[hostname][eql]");
         let items = self
             .servers
             .iter()
-            .filter(|(_, name)| hostname.as_ref().is_none_or(|wanted| *name == wanted))
+            .filter(|(id, name)| {
+                self.in_project(request, id)
+                    && hostname.as_ref().is_none_or(|wanted| *name == wanted)
+            })
             .map(|(id, name)| Self::server_json(id, name))
             .collect();
 
@@ -138,6 +156,7 @@ impl FakeApi {
         let items = self
             .user_data
             .iter()
+            .filter(|(id, _)| self.in_project(request, id))
             .map(|(id, description)| Self::user_data_json(id, description))
             .collect();
 
@@ -461,6 +480,15 @@ fn inventory_reads_every_page_and_reports_namespace_servers_without_one_record()
             "ud_bad".to_owned(),
             "cl-managed cl-owner-run_9 cl-gen-1 cl-kind-userdata extra".to_owned(),
         );
+        // another project's deployment of the same app, which its own sweep owns
+        api.servers
+            .insert("sv_elsewhere".to_owned(), "cl-1111111111111111".to_owned());
+        api.user_data.insert(
+            "ud_elsewhere".to_owned(),
+            "cl-managed cl-owner-run_2 cl-gen-1 cl-kind-userdata".to_owned(),
+        );
+        api.other_project
+            .extend(["sv_elsewhere".to_owned(), "ud_elsewhere".to_owned()]);
     }
 
     let inventory = block_on(harness.provider.inventory()).unwrap();

@@ -19,6 +19,10 @@
 //!
 //! Servers have delete rank 0 and user data rank 1, so cleanup confirms a server gone
 //! before it deletes the record that names its owner.
+//!
+//! Every list is filtered to the adapter's project. Latitude.sh lists the whole team
+//! otherwise, and another project's owner store does not know this app's owners, so a sweep
+//! there must not see these servers or this one see theirs.
 
 pub mod client;
 
@@ -151,7 +155,8 @@ pub struct Latitude<T, R> {
 }
 
 impl<T: HttpTransport, R: Runtime> Latitude<T, R> {
-    /// Creates an adapter that creates resources in `project` with `scheme`'s tags
+    /// Creates an adapter that creates, finds and sweeps resources in `project` only, with
+    /// `scheme`'s tags
     pub const fn new(client: LatitudeClient<T, R>, scheme: TagScheme, project: Slug) -> Self {
         Self {
             client,
@@ -272,8 +277,11 @@ impl<T: HttpTransport, R: Runtime> Latitude<T, R> {
     }
 
     async fn classified(&self) -> ProviderResult<Vec<Result<Observed<LatKind>, Unrecognized>>> {
-        let records = self.client.list_user_data().await?;
-        let servers = self.client.list_servers(None).await?;
+        let records = self.client.list_user_data(self.project.as_str()).await?;
+        let servers = self
+            .client
+            .list_servers(self.project.as_str(), None)
+            .await?;
 
         let records: Vec<_> = records
             .into_iter()
@@ -300,7 +308,10 @@ impl<T: HttpTransport, R: Runtime> Latitude<T, R> {
         generation: Generation,
     ) -> ProviderResult<Vec<ResourceId>> {
         let hostname = self.hostname(owner, generation);
-        let servers = self.client.list_servers(Some(&hostname)).await?;
+        let servers = self
+            .client
+            .list_servers(self.project.as_str(), Some(&hostname))
+            .await?;
 
         servers
             .into_iter()
@@ -314,7 +325,7 @@ impl<T: HttpTransport, R: Runtime> Latitude<T, R> {
         owner: &OwnerId,
         generation: Generation,
     ) -> ProviderResult<Vec<ResourceId>> {
-        let records = self.client.list_user_data().await?;
+        let records = self.client.list_user_data(self.project.as_str()).await?;
 
         Ok(records
             .into_iter()
