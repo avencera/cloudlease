@@ -64,8 +64,10 @@ it, with a core holding.
    `max_hours` from its create. The run object's alarm fires then and deletes the machine.
    The deadline is also the droplet's `until` tag, so the sweep deletes it even if the run
    object is broken.
-2. **Heartbeat.** The machine must renew within 10 minutes (15 minutes after create, for
-   boot). A missed heartbeat ends the lease on the alarm, or on any earlier read or renew
+2. **Heartbeat.** The machine must renew within the heartbeat window, 3 minutes by
+   default, and first within the boot grace, 8 minutes after create by default; homebased
+   renews every 30 seconds. A run keeps the windows the config had when the run was
+   created, so renews never read the config. A missed heartbeat ends the lease on the alarm, or on any earlier read or renew
    of it; a release ends it at once.
 3. **Tag sweep.** Every 5 minutes the cron trigger lists every droplet and volume tagged
    with `CLOUDLEASE_TAG_PREFIX`. It first deletes every one past its `until` tag, without
@@ -124,7 +126,7 @@ the Worker log either way:
 | `NTFY_TOKEN` | secret, optional | an ntfy access token |
 | `CLOUDLEASE_TAG_PREFIX` | var | the tag prefix; no other cloudlease app may share it |
 | `HOURLY_SPEND_CAP_CENTS` | var | the hourly cap, default 100 |
-| `MACHINES_CONFIG` | var, JSON | `api_base`, `max_run_hours`, `max_machines_per_run`, `run_spend_cap_usd`, `classes` and the classes each app may use |
+| `MACHINES_CONFIG` | var, JSON | `api_base`, `max_run_hours`, `max_machines_per_run`, `run_spend_cap_usd`, `heartbeat_ttl_secs` (default 180, at least 60), `boot_grace_secs` (default 480, at least the heartbeat window), `classes` and the classes each app may use |
 
 A class is `{region, size, image, price_per_hour_usd, max_hours, volume?: {size_gib,
 mount}, ssh_key_ids?, vpc_uuid?}`. `api_base` is the URL machines renew at, written into

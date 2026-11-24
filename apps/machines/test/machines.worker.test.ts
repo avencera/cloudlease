@@ -121,16 +121,19 @@ async function createMachine(run: RunView, hostname: string): Promise<LeaseView>
   return response.json();
 }
 
-// the lease token reaches the machine only inside its user data
-function leaseToken(hostname: string): string {
+// the lease file reaches the machine only inside its user data
+function leaseFile(hostname: string): { token: string; heartbeat_ttl_secs: number } {
   const droplet = [...fake.droplets.values()].find((candidate) => candidate.name === hostname);
   expect(droplet).toBeDefined();
   const match = /cloudlease_write '\/etc\/cloudlease\/lease\.json' 0600 '([A-Za-z0-9+/=]+)'/.exec(
     droplet?.userData ?? "",
   );
   expect(match).not.toBeNull();
-  const lease = JSON.parse(atob(match?.[1] ?? "")) as { token: string };
-  return lease.token;
+  return JSON.parse(atob(match?.[1] ?? ""));
+}
+
+function leaseToken(hostname: string): string {
+  return leaseFile(hostname).token;
 }
 
 function dropletOf(hostname: string) {
@@ -332,6 +335,9 @@ describe("cloudlease machines in miniflare", () => {
     );
     expect(droplet?.userData).toContain("systemctl");
     expect(leaseToken("hb-idempotent-1")).toMatch(/^cll_[0-9a-f]{64}$/);
+    expect(leaseFile("hb-idempotent-1").heartbeat_ttl_secs).toBe(180);
+    // the first renew is due within the default 8 minute boot grace
+    expect(Date.parse(lease.heartbeat_deadline_at) - Date.parse(lease.created_at)).toBe(8 * MINUTE);
     expect(await permits()).toEqual([expect.objectContaining({ ownerId: run.run_id, generation: 1, units: 1 })]);
   });
 
@@ -345,8 +351,9 @@ describe("cloudlease machines in miniflare", () => {
     expect(renewed.status).toBe(200);
     const view = (await renewed.json()) as { heartbeat_deadline_at: string; hard_deadline_at: string };
     const due = Date.parse(view.heartbeat_deadline_at);
-    expect(due).toBeGreaterThan(Date.now() + 9 * MINUTE);
-    expect(due).toBeLessThanOrEqual(Date.now() + 10 * MINUTE);
+    // the default heartbeat window is 3 minutes
+    expect(due).toBeGreaterThan(Date.now() + 2 * MINUTE);
+    expect(due).toBeLessThanOrEqual(Date.now() + 3 * MINUTE);
     expect(view.hard_deadline_at).toBe(first.hard_deadline_at);
 
     // the machine may read its own lease
@@ -516,13 +523,6 @@ describe("cloudlease machines in miniflare", () => {
     expect(view.release).toMatchObject({ reason: "heartbeat_lapsed", by: "cloudlease" });
   });
 
-  it("refuses a machine past max_machines", async () => {
-    const run = await createRun({ max_machines: 1 });
-    await createMachine(run, "hb-full-1");
-
-    await expectError(
-      await call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-full-2")),
-      409,
   it("never gives an expired pending create's generation to a later request", async () => {
     const run = await createRun();
     const stub = runStub(run.run_id);
@@ -574,6 +574,13 @@ describe("cloudlease machines in miniflare", () => {
     expect((await permits()).map((permit) => permit.generation)).toEqual([2]);
   }, 20_000);
 
+  it("refuses a machine past max_machines", async () => {
+    const run = await createRun({ max_machines: 1 });
+    await createMachine(run, "hb-full-1");
+
+    await expectError(
+      await call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-full-2")),
+      409,
       "run_full",
     );
     expect(fake.droplets.size).toBe(1);

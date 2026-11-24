@@ -18,7 +18,7 @@ use cloudlease_core::{
 use cloudlease_machines::{
     alert::{Alert, Priority},
     boot::{Boot, LeaseFile, VolumeMount, check_fits, render_user_data},
-    config::{HEARTBEAT_TTL, MachineClass, MachinesConfig, renew_policy},
+    config::{MachineClass, MachinesConfig},
     ids::{AppName, RunId},
     money::MicroUsd,
     run::{
@@ -304,6 +304,7 @@ impl Run {
             price_per_hour: class.price_per_hour,
             gate_units: class.gate_units,
             spend_cap,
+            heartbeat: config.heartbeat,
             requested_spend_cap_cents: request.spend_cap_cents,
             ended: None,
             create_failure_alerted: false,
@@ -475,7 +476,11 @@ impl Run {
                 .machine_id(&loaded.run.run_id)
                 .lease_id()
                 .map_err(internal)?;
-            let policy = class.lease_policy().map_err(internal)?;
+            let policy = loaded
+                .run
+                .heartbeat
+                .lease_policy(class.max_lifetime)
+                .map_err(internal)?;
             Lease::start(lease_id, &policy, now, Some(loaded.run.deadline_at)).map_err(internal)
         });
         let lease = match started {
@@ -579,7 +584,7 @@ impl Run {
                 token: token.expose(),
                 api_base: &config.api_base,
                 hard_deadline_at: Timestamp(admitted.hard_deadline_at),
-                heartbeat_ttl_secs: HEARTBEAT_TTL.as_secs(),
+                heartbeat_ttl_secs: run.heartbeat.ttl().as_secs(),
             },
             mount,
             boot,
@@ -746,7 +751,7 @@ impl Run {
             .machine_id(&loaded.run.run_id)
             .lease_id()
             .map_err(internal)?;
-        let policy = renew_policy().map_err(internal)?;
+        let policy = loaded.run.heartbeat.renew_policy().map_err(internal)?;
 
         match machine.holding.renew(&lease_id, now, &policy) {
             Ok(renewed) => {

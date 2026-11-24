@@ -17,7 +17,7 @@ use cloudlease_core::{
     lease::{LeaseError, LeasePolicy},
 };
 use cloudlease_provider::digitalocean::{DropletImage, Slug};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -26,11 +26,14 @@ use crate::{
     money::MicroUsd,
 };
 
-/// How long a lease lives without a renew once its machine has renewed once
-pub const HEARTBEAT_TTL: Duration = Duration::from_secs(10 * 60);
+/// The heartbeat window when `MACHINES_CONFIG` sets none; machines renew every 30 seconds
+pub const DEFAULT_HEARTBEAT_TTL: Duration = Duration::from_secs(3 * 60);
 
-/// How long a new lease waits for its machine's first renew
-pub const BOOT_GRACE: Duration = Duration::from_secs(15 * 60);
+/// The boot grace when `MACHINES_CONFIG` sets none
+pub const DEFAULT_BOOT_GRACE: Duration = Duration::from_secs(8 * 60);
+
+/// The shortest heartbeat window a config may set, so a few lost renews do not end a lease
+pub const MIN_HEARTBEAT_TTL: Duration = Duration::from_secs(60);
 
 /// The longest run deadline any configuration may allow
 pub const MAX_RUN_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -69,6 +72,10 @@ struct RawConfig {
     max_run_hours: u64,
     max_machines_per_run: u16,
     run_spend_cap_usd: String,
+    #[serde(default)]
+    heartbeat_ttl_secs: Option<u64>,
+    #[serde(default)]
+    boot_grace_secs: Option<u64>,
     classes: BTreeMap<ClassName, RawClass>,
     apps: BTreeMap<AppName, RawApp>,
 }
@@ -134,20 +141,77 @@ pub struct MachineClass {
     pub vpc_uuid: Option<ResourceId>,
 }
 
-impl MachineClass {
-    /// Returns the lease policy of this class: the contract's heartbeat and boot grace, and
-    /// the class's maximum lifetime
-    pub fn lease_policy(&self) -> Result<LeasePolicy, LeaseError> {
-        LeasePolicy::new(HEARTBEAT_TTL, self.max_lifetime)?.with_boot_grace(BOOT_GRACE)
+/// How long a lease lives without a renew, fixed on a run when it is created
+///
+/// A run keeps the windows it was created with, so renews never read the configuration: a
+/// bad config deploy cannot make every live lease lapse.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Heartbeat {
+    ttl_secs: u64,
+    boot_grace_secs: u64,
+}
+
+impl Heartbeat {
+    /// Checks a heartbeat window and boot grace
+    ///
+    /// The window is at least [`MIN_HEARTBEAT_TTL`], and the boot grace at least the window
+    /// and at most [`MAX_RUN_LIFETIME`].
+    pub fn new(ttl: Duration, boot_grace: Duration) -> Result<Self, ConfigError> {
+        if ttl < MIN_HEARTBEAT_TTL || ttl > MAX_RUN_LIFETIME {
+            return Err(ConfigError::invalid(
+                "heartbeat_ttl_secs",
+                format!(
+                    "must be from {} seconds through 168 hours",
+                    MIN_HEARTBEAT_TTL.as_secs()
+                ),
+            ));
+        }
+        if boot_grace < ttl || boot_grace > MAX_RUN_LIFETIME {
+            return Err(ConfigError::invalid(
+                "boot_grace_secs",
+                "must be from heartbeat_ttl_secs through 168 hours",
+            ));
+        }
+
+        Ok(Self {
+            ttl_secs: ttl.as_secs(),
+            boot_grace_secs: boot_grace.as_secs(),
+        })
+    }
+
+    /// How long a lease lives after a renew
+    #[must_use]
+    pub const fn ttl(self) -> Duration {
+        Duration::from_secs(self.ttl_secs)
+    }
+
+    /// How long a new lease waits for its machine's first renew
+    #[must_use]
+    pub const fn boot_grace(self) -> Duration {
+        Duration::from_secs(self.boot_grace_secs)
+    }
+
+    /// Returns the policy a lease of a class with `max_lifetime` starts under
+    pub fn lease_policy(self, max_lifetime: Duration) -> Result<LeasePolicy, LeaseError> {
+        LeasePolicy::new(self.ttl(), max_lifetime)?.with_boot_grace(self.boot_grace())
+    }
+
+    /// Returns the policy renews are checked against
+    ///
+    /// A renew uses only the heartbeat window, so it needs no class: a lease keeps working
+    /// even if its class was removed from the configuration after the lease began.
+    pub fn renew_policy(self) -> Result<LeasePolicy, LeaseError> {
+        self.lease_policy(MAX_RUN_LIFETIME)
     }
 }
 
-/// Returns the policy renews are checked against
-///
-/// A renew uses only the heartbeat TTL, so it needs no class: a lease keeps working even if
-/// its class was removed from the configuration after the lease began.
-pub fn renew_policy() -> Result<LeasePolicy, LeaseError> {
-    LeasePolicy::new(HEARTBEAT_TTL, MAX_RUN_LIFETIME)?.with_boot_grace(BOOT_GRACE)
+impl Default for Heartbeat {
+    fn default() -> Self {
+        Self {
+            ttl_secs: DEFAULT_HEARTBEAT_TTL.as_secs(),
+            boot_grace_secs: DEFAULT_BOOT_GRACE.as_secs(),
+        }
+    }
 }
 
 /// The Worker's validated configuration
@@ -161,6 +225,8 @@ pub struct MachinesConfig {
     pub max_machines_per_run: u16,
     /// What one run may spend before its machines are released
     pub run_spend_cap: MicroUsd,
+    /// The heartbeat window and boot grace new runs take
+    pub heartbeat: Heartbeat,
     classes: BTreeMap<ClassName, MachineClass>,
     apps: BTreeMap<AppName, BTreeSet<ClassName>>,
 }
@@ -190,12 +256,19 @@ impl MachinesConfig {
         }
         let run_spend_cap = MicroUsd::parse_dollars(&raw.run_spend_cap_usd)
             .map_err(|error| ConfigError::invalid("run_spend_cap_usd", error))?;
+        let default = Heartbeat::default();
+        let heartbeat = Heartbeat::new(
+            raw.heartbeat_ttl_secs
+                .map_or(default.ttl(), Duration::from_secs),
+            raw.boot_grace_secs
+                .map_or(default.boot_grace(), Duration::from_secs),
+        )?;
 
         let classes = raw
             .classes
             .into_iter()
             .map(|(name, class)| {
-                let class = machine_class(&name, class)?;
+                let class = machine_class(&name, class, heartbeat)?;
                 Ok((name, class))
             })
             .collect::<Result<BTreeMap<_, _>, ConfigError>>()?;
@@ -218,6 +291,7 @@ impl MachinesConfig {
             max_run_lifetime,
             max_machines_per_run: raw.max_machines_per_run,
             run_spend_cap,
+            heartbeat,
             classes,
             apps,
         })
@@ -253,7 +327,11 @@ fn hours(field: &str, value: u64) -> Result<Duration, ConfigError> {
     Ok(duration)
 }
 
-fn machine_class(name: &ClassName, raw: RawClass) -> Result<MachineClass, ConfigError> {
+fn machine_class(
+    name: &ClassName,
+    raw: RawClass,
+    heartbeat: Heartbeat,
+) -> Result<MachineClass, ConfigError> {
     let field = |key: &str| format!("classes.{name}.{key}");
     let slug = |key: &str, value: String| {
         Slug::parse(value).map_err(|error| ConfigError::invalid(field(key), error))
@@ -302,8 +380,8 @@ fn machine_class(name: &ClassName, raw: RawClass) -> Result<MachineClass, Config
         ssh_key_ids: raw.ssh_key_ids,
         vpc_uuid,
     };
-    class
-        .lease_policy()
+    heartbeat
+        .lease_policy(class.max_lifetime)
         .map_err(|error| ConfigError::invalid(field("max_hours"), error))?;
 
     Ok(class)
@@ -311,6 +389,8 @@ fn machine_class(name: &ClassName, raw: RawClass) -> Result<MachineClass, Config
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::time::Duration;
+
     use serde_json::{Value, json};
 
     use super::{ConfigError, MachinesConfig, UnknownClass};
@@ -348,6 +428,9 @@ pub(crate) mod tests {
         let config = MachinesConfig::parse(&sample().to_string()).unwrap();
         let homebased = AppName::parse("homebased").unwrap();
         let class = ClassName::parse("do-c16-disk").unwrap();
+
+        assert_eq!(config.heartbeat.ttl(), Duration::from_secs(180));
+        assert_eq!(config.heartbeat.boot_grace(), Duration::from_secs(480));
 
         let disk = config.class_for(&homebased, &class).unwrap();
         assert_eq!(disk.gate_units.get(), 52);
@@ -393,5 +476,17 @@ pub(crate) mod tests {
             .is_err()
         );
         assert!(broken(&["apps", "homebased", "classes"], json!(["do-gpu"])).is_err());
+        assert!(broken(&["heartbeat_ttl_secs"], json!(30)).is_err());
+        // the boot grace may not be shorter than the window it precedes
+        assert!(broken(&["heartbeat_ttl_secs"], json!(600)).is_err());
+        assert!(broken(&["boot_grace_secs"], json!(120)).is_err());
+        let tuned = {
+            let mut config = sample();
+            config["heartbeat_ttl_secs"] = json!(120);
+            config["boot_grace_secs"] = json!(300);
+            MachinesConfig::parse(&config.to_string()).unwrap()
+        };
+        assert_eq!(tuned.heartbeat.ttl(), Duration::from_secs(120));
+        assert_eq!(tuned.heartbeat.boot_grace(), Duration::from_secs(300));
     }
 }

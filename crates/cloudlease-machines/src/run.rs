@@ -28,6 +28,7 @@ use cloudlease_provider::digitalocean::DoKind;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    config::Heartbeat,
     ids::{AppName, ClassName, Hostname, MachineId, RequestId, RunId, RunName},
     money::{BilledLife, MicroUsd, Spend, billed},
     time::Timestamp,
@@ -79,6 +80,8 @@ pub struct RunRecord {
     pub gate_units: PermitUnits,
     /// What the run may spend, fixed at create
     pub spend_cap: MicroUsd,
+    /// The heartbeat window and boot grace of the run's leases, from the config at create
+    pub heartbeat: Heartbeat,
     /// The cap the client asked for, if any, which a retried create must repeat
     #[serde(default)]
     pub requested_spend_cap_cents: Option<NonZeroU64>,
@@ -568,6 +571,7 @@ mod tests {
     };
     use crate::{
         boot::BootPayload,
+        config::Heartbeat,
         ids::{AppName, ClassName, Hostname, MachineId, RequestId, RunId, RunName},
         money::MicroUsd,
         token::TokenHash,
@@ -596,6 +600,7 @@ mod tests {
             price_per_hour: MicroUsd::parse_dollars("36").unwrap(),
             gate_units: PermitUnits::new(3_600).unwrap(),
             spend_cap: MicroUsd::parse_dollars("2").unwrap(),
+            heartbeat: Heartbeat::default(),
             requested_spend_cap_cents: None,
             ended: None,
             create_failure_alerted: false,

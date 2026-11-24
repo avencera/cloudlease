@@ -30,6 +30,9 @@
       "max_run_hours": 24,
       "max_machines_per_run": 64,
       "run_spend_cap_usd": "25.00",
+      // a machine renews every 30 seconds; a run keeps the windows it was created with
+      "heartbeat_ttl_secs": 180,
+      "boot_grace_secs": 480,
       // prices are DigitalOcean list prices per hour; check them with
       // `doctl compute size list` before deploying
       "classes": {
