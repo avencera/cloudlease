@@ -427,6 +427,12 @@ fn find_matches_only_the_exact_owner_and_generation() {
     harness.launch(&owner_tags("run_1", 3));
     harness.launch(&owner_tags("RUN_1", 2));
     harness.launch(&owner_tags("run_12", 2));
+    // the same app, owner and generation in another project of the team
+    let (other_record, other_server) = harness.launch(&owner_tags("run_1", 2));
+    harness.api.borrow_mut().other_project.extend([
+        other_record.as_str().to_owned(),
+        other_server.as_str().to_owned(),
+    ]);
 
     let owner = OwnerId::parse("run_1").unwrap();
     let generation = Generation::new(2).unwrap();
