@@ -295,7 +295,13 @@ describe("cloudlease machines in miniflare", () => {
     const run = await createRun();
     const finishCreate = fake.hold("POST");
     const creating = call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-inflight-1"));
-    await vi.waitFor(() => expect(fake.log).toContain("POST droplets"));
+    // read the ID while the create response is held: once the run is released, cleanup may
+    // delete the droplet before this test could look it up
+    const dropletId = await vi.waitFor(() => {
+      const id = dropletOf("hb-inflight-1")?.id;
+      expect(id).toBeDefined();
+      return id as number;
+    });
 
     const released = await call("POST", `/v1/runs/${run.run_id}/release`, CLIENT, { reason: "requested" });
     expect(released.status).toBe(202);
@@ -310,11 +316,9 @@ describe("cloudlease machines in miniflare", () => {
     expect(response.status).toBe(201);
     const lease = (await response.json()) as LeaseView;
     expect(lease.release).toMatchObject({ reason: "run_released", by: "client" });
-    const dropletId = dropletOf("hb-inflight-1")?.id;
-    expect(dropletId).toBeDefined();
 
     expect((await settle(lease)).state).toBe("released");
-    expect(fake.deletesOf(dropletId as number)).toEqual([`DELETE droplets/${dropletId}`]);
+    expect(fake.deletesOf(dropletId)).toEqual([`DELETE droplets/${dropletId}`]);
     expect(fake.droplets.size).toBe(0);
     expect((await readRun(run.run_id)).state).toBe("released");
     expect(ntfy.titles()).toEqual([]);
