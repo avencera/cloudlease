@@ -312,10 +312,14 @@ impl Spend {
         })
     }
 
-    /// Reports whether the run has spent its cap
+    /// Reports whether the run has spent past its cap
+    ///
+    /// Spending exactly the cap is allowed, as admission allows it: under hourly billing a
+    /// machine admitted to fill the cap bills its hour at once, and that must not end the
+    /// run whose hours it already paid for.
     #[must_use]
     pub fn has_reached(&self, cap: MicroUsd) -> bool {
-        self.accrued >= cap
+        self.accrued > cap
     }
 
     /// Returns when the spend must next be checked against `cap`, or `None` when nothing
@@ -485,7 +489,13 @@ mod tests {
             .reaches_cap_at(cap, early)
             .unwrap();
         assert_eq!(last, at(348_000));
-        assert!(Spend::of(DO, price, machines, last).has_reached(cap));
+        // at 348 s the run has spent exactly its cap, which it may; the next second passes it
+        let exact = Spend::of(DO, price, machines, last);
+        assert_eq!(exact.accrued, cap);
+        assert!(!exact.has_reached(cap));
+        let past = exact.reaches_cap_at(cap, last).unwrap();
+        assert_eq!(past, at(349_000));
+        assert!(Spend::of(DO, price, machines, past).has_reached(cap));
 
         let idle = Spend::of(DO, price, [machines[0]], at(200_000));
         assert_eq!(idle.reaches_cap_at(cap, at(200_000)), None);

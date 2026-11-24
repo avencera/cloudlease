@@ -127,8 +127,9 @@ A class may set a `billing_increment_secs` that is a whole multiple of its provi
   on the gate reserves one minimum, so simultaneous creates cannot pass the cap together. A
   run's cap is the client's `spend_cap_cents`, or else `run_spend_cap_usd`. A create that
   would take the run past it is refused with `spend_cap_reached`, and is checked again
-  after the gate answers. When accrued spend reaches the cap, the run object ends the run,
-  releases every machine with reason `spend_cap`, and alerts.
+  after the gate answers. A machine counts from its admission, while its create is still
+  in flight. A run may spend exactly its cap; when accrued spend passes it, the run object
+  ends the run, releases every machine with reason `spend_cap`, and alerts.
 - **Per hour**: a rate cap. Every machine not yet confirmed gone holds a permit in the
   `Gate` object weighted by its class's price in cents per hour, rounded up. A create whose
   permit would take the total past `HOURLY_SPEND_CAP_CENTS` is refused with
