@@ -1,0 +1,21 @@
+[package]
+name = "cloudlease-worker"
+description = "workers-rs glue for cloudlease: alarms, holding storage, the capacity gate and the tag sweep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+cloudlease-core.workspace = true
+cloudlease-provider.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+worker.workspace = true
+
+[lints]
+workspace = true

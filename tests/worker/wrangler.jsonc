@@ -1,0 +1,16 @@
+{
+  // test-only Worker for the miniflare suite; it is never deployed
+  "name": "cloudlease-test-worker",
+  "main": "build/index.js",
+  "compatibility_date": "2026-08-06",
+  "durable_objects": {
+    "bindings": [
+      { "name": "OWNERS", "class_name": "Owner" },
+      { "name": "CAPACITY", "class_name": "Capacity" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Owner", "Capacity"] }],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  }
+}

@@ -1,1 +1,6 @@
 _scratch/
+/target/
+/node_modules/
+/tests/worker/build/
+/.wrangler/
+/tests/worker/.wrangler/

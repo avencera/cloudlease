@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cloudlease-core", "crates/cloudlease-provider"]
+members = ["crates/*", "tests/worker"]
 resolver = "3"
 
 [workspace.package]
@@ -19,6 +19,8 @@ serde_json = "1"
 thiserror = "2"
 url = "2"
 uuid = { version = "1", features = ["v4", "js"] }
+# the durable_object macro expands to paths in wasm-bindgen, so apps declaring objects need it
+wasm-bindgen = "0.2"
 # pinned to rembuild's version so rembuild can depend on these crates directly
 worker = "=0.8.5"
 
