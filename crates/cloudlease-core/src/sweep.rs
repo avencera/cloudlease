@@ -91,6 +91,9 @@ pub struct OwnerQuery<K> {
     /// Generations the owner reports on: those of its resources, including resources past
     /// their ceiling, and those of its suspect permits
     pub generations: BTreeSet<Generation>,
+    /// When the sweep listed the inventory; a generation released after it may have been
+    /// confirmed gone while the sweep was deleting the same resource
+    pub listed_at: UnixMillis,
 }
 
 /// One owner's answer to an [`OwnerQuery`]
@@ -101,10 +104,13 @@ pub struct OwnerAnswer {
     pub claimed: BTreeSet<ResourceId>,
     /// Queried generations that are not yet confirmed gone
     pub busy: BTreeSet<Generation>,
-    /// Queried generations whose lease the owner ended, still releasing or already released
+    /// Queried generations whose lease the owner ended: still releasing, or released after
+    /// the sweep listed the inventory
     ///
-    /// Released counts too: the sweep deletes past-ceiling resources before it asks, so an
+    /// A late release counts: the sweep deletes past-ceiling resources before it asks, so an
     /// owner cleaning up the same resource may confirm it gone and record it released first.
+    /// A generation released before the listing whose resource was still listed leaked, so
+    /// it does not count.
     #[serde(default)]
     pub ended: BTreeSet<Generation>,
 }
@@ -132,7 +138,7 @@ pub fn answer<'a, K: ResourceKind>(
         })
         .map(|resource| resource.id.clone())
         .collect();
-    let reported = |keep: fn(&Holding<K>) -> bool| -> BTreeSet<Generation> {
+    let reported = |keep: &dyn Fn(&Holding<K>) -> bool| -> BTreeSet<Generation> {
         query
             .generations
             .iter()
@@ -147,12 +153,11 @@ pub fn answer<'a, K: ResourceKind>(
 
     OwnerAnswer {
         claimed,
-        busy: reported(|holding| !holding.is_released()),
-        ended: reported(|holding| {
-            matches!(
-                holding.state(),
-                HoldingState::Releasing { .. } | HoldingState::Released { .. }
-            )
+        busy: reported(&|holding| !holding.is_released()),
+        ended: reported(&|holding| match holding.state() {
+            HoldingState::Releasing { .. } => true,
+            HoldingState::Released { at, .. } => *at >= query.listed_at,
+            HoldingState::Leased { .. } => false,
         }),
     }
 }
@@ -181,7 +186,7 @@ pub fn plan<K: ResourceKind>(
         // only to learn whether it was already deleting it
         let query = owners
             .entry(resource.tags.owner.clone())
-            .or_insert_with(empty_query);
+            .or_insert_with(|| empty_query(now));
         query.generations.insert(resource.tags.generation);
         if resource.tags.ceiling.is_reached_at(now) {
             past_ceiling.push(resource.clone());
@@ -194,7 +199,7 @@ pub fn plan<K: ResourceKind>(
     for permit in suspect_permits {
         owners
             .entry(permit.owner_id.clone())
-            .or_insert_with(empty_query)
+            .or_insert_with(|| empty_query(now))
             .generations
             .insert(permit.generation);
     }
@@ -205,8 +210,9 @@ pub fn plan<K: ResourceKind>(
     }
 }
 
-const fn empty_query<K>() -> OwnerQuery<K> {
+const fn empty_query<K>(listed_at: UnixMillis) -> OwnerQuery<K> {
     OwnerQuery {
+        listed_at,
         resources: Vec::new(),
         generations: BTreeSet::new(),
     }

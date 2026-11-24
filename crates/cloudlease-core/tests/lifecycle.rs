@@ -445,6 +445,12 @@ fn only_resources_of_leases_their_owner_did_not_end_are_marked_as_orphans() {
     assert!(released.is_released());
     let mut raced = observed("job_1", 4, Kind::Machine, "141");
     raced.tags.ceiling = CeilingTag::At(Ceiling::at_or_before(at(1_000_000)));
+    // generation 5 was released before the sweep listed its machine, which therefore leaked
+    let leaked_lease = Lease::start(lease_id(), &policy(), start(), None).unwrap();
+    let leaked_holding =
+        Holding::<Kind>::leased(owner(), generation(5), leaked_lease).revoke(at(1_100_000));
+    let mut leaked = observed("job_1", 5, Kind::Machine, "151");
+    leaked.tags.ceiling = CeilingTag::At(Ceiling::at_or_before(at(1_000_000)));
     let mut outlived = observed("job_1", 2, Kind::Machine, "111");
     outlived.tags.ceiling = CeilingTag::At(Ceiling::at_or_before(at(1_000_000)));
     let mut ghost_past_ceiling = observed("ghost", 2, Kind::Machine, "202");
@@ -455,6 +461,7 @@ fn only_resources_of_leases_their_owner_did_not_end_are_marked_as_orphans() {
             outlived.clone(),
             observed("job_1", 3, Kind::Machine, "131"),
             raced,
+            leaked,
             observed("ghost", 1, Kind::Machine, "201"),
             ghost_past_ceiling,
         ],
@@ -466,11 +473,17 @@ fn only_resources_of_leases_their_owner_did_not_end_are_marked_as_orphans() {
     let query = &plan.owners[&owner()];
     assert_eq!(
         query.generations,
-        BTreeSet::from([generation(1), generation(2), generation(3), generation(4)])
+        BTreeSet::from([
+            generation(1),
+            generation(2),
+            generation(3),
+            generation(4),
+            generation(5)
+        ])
     );
     assert!(!query.resources.contains(&outlived));
 
-    let answer_job = answer([&releasing, &live, &released], query, now);
+    let answer_job = answer([&releasing, &live, &released, &leaked_holding], query, now);
     assert_eq!(
         answer_job.ended,
         BTreeSet::from([generation(1), generation(4)])
@@ -501,6 +514,7 @@ fn only_resources_of_leases_their_owner_did_not_end_are_marked_as_orphans() {
             ("111".to_owned(), DoomReason::PastCeiling, false),
             // the owner confirmed it gone and recorded the release before it was asked
             ("141".to_owned(), DoomReason::PastCeiling, true),
+            ("151".to_owned(), DoomReason::PastCeiling, false),
             // the failed owner keeps 201 this round, but its past-ceiling resource still goes
             ("202".to_owned(), DoomReason::PastCeiling, false),
             ("101".to_owned(), DoomReason::Unclaimed, true),
@@ -573,6 +587,7 @@ fn suspect_permits_are_released_only_with_a_complete_inventory_and_an_idle_owner
     let query = OwnerQuery {
         resources: Vec::new(),
         generations: BTreeSet::from([generation(1)]),
+        listed_at: at(1_120_000),
     };
     assert_eq!(
         answer([&releasing], &query, at(1_120_000)).busy,

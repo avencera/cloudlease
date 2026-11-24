@@ -130,6 +130,20 @@ pub fn billed(price_per_hour: MicroUsd, from: UnixMillis, to: UnixMillis) -> Mic
     MicroUsd(u64::try_from(micros).unwrap_or(u64::MAX)).max(MINIMUM_CHARGE)
 }
 
+/// How long a machine at `price_per_hour` lives before its bill grows past the minimum
+#[must_use]
+pub fn minimum_life(price_per_hour: MicroUsd) -> Duration {
+    if price_per_hour == MicroUsd::ZERO {
+        return MINIMUM_BILLED;
+    }
+
+    let charge_millis =
+        (u128::from(MINIMUM_CHARGE.0) * MILLIS_PER_HOUR).div_ceil(u128::from(price_per_hour.0));
+    let charge = Duration::from_millis(u64::try_from(charge_millis).unwrap_or(u64::MAX));
+
+    charge.max(MINIMUM_BILLED)
+}
+
 /// One machine's billed life: from its lease's creation until its resources are gone
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BilledLife {
@@ -144,8 +158,10 @@ pub struct BilledLife {
 pub struct Spend {
     /// What the run's machines have cost so far
     pub accrued: MicroUsd,
-    /// What the run's machines that may still exist add per hour
+    /// What the run's live machines past their minimum add per hour
     pub per_hour: MicroUsd,
+    /// When the first live machine still inside its minimum starts to add to the spend
+    pub next_accrual: Option<UnixMillis>,
 }
 
 impl Spend {
@@ -156,24 +172,42 @@ impl Spend {
         machines: impl IntoIterator<Item = BilledLife>,
         now: UnixMillis,
     ) -> Self {
-        machines.into_iter().fold(
+        let minimum = minimum_life(price_per_hour);
+        let empty = Self {
+            accrued: MicroUsd::ZERO,
+            per_hour: MicroUsd::ZERO,
+            next_accrual: None,
+        };
+
+        machines.into_iter().fold(empty, |spend, machine| {
+            let accrued = spend.accrued.saturating_add(billed(
+                price_per_hour,
+                machine.from,
+                machine.gone_at.unwrap_or(now),
+            ));
+            if machine.gone_at.is_some() {
+                return Self { accrued, ..spend };
+            }
+
+            let accrues_from = machine.from.saturating_add(minimum);
+            if accrues_from <= now {
+                return Self {
+                    accrued,
+                    per_hour: spend.per_hour.saturating_add(price_per_hour),
+                    ..spend
+                };
+            }
+
             Self {
-                accrued: MicroUsd::ZERO,
-                per_hour: MicroUsd::ZERO,
-            },
-            |spend, machine| Self {
-                accrued: spend.accrued.saturating_add(billed(
-                    price_per_hour,
-                    machine.from,
-                    machine.gone_at.unwrap_or(now),
-                )),
-                per_hour: if machine.gone_at.is_some() {
-                    spend.per_hour
-                } else {
-                    spend.per_hour.saturating_add(price_per_hour)
-                },
-            },
-        )
+                accrued,
+                next_accrual: Some(
+                    spend
+                        .next_accrual
+                        .map_or(accrues_from, |next| next.min(accrues_from)),
+                ),
+                ..spend
+            }
+        })
     }
 
     /// Reports whether the run has spent its cap
@@ -182,25 +216,31 @@ impl Spend {
         self.accrued >= cap
     }
 
-    /// Returns when the accrued spend reaches `cap` if nothing changes, or `None` when
-    /// nothing is accruing
+    /// Returns when the spend must next be checked against `cap`, or `None` when nothing
+    /// is accruing or will
     ///
-    /// Machines younger than the minimum accrue nothing until it passes, so this is never
-    /// later than the real crossing; an early check finds the cap not reached and asks again.
+    /// That is the earlier of when the machines past their minimum reach the cap, and when
+    /// the next machine inside its minimum starts to accrue, so it is never later than the
+    /// real crossing. Machines inside their minimum add nothing until then, so they cannot
+    /// pull the check ever closer while the spend stays flat.
     #[must_use]
     pub fn reaches_cap_at(&self, cap: MicroUsd, now: UnixMillis) -> Option<UnixMillis> {
         if self.has_reached(cap) {
             return Some(now);
         }
-        if self.per_hour == MicroUsd::ZERO {
-            return None;
+
+        let crossing = (self.per_hour != MicroUsd::ZERO).then(|| {
+            let left = u128::from(cap.0 - self.accrued.0);
+            let millis = (left * MILLIS_PER_HOUR).div_ceil(u128::from(self.per_hour.0));
+            now.saturating_add(Duration::from_millis(
+                u64::try_from(millis).unwrap_or(u64::MAX),
+            ))
+        });
+
+        match (crossing, self.next_accrual) {
+            (Some(crossing), Some(next)) => Some(crossing.min(next)),
+            (crossing, next) => crossing.or(next),
         }
-
-        let left = u128::from(cap.0 - self.accrued.0);
-        let millis = (left * MILLIS_PER_HOUR).div_ceil(u128::from(self.per_hour.0));
-        let millis = u64::try_from(millis).unwrap_or(u64::MAX);
-
-        Some(now.saturating_add(Duration::from_millis(millis)))
     }
 }
 
@@ -208,7 +248,9 @@ impl Spend {
 mod tests {
     use cloudlease_core::time::UnixMillis;
 
-    use super::{BilledLife, MicroUsd, MoneyError, Spend, billed};
+    use std::time::Duration;
+
+    use super::{BilledLife, MicroUsd, MoneyError, Spend, billed, minimum_life};
 
     fn at(millis: u64) -> UnixMillis {
         UnixMillis::new(millis).unwrap()
@@ -269,20 +311,52 @@ mod tests {
 
         let spend = Spend::of(price, machines, at(200_000));
         assert_eq!(spend.accrued, dollars("1.60"));
-        assert_eq!(spend.per_hour, price);
         assert!(!spend.has_reached(cap));
-        // the projection ignores the minimum, so it is early, never late
-        let projected = spend.reaches_cap_at(cap, at(200_000)).unwrap();
-        assert_eq!(projected, at(340_000));
-        let later = Spend::of(price, machines, projected);
-        assert!(later.accrued <= cap);
-        assert!(Spend::of(price, machines, at(390_000)).has_reached(cap));
+        // the live machine adds nothing until its minute is up, so that is the next check
+        assert_eq!(spend.per_hour, MicroUsd::ZERO);
+        assert_eq!(spend.reaches_cap_at(cap, at(200_000)), Some(at(210_000)));
+
+        // from then it accrues a cent a second, and the remaining $1.40 takes 140 s
+        let accruing = Spend::of(price, machines, at(210_000));
+        assert_eq!(accruing.per_hour, price);
+        let projected = accruing.reaches_cap_at(cap, at(210_000)).unwrap();
+        assert_eq!(projected, at(350_000));
+        assert!(Spend::of(price, machines, projected).has_reached(cap));
 
         let idle = Spend::of(price, [machines[0]], at(200_000));
         assert_eq!(idle.reaches_cap_at(cap, at(200_000)), None);
         assert_eq!(
             idle.reaches_cap_at(dollars("1"), at(200_000)),
             Some(at(200_000))
+        );
+    }
+
+    #[test]
+    fn a_spend_left_just_under_the_cap_is_checked_when_it_next_grows() {
+        // a cent buys 288 s of a $0.125/h machine, longer than the 60 s minimum
+        let price = dollars("0.125");
+        assert_eq!(minimum_life(price), Duration::from_secs(288));
+
+        let machines = [
+            // released after 575.9 s: $0.019997
+            BilledLife {
+                from: at(0),
+                gone_at: Some(at(575_900)),
+            },
+            // still inside its one cent minimum
+            BilledLife {
+                from: at(600_000),
+                gone_at: None,
+            },
+        ];
+        let spend = Spend::of(price, machines, at(601_000));
+        assert_eq!(spend.accrued, MicroUsd::new(29_997));
+
+        // 3 millionths short of a 3 cent cap, the next check is when the live machine starts
+        // to accrue, not a few milliseconds away again and again
+        assert_eq!(
+            spend.reaches_cap_at(dollars("0.03"), at(601_000)),
+            Some(at(888_000))
         );
     }
 }

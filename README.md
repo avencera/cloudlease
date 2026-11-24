@@ -45,10 +45,11 @@ The app declares its own Durable Object classes and wraps the handlers in
   the next sweep. A resource past its `until` ceiling tag is deleted before any owner is
   asked, so a stalled owner never delays a hard deadline; `SweepConfig::owner_timeout`
   bounds each owner call.
-- Each owner also says which of the asked generations it ended itself, still releasing or
-  already released. A sweep delete of such a generation is the owner's own cleanup racing
-  the sweep; every other delete is reported with `ownerEnded: false`, which apps use to
-  alert on orphans.
+- Each owner also says which of the asked generations it ended itself: still releasing,
+  or released after the sweep listed the inventory. A sweep delete of such a generation is
+  the owner's own cleanup racing the sweep; every other delete, including a resource still
+  listed after its owner confirmed it gone, is reported with `ownerEnded: false`, which apps
+  use to alert on orphans.
 - **Capacity permits** count against a global limit until the owner proves its resources
   absent. A permit takes one unit by default; a gate that caps spend weighs each permit by
   its price, such as cents per hour. A suspect permit is released only by a sweep whose

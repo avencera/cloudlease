@@ -192,8 +192,12 @@ impl Heartbeat {
     }
 
     /// Returns the policy a lease of a class with `max_lifetime` starts under
+    ///
+    /// Both windows are cut to the class's lifetime: a run keeps the windows of the config it
+    /// was created under, and a later config may shorten the class below them.
     pub fn lease_policy(self, max_lifetime: Duration) -> Result<LeasePolicy, LeaseError> {
-        LeasePolicy::new(self.ttl(), max_lifetime)?.with_boot_grace(self.boot_grace())
+        LeasePolicy::new(self.ttl().min(max_lifetime), max_lifetime)?
+            .with_boot_grace(self.boot_grace().min(max_lifetime))
     }
 
     /// Returns the policy renews are checked against
@@ -393,7 +397,7 @@ pub(crate) mod tests {
 
     use serde_json::{Value, json};
 
-    use super::{ConfigError, MachinesConfig, UnknownClass};
+    use super::{ConfigError, Heartbeat, MachinesConfig, UnknownClass};
     use crate::ids::{AppName, ClassName};
 
     pub(crate) fn sample() -> Value {
@@ -488,5 +492,11 @@ pub(crate) mod tests {
         };
         assert_eq!(tuned.heartbeat.ttl(), Duration::from_secs(120));
         assert_eq!(tuned.heartbeat.boot_grace(), Duration::from_secs(300));
+
+        // a run created with a two hour boot grace still starts leases of a class a later
+        // config cut to one hour
+        let long = Heartbeat::new(Duration::from_secs(180), Duration::from_secs(7_200)).unwrap();
+        let policy = long.lease_policy(Duration::from_secs(3_600)).unwrap();
+        assert_eq!(policy.boot_grace(), Duration::from_secs(3_600));
     }
 }
