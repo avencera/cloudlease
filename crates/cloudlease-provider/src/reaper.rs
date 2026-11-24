@@ -80,7 +80,7 @@ async fn step<P: CloudProvider>(
                 .find(holding.owner(), holding.generation(), *kind)
                 .await?;
 
-            Ok(Some(holding.resolve_tagged(*kind, found, now)))
+            Ok(holding.resolve_tagged(*kind, found, now).transpose())
         }
         DeleteTarget::Known { kind, id } => {
             provider.delete(*kind, id).await?;

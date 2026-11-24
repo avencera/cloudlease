@@ -9,7 +9,7 @@ use cloudlease_core::{
     alarm::{Backoff, Wake, next_alarm},
     capacity::{Permit, PermitKey, PermitStatus},
     deletes::{DeleteTarget, DeletesError},
-    holding::{Holding, HoldingError, HoldingState, ReleaseReason, Retry},
+    holding::{Holding, HoldingError, HoldingState, ReleaseReason, Retry, TAG_SEARCH_SETTLE},
     ids::{Generation, LeaseId, OwnerId, PermitId, ResourceId},
     lease::{Expiry, Lease, LeaseError, LeasePolicy},
     sweep::{
@@ -156,9 +156,26 @@ fn an_expired_lease_releases_machines_before_disks_and_finds_lost_creates_by_tag
         vec![DeleteTarget::Tagged { kind: Kind::Disk }]
     );
 
-    // a tag search that finds the lost disk turns it into a known target
+    // an empty search soon after the lease ended proves nothing, since the disk's create
+    // may still be in flight; once the settle time has passed it proves absence
+    let settled = 1_120_000 + u64::try_from(TAG_SEARCH_SETTLE.as_millis()).unwrap();
+    let nothing: [ResourceId; 0] = [];
+    assert_eq!(
+        machine_gone
+            .resolve_tagged(Kind::Disk, nothing.clone(), at(settled - 1))
+            .unwrap(),
+        None
+    );
+    let settled_empty = machine_gone
+        .resolve_tagged(Kind::Disk, nothing, at(settled))
+        .unwrap()
+        .unwrap();
+    assert!(settled_empty.is_released());
+
+    // a tag search that finds the lost disk turns it into a known target at once
     let found = machine_gone
         .resolve_tagged(Kind::Disk, [id("vol-1")], at(1_122_000))
+        .unwrap()
         .unwrap();
     assert_eq!(
         found.ready_deletes(),

@@ -110,7 +110,9 @@ async function leaseOwner(owner: string, generation: number): Promise<void> {
   expect(response.status).toBe(201);
 }
 
-async function holdings(owner: string): Promise<Array<{ state: { state: string } }>> {
+async function holdings(
+  owner: string,
+): Promise<Array<{ state: { state: string; lease?: { heartbeatDueAt: number } } }>> {
   const response = await ownerStub(owner).fetch("https://owner/holdings");
   expect(response.status).toBe(200);
   return response.json();
@@ -158,7 +160,7 @@ describe("cloudlease sweep in miniflare", () => {
     // another owner is mid-create: the droplet exists and is tagged, but its ID is not
     // recorded yet, so only the intent saved before the create call protects it
     await leaseOwner("job_creating", 1);
-    const release = fake.holdCreates();
+    const release = fake.hold("POST");
     const creating = ownerStub("job_creating").fetch("https://owner/droplet", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -396,6 +398,47 @@ describe("cloudlease sweep in miniflare", () => {
     expect(fake.droplets.size).toBe(0);
     expect(fake.volumes.size).toBe(0);
     expect((await holdings("job_alarm"))[0]?.state.state).toBe("released");
+  });
+
+  it("an owner alarm keeps the alarm of a lease saved while it was deleting", async () => {
+    const now = Date.now();
+    await seedHolding(
+      "job_race",
+      leasedHolding(
+        "job_race",
+        1,
+        { startedAt: now - 5 * MINUTE, heartbeatDueAt: now - MINUTE, hardDeadline: now + 55 * MINUTE },
+        { droplet: { status: "created", id: "1201" } },
+      ),
+    );
+    fake.addDroplet(1201, tags("job_race", 1, "droplet"));
+    fake.dropletReadsAfterDelete = 0;
+    const stub = ownerStub("job_race");
+    await parkAlarm(stub);
+
+    // a new lease is saved while the alarm waits on the provider; the alarm pass must not
+    // re-arm from the holdings it read before that
+    const release = fake.hold("DELETE");
+    const alarmPass = runDurableObjectAlarm(stub);
+    await vi.waitUntil(() => fake.log.includes("DELETE droplets/1201"));
+    await leaseOwner("job_race", 2);
+    release();
+    expect(await alarmPass).toBe(true);
+
+    const states = await holdings("job_race");
+    expect(states.map((holding) => holding.state.state)).toEqual(["released", "leased"]);
+    const alarm = await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm());
+    expect(alarm).toBe(states[1]?.state.lease?.heartbeatDueAt);
+  });
+
+  it("sweeps despite a volume whose tags and attachments are null", async () => {
+    fake.addDroplet(1301, tags("ghost_nulls", 1, "droplet"));
+    fake.addVolume("vol-unrelated", null, null);
+
+    const report = await sweep();
+
+    expect(outcomes(report)).toEqual([["1301", "unclaimed", "gone"]]);
+    expect(fake.volumes.has("vol-unrelated")).toBe(true);
   });
 
   it("runs the sweep from the cron trigger", async () => {

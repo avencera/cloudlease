@@ -14,11 +14,12 @@ interface Droplet {
   readsUntilGone: number | null;
 }
 
+// the API may return null for a volume's tags and attachments
 interface Volume {
   id: string;
   name: string;
-  tags: string[];
-  dropletIds: number[];
+  tags: string[] | null;
+  dropletIds: number[] | null;
   deleted: boolean;
 }
 
@@ -26,14 +27,16 @@ export class FakeDigitalOcean {
   readonly droplets = new Map<number, Droplet>();
   readonly volumes = new Map<string, Volume>();
   readonly log: string[] = [];
+  // reads that still return a droplet after its delete request
+  dropletReadsAfterDelete = 1;
   private nextId = 9_000;
-  private createGate: Promise<void> | null = null;
+  private readonly gates = new Map<string, Promise<void>>();
 
   addDroplet(id: number, tags: string[], name = `droplet-${id}`): void {
     this.droplets.set(id, { id, name, tags, readsUntilGone: null });
   }
 
-  addVolume(id: string, tags: string[], dropletIds: number[] = []): void {
+  addVolume(id: string, tags: string[] | null, dropletIds: number[] | null = []): void {
     this.volumes.set(id, { id, name: `volume-${id}`, tags, dropletIds, deleted: false });
   }
 
@@ -46,16 +49,16 @@ export class FakeDigitalOcean {
     );
   }
 
-  // holds create responses until the returned function is called; the resource already
-  // exists meanwhile, as it does on DigitalOcean while a create response is in flight
-  holdCreates(): () => void {
+  // holds responses to one method until the returned function is called; the change has
+  // already happened meanwhile, as on DigitalOcean while a response is in flight
+  hold(method: "POST" | "DELETE"): () => void {
     let release = () => {};
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    this.createGate = gate;
+    this.gates.set(method, gate);
     return () => {
-      this.createGate = null;
+      this.gates.delete(method);
       release();
     };
   }
@@ -89,7 +92,7 @@ export class FakeDigitalOcean {
         readsUntilGone: null,
       };
       this.droplets.set(droplet.id, droplet);
-      await this.createGate;
+      await this.gates.get(method);
       return Response.json({ droplet: dropletJson(droplet) }, { status: 202 });
     }
 
@@ -120,7 +123,8 @@ export class FakeDigitalOcean {
       if (droplet === undefined) {
         return notFound();
       }
-      droplet.readsUntilGone ??= 1;
+      droplet.readsUntilGone ??= this.dropletReadsAfterDelete;
+      await this.gates.get(method);
       return new Response(null, { status: 204 });
     }
     if (method === "DELETE" && collection === "volumes" && id !== undefined) {
@@ -128,7 +132,7 @@ export class FakeDigitalOcean {
       if (volume === undefined) {
         return notFound();
       }
-      if (volume.dropletIds.length > 0) {
+      if ((volume.dropletIds ?? []).length > 0) {
         return Response.json(
           { id: "conflict", message: "the volume is attached to a droplet" },
           { status: 409 },
@@ -149,7 +153,7 @@ export class FakeDigitalOcean {
     if (droplet.readsUntilGone === 0) {
       this.droplets.delete(id);
       for (const volume of this.volumes.values()) {
-        volume.dropletIds = volume.dropletIds.filter((attached) => attached !== id);
+        volume.dropletIds = volume.dropletIds?.filter((attached) => attached !== id) ?? null;
       }
       return notFound();
     }

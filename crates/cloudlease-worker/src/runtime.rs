@@ -50,14 +50,35 @@ async fn send(request: HttpRequest) -> Result<HttpResponse, TransportError> {
     let controller = AbortController::default();
     let signal = controller.signal();
     let fetch = Fetch::Request(outbound);
-    let mut response = std::pin::pin!(fetch.send_with_signal(&signal));
+    // the timeout covers the body as well as the headers, since a stalled body would
+    // otherwise hold a cleanup pass or a sweep until the Worker is stopped
+    let exchange = async {
+        let mut response = fetch
+            .send_with_signal(&signal)
+            .await
+            .map_err(|error| TransportError::network(format!("send request: {error}")))?;
+        let status = response.status_code();
+        let headers = response.headers().entries().collect();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| TransportError::network(format!("read response: {error}")))?;
+
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
+    };
+    let mut exchange = std::pin::pin!(exchange);
     let mut timeout = std::pin::pin!(Delay::from(request.timeout));
     let mut controller = Some(controller);
     let mut timed_out = false;
 
-    // poll the fetch first so a response that is already ready wins over the timeout
+    // poll the exchange first so a response that is already complete wins over the timeout;
+    // after an abort, keep polling until the aborted exchange settles
     let result = poll_fn(|context| {
-        if let Poll::Ready(result) = response.as_mut().poll(context) {
+        if let Poll::Ready(result) = exchange.as_mut().poll(context) {
             return Poll::Ready(result);
         }
         if !timed_out && timeout.as_mut().poll(context).is_ready() {
@@ -77,20 +98,7 @@ async fn send(request: HttpRequest) -> Result<HttpResponse, TransportError> {
         )));
     }
 
-    let mut response =
-        result.map_err(|error| TransportError::network(format!("send request: {error}")))?;
-    let status = response.status_code();
-    let headers = response.headers().entries().collect();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| TransportError::network(format!("read response: {error}")))?;
-
-    Ok(HttpResponse {
-        status,
-        headers,
-        body,
-    })
+    result
 }
 
 const fn method(method: HttpMethod) -> Method {

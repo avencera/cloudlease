@@ -116,16 +116,21 @@ where
     K: ResourceKind + DeserializeOwned,
     P: CloudProvider<Kind = K>,
 {
+    let mut released = Vec::new();
+    let mut errors = Vec::new();
+
     let mut holdings = store.list::<K>()?;
     for holding in &mut holdings {
         if let Some(expired) = holding.expire(now) {
             store.put(&expired, now)?;
+            // a lease with no resources goes straight to released
+            if expired.is_released() {
+                released.push(expired.clone());
+            }
             *holding = expired;
         }
     }
 
-    let mut released = Vec::new();
-    let mut errors = Vec::new();
     for holding in &mut holdings {
         if !is_due(holding.wake(), now) || holding.lease().is_some() {
             continue;
@@ -140,7 +145,10 @@ where
         *holding = reaped.holding;
     }
 
-    rearm(storage, holdings.iter().filter_map(Holding::wake), now).await?;
+    // requests run while the provider calls above are awaited and may have saved new
+    // holdings, so the alarm is re-armed from storage rather than from this pass's copy
+    let current = store.list::<K>()?;
+    rearm(storage, current.iter().filter_map(Holding::wake), now).await?;
 
     Ok(Processed { released, errors })
 }

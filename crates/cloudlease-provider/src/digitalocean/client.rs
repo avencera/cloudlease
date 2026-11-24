@@ -136,7 +136,7 @@ pub struct WireDroplet {
     /// The status, such as `new`, `active` or `off`
     pub status: String,
     /// The tags
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub tags: Vec<String>,
 }
 
@@ -147,19 +147,20 @@ pub struct WireVolume {
     pub id: String,
     /// The name
     pub name: String,
-    /// The droplets it is attached to
-    #[serde(default)]
+    /// The droplets it is attached to, which the API returns as `null` for a detached volume
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub droplet_ids: Vec<u64>,
     /// The tags, which the API may return as `null`
     #[serde(default, deserialize_with = "null_as_empty")]
     pub tags: Vec<String>,
 }
 
-fn null_as_empty<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+fn null_as_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
 {
-    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// A DigitalOcean v2 client

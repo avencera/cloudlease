@@ -25,7 +25,9 @@ The app declares its own Durable Object classes and wraps the handlers in
 - A **holding** is one owner generation's resources. It moves from `leased` to `releasing`
   to `released`. It leaves `releasing` only after the provider reports every resource
   absent, deleting in rank order (droplets before volumes). A resource whose create
-  response was lost is found by its tags.
+  response was lost is found by its tags. An empty tag search counts as absence only
+  once two minutes have passed since the lease ended, so a create still in flight is
+  not missed.
 - Leases end when released, when a heartbeat is missed, at the hard deadline, or when
   the owner revokes them.
 - The **sweep** lists every resource carrying the managed tag and asks each owner object

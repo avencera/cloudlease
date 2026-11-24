@@ -12,7 +12,7 @@
 //! Expiry is a pure transition ([`Holding::expire`]). Owners apply and persist it before any
 //! provider call, so a failing provider can never keep an expired lease alive.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -117,6 +117,13 @@ pub enum HoldingState<K> {
         at: UnixMillis,
     },
 }
+
+/// How long after a lease ends an empty tag search still proves nothing
+///
+/// A create sent just before the lease ended can still be in flight. This is well past the
+/// DigitalOcean client's 30 second request timeout, so such a create has finished or failed
+/// by then; if one still lands later, the sweep deletes it as unclaimed.
+pub const TAG_SEARCH_SETTLE: Duration = Duration::from_secs(120);
 
 /// A rejected holding transition
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -318,15 +325,25 @@ impl<K: ResourceKind> Holding<K> {
     }
 
     /// Replaces a tagged target with the IDs a tag search found
+    ///
+    /// Returns `None` for an empty search within [`TAG_SEARCH_SETTLE`] of the lease's end:
+    /// a create sent just before then may not be visible yet, so the target stays pending
+    /// and the owner retries.
     pub fn resolve_tagged(
         &self,
         kind: K,
         found: impl IntoIterator<Item = ResourceId>,
         now: UnixMillis,
-    ) -> Result<Self, HoldingError> {
+    ) -> Result<Option<Self>, HoldingError> {
         let (reason, since, deletes) = self.releasing("resolve a tagged deletion for")?;
+        let found: Vec<_> = found.into_iter().collect();
+        if found.is_empty() && now < since.saturating_add(TAG_SEARCH_SETTLE) {
+            return Ok(None);
+        }
 
-        Ok(self.after_progress(reason, since, deletes.resolve_tagged(kind, found)?, now))
+        let remaining = deletes.resolve_tagged(kind, found)?;
+
+        Ok(Some(self.after_progress(reason, since, remaining, now)))
     }
 
     /// Schedules the next cleanup attempt after one that failed or did not confirm absence
