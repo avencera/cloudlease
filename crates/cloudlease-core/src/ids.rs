@@ -132,18 +132,6 @@ string_id!(
     |value| bounded(value, 128, is_word)
 );
 
-string_id!(
-    /// An opaque identity a leased machine reports for itself, such as a network node ID
-    ///
-    /// cloudlease never interprets it; a client uses it to tell which machine holds a live
-    /// lease.
-    MachineIdentity,
-    "must be 1 to 256 visible ASCII characters",
-    |value| !value.is_empty()
-        && value.len() <= 256
-        && value.bytes().all(|byte| byte.is_ascii_graphic())
-);
-
 /// A positive lifecycle counter, unique within one owner
 ///
 /// Each lease an owner grants uses a new generation, and every resource created for that
