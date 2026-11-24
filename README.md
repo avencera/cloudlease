@@ -20,8 +20,10 @@ The app declares its own Durable Object classes and wraps the handlers in
 
 ## Lifetime rules
 
-- A **lease** has a heartbeat deadline and a hard deadline. The first heartbeat may be
-  given a boot grace, and the hard deadline can be capped (`not_after`) by a run deadline.
+- A **lease** has a heartbeat deadline and a hard deadline. Clients extend it with
+  `heartbeat` (sequenced) or `renew` (unsequenced), and neither can pass the hard
+  deadline. The first heartbeat may be given a boot grace, and the hard deadline can be
+  capped (`not_after`) by a run deadline.
 - A **holding** is one owner generation's resources. It moves from `leased` to `releasing`
   to `released`. It leaves `releasing` only after the provider reports every resource
   absent, deleting in rank order (droplets before volumes). A resource whose create

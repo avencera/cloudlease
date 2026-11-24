@@ -277,6 +277,21 @@ impl<K: ResourceKind> Holding<K> {
         }))
     }
 
+    /// Accepts a heartbeat from a client that sends no sequence numbers
+    pub fn renew(
+        &self,
+        lease_id: &LeaseId,
+        now: UnixMillis,
+        policy: &LeasePolicy,
+    ) -> Result<Self, HoldingError> {
+        let (lease, slots) = self.leased_parts("renew")?;
+
+        Ok(self.with_state(HoldingState::Leased {
+            lease: lease.renew(lease_id, now, policy)?,
+            slots: slots.clone(),
+        }))
+    }
+
     /// Ends a live lease at the client's request and starts deleting its resources
     pub fn release(&self, lease_id: &LeaseId, now: UnixMillis) -> Result<Self, HoldingError> {
         let (lease, _) = self.leased_parts("release")?;

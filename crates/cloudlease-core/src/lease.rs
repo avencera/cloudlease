@@ -243,6 +243,24 @@ impl Lease {
             ..self.clone()
         })
     }
+
+    /// Accepts a heartbeat from a client that sends no sequence numbers
+    ///
+    /// It counts as the next sequence number, so it still moves the deadline only forward
+    /// in time and never past the hard deadline.
+    pub fn renew(
+        &self,
+        id: &LeaseId,
+        now: UnixMillis,
+        policy: &LeasePolicy,
+    ) -> Result<Self, LeaseError> {
+        let sequence = self
+            .last_sequence
+            .checked_add(1)
+            .ok_or(LeaseError::OutOfRange)?;
+
+        self.heartbeat(id, sequence, now, policy)
+    }
 }
 
 #[derive(Deserialize)]
@@ -398,6 +416,31 @@ mod tests {
         assert_eq!(
             policy.with_boot_grace(241 * MINUTE),
             Err(LeaseError::InvalidPolicy)
+        );
+    }
+
+    #[test]
+    fn a_renew_extends_from_now_up_to_the_hard_deadline() {
+        let policy = policy().with_boot_grace(15 * MINUTE).unwrap();
+        // the run deadline caps the lease, and with it the boot grace
+        let lease = Lease::start(lease_id(), &policy, at(1_000_000), Some(at(1_200_000))).unwrap();
+        assert_eq!(lease.hard_deadline(), at(1_200_000));
+        assert_eq!(lease.heartbeat_due_at(), at(1_200_000));
+
+        let renewed = lease.renew(&lease_id(), at(1_050_000), &policy).unwrap();
+        assert_eq!(renewed.heartbeat_due_at(), at(1_170_000));
+        assert_eq!(renewed.last_sequence(), 1);
+
+        let capped = renewed.renew(&lease_id(), at(1_100_000), &policy).unwrap();
+        assert_eq!(capped.heartbeat_due_at(), at(1_200_000));
+        assert_eq!(capped.last_sequence(), 2);
+        assert_eq!(
+            capped.renew(&lease_id(), at(1_200_000), &policy),
+            Err(LeaseError::Expired(Expiry::HardDeadline))
+        );
+        assert_eq!(
+            lease.renew(&LeaseId::parse("lease_2").unwrap(), at(1_050_000), &policy),
+            Err(LeaseError::WrongLease)
         );
     }
 
