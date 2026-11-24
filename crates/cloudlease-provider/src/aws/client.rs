@@ -292,8 +292,11 @@ fn classify_error(status: u16, provider_code: Option<&str>) -> (ProviderErrorCod
         return (ProviderErrorCode::PermissionDenied, false);
     }
     // retryable so a launch can fall through to the next instance type in its pool
+    // a Spot price above the request's max price creates nothing either, so another type or
+    // zone may still be under it
     if code.contains("insufficient") && (code.contains("capacity") || code.contains("spot"))
         || code.contains("unfulfillablecapacity")
+        || code == "spotmaxpricetoolow"
         || code.contains("capacityreservation")
     {
         return (ProviderErrorCode::NoCapacity, true);
@@ -630,6 +633,10 @@ pub(super) mod tests {
                 400,
                 br"<Response><Errors><Error><Code>MaxSpotInstanceCountExceeded</Code></Error></Errors></Response>",
             ),
+            status(
+                400,
+                br"<Response><Errors><Error><Code>SpotMaxPriceTooLow</Code></Error></Errors></Response>",
+            ),
         ]);
         let client = client(transport);
 
@@ -637,6 +644,8 @@ pub(super) mod tests {
             block_on(client.call("RunInstances", Vec::new(), AwsRequestSafety::Ambiguous))
                 .unwrap_err();
         let quota = block_on(client.call("RunInstances", Vec::new(), AwsRequestSafety::Ambiguous))
+            .unwrap_err();
+        let price = block_on(client.call("RunInstances", Vec::new(), AwsRequestSafety::Ambiguous))
             .unwrap_err();
 
         assert_eq!(
@@ -646,6 +655,11 @@ pub(super) mod tests {
         assert_eq!(
             (quota.code, quota.retryable),
             (ProviderErrorCode::QuotaExceeded, false)
+        );
+        // a price over the cap created nothing, so the launch may try another type
+        assert_eq!(
+            (price.code, price.retryable),
+            (ProviderErrorCode::NoCapacity, true)
         );
     }
 }

@@ -1,8 +1,8 @@
 //! EC2 Spot instances on AWS
 //!
-//! [`Aws`] manages one kind, [`AwsKind::Instance`]: a persistent Spot instance that stops
-//! when EC2 reclaims its capacity. Its root volume is deleted with it, so there is no volume
-//! kind. AWS tags are keys and values, so the adapter writes the scheme's
+//! [`Aws`] manages one kind, [`AwsKind::Instance`]: a Spot instance, either persistent and
+//! stopped when EC2 reclaims its capacity, or one-time and terminated then, by its
+//! [`SpotMarket`]. Its root volume is deleted with it, so there is no volume kind. AWS tags are keys and values, so the adapter writes the scheme's
 //! [pairs](TagScheme::render_pairs) plus a `Name`, and reads them back with
 //! [`TagScheme::classify_pairs`], leaving `Name` out.
 //!
@@ -34,8 +34,8 @@ pub use ec2::{
     AwsInstanceType, AwsInstanceVolume, AwsSecurityGroup, AwsSecurityGroupIngress,
     AwsSpotInstanceRequest, AwsSpotInstanceRequestState, AwsSpotInstanceRequestType,
     AwsSpotInterruptionBehavior, AwsSubnet, AwsTag, Ec2, InstanceFilter, InstanceName,
-    InstanceType, NAME_TAG_KEY, RunInstancesRequest, SecurityGroupId, SubnetId, TcpIngress,
-    UserData, is_ambiguous_failure,
+    InstanceType, MAX_USER_DATA_BYTES, NAME_TAG_KEY, RunInstancesRequest, SecurityGroupId,
+    SpotLifetime, SpotMarket, SpotMaxPrice, SubnetId, TcpIngress, UserData, is_ambiguous_failure,
 };
 pub use ingress::{AwsIngress, SharedSecurityGroup};
 pub use signing::{AwsCredentials, AwsRegion};
@@ -115,11 +115,10 @@ validated!(
     |value| !value.trim().is_empty() && value.len() <= 512
 );
 
-/// One persistent Spot instance to launch
+/// One Spot instance to launch
 ///
-/// The adapter adds the parts that are not options: a public IPv4 address, IMDSv2, an
-/// encrypted gp3 root volume deleted with the instance, and a persistent Spot request that
-/// stops the instance on interruption.
+/// The adapter adds the parts that are not options: a public IPv4 address, IMDSv2 and an
+/// encrypted gp3 root volume deleted with the instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AwsInstanceSpec {
     /// The `Name` tag
@@ -143,6 +142,8 @@ pub struct AwsInstanceSpec {
     /// The caller's key for this launch; each instance type gets its own client token
     /// derived from it
     pub idempotency_key: IdempotencyKey,
+    /// The Spot request's lifetime, interruption behavior and price cap
+    pub market: SpotMarket,
 }
 
 impl CreateSpec for AwsInstanceSpec {
@@ -233,7 +234,7 @@ impl<C: Ec2> Aws<C> {
         self.scheme.classify_pairs(&pairs)
     }
 
-    /// Launches a persistent Spot instance and returns it as EC2 reported the launch
+    /// Launches a Spot instance and returns it as EC2 reported the launch
     ///
     /// Tries each instance type in order while EC2 reports no Spot capacity. Each type's
     /// client token comes from the owner, generation, idempotency key and type, so repeating
@@ -260,6 +261,7 @@ impl<C: Ec2> Aws<C> {
                 tags: tags.clone(),
                 user_data: spec.user_data.clone(),
                 client_token: self.client_token(owner, &spec.idempotency_key, instance_type),
+                market: spec.market.clone(),
             };
             match self.ec2.run_instances(request).await {
                 Ok(instance) => return Ok(instance),

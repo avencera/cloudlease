@@ -20,7 +20,7 @@ use cloudlease_provider::{
         AwsSpotInstanceRequestState, AwsSpotInstanceRequestType, AwsSpotInterruptionBehavior,
         AwsSubnet, AwsTag, Ec2, IdempotencyKey, InstanceFilter, InstanceName, InstanceType,
         InstanceTypeCandidates, RegionalSpec, RunInstancesRequest, SecurityGroupId,
-        SharedSecurityGroup, SubnetId, TcpIngress, UserData,
+        SharedSecurityGroup, SpotMarket, SubnetId, TcpIngress, UserData,
     },
     error::{ProviderError, ProviderErrorCode, ProviderResult},
     firewall::{IngressPolicy, SourceCidr},
@@ -407,6 +407,7 @@ fn spec(types: &[&str]) -> AwsInstanceSpec {
         security_group_id: SecurityGroupId::parse(GROUP).unwrap(),
         user_data: UserData::parse("#cloud-config").unwrap(),
         idempotency_key: IdempotencyKey::parse("op-1").unwrap(),
+        market: SpotMarket::persistent_stop(),
     }
 }
 

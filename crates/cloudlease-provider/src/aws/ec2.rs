@@ -494,6 +494,83 @@ validated!(
     |value| !value.trim().is_empty() && value.len() <= MAX_USER_DATA_BYTES
 );
 
+validated!(
+    /// The most an instance may cost per hour on the Spot market, in US dollars, such as
+    /// `0.4`
+    SpotMaxPrice,
+    "a Spot max price is a positive dollar amount with at most 6 decimals, such as 0.4",
+    |value| {
+        let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+        let digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+        !whole.is_empty()
+            && whole.len() <= 6
+            && digits(whole)
+            && fraction.len() <= 6
+            && digits(fraction)
+            && !value.ends_with('.')
+            && value.bytes().any(|byte| matches!(byte, b'1'..=b'9'))
+    }
+);
+
+/// How long a Spot request lives and what EC2 does to its instance when it reclaims the
+/// capacity
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpotLifetime {
+    /// A persistent request that stops the instance, keeping its root volume, and starts it
+    /// again when capacity returns
+    PersistentStop,
+    /// A one-time request that terminates the instance, so an interrupted instance is gone
+    /// with its root volume and nothing relaunches it
+    OneTimeTerminate,
+}
+
+impl SpotLifetime {
+    const fn request_type(self) -> &'static str {
+        match self {
+            Self::PersistentStop => "persistent",
+            Self::OneTimeTerminate => "one-time",
+        }
+    }
+
+    const fn interruption_behavior(self) -> &'static str {
+        match self {
+            Self::PersistentStop => "stop",
+            Self::OneTimeTerminate => "terminate",
+        }
+    }
+}
+
+/// The Spot market options of a launch
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpotMarket {
+    /// The request's lifetime and interruption behavior
+    pub lifetime: SpotLifetime,
+    /// The most the instance may cost per hour; EC2 refuses the launch when the Spot price
+    /// is higher and reclaims the instance when it rises above it. `None` caps it at the
+    /// On-Demand price
+    pub max_price: Option<SpotMaxPrice>,
+}
+
+impl SpotMarket {
+    /// A persistent request that stops on interruption, capped at the On-Demand price
+    #[must_use]
+    pub const fn persistent_stop() -> Self {
+        Self {
+            lifetime: SpotLifetime::PersistentStop,
+            max_price: None,
+        }
+    }
+
+    /// A one-time request that terminates on interruption
+    #[must_use]
+    pub const fn one_time_terminate(max_price: Option<SpotMaxPrice>) -> Self {
+        Self {
+            lifetime: SpotLifetime::OneTimeTerminate,
+            max_price,
+        }
+    }
+}
+
 fn is_resource_id(value: &str, prefix: &str) -> bool {
     value.strip_prefix(prefix).is_some_and(|suffix| {
         matches!(suffix.len(), 8 | 17)
@@ -503,11 +580,10 @@ fn is_resource_id(value: &str, prefix: &str) -> bool {
     })
 }
 
-/// A persistent Spot `RunInstances` request
+/// A Spot `RunInstances` request
 ///
-/// The adapter always asks for a public IPv4 address, IMDSv2, an encrypted gp3 root volume
-/// deleted with the instance, and a persistent Spot request that stops the instance on
-/// interruption, so none of those are options.
+/// The adapter always asks for a public IPv4 address, IMDSv2 and an encrypted gp3 root
+/// volume deleted with the instance, so none of those are options.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunInstancesRequest {
     /// The AMI
@@ -530,6 +606,8 @@ pub struct RunInstancesRequest {
     pub user_data: UserData,
     /// The token that makes a repeated launch return the first instance
     pub client_token: String,
+    /// The Spot request's lifetime, interruption behavior and price cap
+    pub market: SpotMarket,
 }
 
 /// Which instances `DescribeInstances` returns
@@ -1043,11 +1121,11 @@ fn run_instances_parameters(request: &RunInstancesRequest) -> Vec<(String, Strin
         query("InstanceMarketOptions.MarketType", "spot"),
         query(
             "InstanceMarketOptions.SpotOptions.InstanceInterruptionBehavior",
-            "stop",
+            request.market.lifetime.interruption_behavior(),
         ),
         query(
             "InstanceMarketOptions.SpotOptions.SpotInstanceType",
-            "persistent",
+            request.market.lifetime.request_type(),
         ),
         query("ClientToken", &request.client_token),
         query(
@@ -1055,6 +1133,12 @@ fn run_instances_parameters(request: &RunInstancesRequest) -> Vec<(String, Strin
             &BASE64.encode(request.user_data.as_str().as_bytes()),
         ),
     ];
+    if let Some(max_price) = &request.market.max_price {
+        parameters.push(query(
+            "InstanceMarketOptions.SpotOptions.MaxPrice",
+            max_price.as_str(),
+        ));
+    }
     // the root volume is deleted with the instance, so only the instance and its Spot
     // request carry the tags
     append_tags(
@@ -1095,8 +1179,8 @@ mod tests {
 
     use super::{
         AmiId, AvailabilityZone, AwsInstanceState, AwsSpotInstanceRequestType, AwsTag, Ec2,
-        InstanceFilter, InstanceType, RunInstancesRequest, SecurityGroupId, SubnetId, TcpIngress,
-        UserData,
+        InstanceFilter, InstanceType, RunInstancesRequest, SecurityGroupId, SpotMarket,
+        SpotMaxPrice, SubnetId, TcpIngress, UserData,
     };
     use crate::{
         aws::client::tests::{FakeTransport, block_on, client, ok, status},
@@ -1160,6 +1244,7 @@ mod tests {
             tags: vec![AwsTag::new("rb-managed", "true")],
             user_data: UserData::parse("#cloud-config").unwrap(),
             client_token: "rb-instance-token".to_owned(),
+            market: SpotMarket::persistent_stop(),
         };
 
         let instance = block_on(client.run_instances(request)).unwrap();
@@ -1180,6 +1265,56 @@ mod tests {
             "TagSpecification.2.Tag.1.Key=rb-managed&TagSpecification.2.Tag.1.Value=true",
         ] {
             assert!(body.contains(expected), "{expected} missing from {body}");
+        }
+        assert!(!body.contains("MaxPrice"), "{body}");
+    }
+
+    #[test]
+    fn runs_a_one_time_spot_instance_that_terminates_under_a_price_cap() {
+        let transport = FakeTransport::with([ok(br"
+            <RunInstancesResponse>
+                <instancesSet>
+                    <item>
+                        <instanceId>i-01234567</instanceId>
+                        <spotInstanceRequestId>sir-01234567</spotInstanceRequestId>
+                    </item>
+                </instancesSet>
+            </RunInstancesResponse>
+        ")]);
+        let client = client(transport.clone());
+        let request = RunInstancesRequest {
+            image_id: AmiId::parse("ami-01234567").unwrap(),
+            root_device_name: "/dev/sda1".to_owned(),
+            root_volume_gib: NonZeroU16::new(150).unwrap(),
+            instance_type: InstanceType::parse("c8a.4xlarge").unwrap(),
+            subnet_id: SubnetId::parse("subnet-01234567").unwrap(),
+            availability_zone: AvailabilityZone::parse("us-east-1a").unwrap(),
+            security_group_id: SecurityGroupId::parse("sg-01234567").unwrap(),
+            tags: vec![AwsTag::new("clm-managed", "true")],
+            user_data: UserData::parse("#!/bin/sh").unwrap(),
+            client_token: "clm-instance-token".to_owned(),
+            market: SpotMarket::one_time_terminate(Some(SpotMaxPrice::parse("0.45").unwrap())),
+        };
+
+        block_on(client.run_instances(request)).unwrap();
+
+        let body = &transport.bodies()[0];
+        for expected in [
+            "InstanceMarketOptions.SpotOptions.SpotInstanceType=one-time",
+            "InstanceMarketOptions.SpotOptions.InstanceInterruptionBehavior=terminate",
+            "InstanceMarketOptions.SpotOptions.MaxPrice=0.45",
+        ] {
+            assert!(body.contains(expected), "{expected} missing from {body}");
+        }
+    }
+
+    #[test]
+    fn a_spot_max_price_is_a_positive_dollar_amount() {
+        for valid in ["0.45", "1", "0.000001", "12.5"] {
+            assert!(SpotMaxPrice::parse(valid).is_ok(), "{valid}");
+        }
+        for invalid in ["0", "0.0", "", ".5", "1.", "-1", "1e3", "0.0000001", "$1"] {
+            assert!(SpotMaxPrice::parse(invalid).is_err(), "{invalid}");
         }
     }
 
