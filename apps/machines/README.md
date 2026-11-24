@@ -114,16 +114,20 @@ resources live in one project, `LATITUDE_PROJECT`, and every list is filtered to
 
 Latitude.sh tags hold no values, so a machine's ownership lives elsewhere:
 
-- The lease first creates a user data record holding the boot script. Its description is
+- The lease first creates a user data record holding the boot script, wrapped in a
+  `#cloud-config` document (the only Linux format Latitude.sh documents) that writes it to
+  `/var/lib/cloudlease/boot.sh` and runs it once. Its description is
   the machine's tag set (`{prefix}-managed`, `-owner-…`, `-gen-…`, `-kind-userdata`,
   `-until-…`). A record costs nothing.
 - It then creates the server with `billing: hourly`, booting from that record. The server's
   hostname is `{prefix}-` and 16 hex digits of a hash of the owner and generation, not the
-  client's hostname, so a server whose create answer was lost is still found by name.
+  client's hostname, so a server whose create answer was lost is still found by name. The
+  lease's `hostname` stays the client's machine name; the server's OS hostname is the
+  `{prefix}-…` one.
 - The sweep reads a server's owner and ceiling from the record its hostname matches.
   Cleanup deletes the server, confirms it gone (`404`), then deletes the record.
 - A server with that hostname shape and no record is an orphan once it is 10 minutes old by
-  its `created_at`: the sweep deletes it and alerts. This covers a create whose answer was
+  its `created_at`, or at once if Latitude.sh gives none: the sweep deletes it and alerts. This covers a create whose answer was
   lost and that Latitude.sh listed only after the lease's cleanup had given up and deleted
   the record. Any other server in the namespace without exactly one record is reported,
   never deleted. Keep hand-made servers in `LATITUDE_PROJECT` out of the `{prefix}-`

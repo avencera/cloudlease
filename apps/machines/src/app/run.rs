@@ -1253,7 +1253,7 @@ impl Provisioning<'_> {
     async fn latitude(&self, class: &LatitudeClass) -> CloudleaseResult<()> {
         let user_data = self.user_data(None)?;
         let record = MachineSpec::Latitude(LatitudeSpec::UserData(UserDataSpec {
-            boot: latitude::BootScript::parse(user_data.as_str())?,
+            boot: latitude::BootScript::shell(user_data.as_str())?,
         }));
         let record = self.create(&record).await?;
 

@@ -42,8 +42,15 @@ function recordOf(runId: string, generation = 1) {
   );
 }
 
+// the shell script inside the server's `#cloud-config` user data
+function bootScript(server: Server): string {
+  const content = /^ {4}content: ([A-Za-z0-9+/=]+)$/m.exec(server.userData);
+  expect(content).not.toBeNull();
+  return atob(content?.[1] ?? "");
+}
+
 function leaseToken(server: Server): string {
-  const match = /cloudlease_write '\/etc\/cloudlease\/lease\.json' 0600 '([A-Za-z0-9+/=]+)'/.exec(server.userData);
+  const match = /cloudlease_write '\/etc\/cloudlease\/lease\.json' 0600 '([A-Za-z0-9+/=]+)'/.exec(bootScript(server));
   expect(match).not.toBeNull();
   return JSON.parse(atob(match?.[1] ?? "")).token;
 }
@@ -105,8 +112,11 @@ describe("Latitude.sh machines in miniflare", () => {
       billing: "hourly",
     });
     expect(server.hostname).toMatch(/^clm-[0-9a-f]{16}$/);
-    expect(server.userData).toMatch(/^#!\/bin\/sh\n/);
-    expect(server.userData).toContain("systemctl");
+    // Latitude.sh documents only cloud-config as Linux user data, so the script rides inside it
+    expect(server.userData).toMatch(/^#cloud-config\nwrite_files:\n/);
+    expect(server.userData).toContain("runcmd:\n  - [sh, /var/lib/cloudlease/boot.sh]\n");
+    expect(bootScript(server)).toMatch(/^#!\/bin\/sh\n/);
+    expect(bootScript(server)).toContain("systemctl");
     expect(leaseToken(server)).toMatch(/^cll_[0-9a-f]{64}$/);
     const until = Math.floor(Date.parse(lease.hard_deadline_at) / 1000);
     expect(recordOf(run.run_id)).toMatchObject({

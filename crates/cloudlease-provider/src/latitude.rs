@@ -18,8 +18,8 @@
 //!   disagree, or in another shape than the adapter's, is reported as unrecognized and never
 //!   deleted automatically.
 //! - A server with the adapter's exact hostname shape and no record at all is an orphan once
-//!   it is [`ORPHAN_SETTLE`] old. Its record is created before it and deleted only after it
-//!   is confirmed gone, so this happens only when the server appeared after its lease's
+//!   it is [`ORPHAN_SETTLE`] old, or at once if Latitude.sh gives no `created_at`. Its
+//!   record is created before it and deleted only after it is confirmed gone, so this happens only when the server appeared after its lease's
 //!   cleanup had already given up finding it, such as a create whose response was lost and
 //!   that Latitude.sh listed late. The adapter reports it under [`ORPHAN_OWNER`] with its
 //!   ceiling reached, so the sweep deletes it without asking an owner and alerts on it.
@@ -130,6 +130,36 @@ validated!(
     "user data must be non-empty and at most 64 KiB",
     |value| !value.is_empty() && value.len() <= MAX_USER_DATA_BYTES
 );
+
+/// Where [`BootScript::shell`] writes the shell script it runs
+pub const SHELL_SCRIPT_PATH: &str = "/var/lib/cloudlease/boot.sh";
+
+impl BootScript {
+    /// Wraps a shell script in a `#cloud-config` document that writes it to
+    /// [`SHELL_SCRIPT_PATH`] and runs it once at first boot
+    ///
+    /// Latitude.sh documents only `#cloud-config` YAML as Linux user data, so the script
+    /// travels base64-encoded in `write_files` rather than as a `#!` part that cloud-init
+    /// would otherwise run directly.
+    pub fn shell(script: &str) -> ProviderResult<Self> {
+        let content = STANDARD.encode(script);
+
+        Self::parse(
+            [
+                "#cloud-config",
+                "write_files:",
+                &format!("  - path: {SHELL_SCRIPT_PATH}"),
+                "    permissions: \"0700\"",
+                "    encoding: b64",
+                &format!("    content: {content}"),
+                "runcmd:",
+                &format!("  - [sh, {SHELL_SCRIPT_PATH}]"),
+                "",
+            ]
+            .join("\n"),
+        )
+    }
+}
 
 /// A server to create, billed hourly
 ///
@@ -274,18 +304,24 @@ impl<T: HttpTransport, R: Runtime> Latitude<T, R> {
 
     /// Returns the tags an orphan server is swept under, once it has settled
     ///
-    /// A server with no parseable creation time, or one younger than [`ORPHAN_SETTLE`], gets
-    /// none and stays unrecognized.
+    /// A server younger than [`ORPHAN_SETTLE`], or with a creation time that does not parse,
+    /// gets none and stays unrecognized. One with no creation time is settled at once.
     fn orphan_tags(&self, server: &WireServer, now: UnixMillis) -> Option<ManagedTags<LatKind>> {
         if !self.is_adapter_hostname(&server.attributes.hostname) {
             return None;
         }
-        let created = server.attributes.created_at.as_deref()?;
-        let created = chrono::DateTime::parse_from_rfc3339(created).ok()?;
-        let settled = u64::try_from(created.timestamp_millis())
-            .ok()?
-            .checked_add(u64::try_from(ORPHAN_SETTLE.as_millis()).ok()?)?;
-        let settled = UnixMillis::new(settled)?;
+        let settled = match server.attributes.created_at.as_deref() {
+            // Latitude.sh documents `created_at` as nullable; with no age to wait on, the
+            // record ordering alone shows the server outlived its lease's cleanup
+            None => now,
+            Some(created) => {
+                let created = chrono::DateTime::parse_from_rfc3339(created).ok()?;
+                let settled = u64::try_from(created.timestamp_millis())
+                    .ok()?
+                    .checked_add(u64::try_from(ORPHAN_SETTLE.as_millis()).ok()?)?;
+                UnixMillis::new(settled)?
+            }
+        };
         let ceiling = Ceiling::at_or_before(settled);
         if !ceiling.is_reached_at(now) {
             return None;

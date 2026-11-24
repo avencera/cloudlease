@@ -78,7 +78,8 @@
         // a Latitude.sh class needs LATITUDE_API_KEY and LATITUDE_PROJECT; check the plan's
         // hourly price and per-site stock with GET /plans?filter[slug]=m4-metal-medium first.
         // On 2026-11-24 m4.metal.medium (EPYC 9124, 16 cores, 128 GB) cost $1.25 an hour
-        // with one in stock at each of DAL, CHI, MIA2 and SJC2
+        // with one in stock at each of DAL, CHI, MIA2 and SJC2. One hour of it needs
+        // HOURLY_SPEND_CAP_CENTS of at least 125 and a run spend cap of at least $1.25
         // ,
         // "lat-m4-medium": {
         //   "provider": "latitude",

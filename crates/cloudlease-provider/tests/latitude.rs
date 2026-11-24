@@ -26,7 +26,7 @@ use cloudlease_provider::{
     },
     latitude::{
         BootScript, ClientOptions, LatKind, LatSpec, Latitude, LatitudeApiKey, LatitudeClient,
-        ORPHAN_OWNER, ORPHAN_SETTLE, ServerSpec, Slug, UserDataSpec,
+        ORPHAN_OWNER, ORPHAN_SETTLE, SHELL_SCRIPT_PATH, ServerSpec, Slug, UserDataSpec,
     },
     provider::{CloudProvider, Presence},
     reaper::reap,
@@ -478,9 +478,13 @@ fn inventory_reads_every_page_and_reports_namespace_servers_without_one_record()
     }
     {
         let mut api = harness.api.borrow_mut();
-        // a server in the namespace whose record is gone
+        // a server in the namespace whose record is gone, too young to sweep as an orphan
         api.servers
             .insert("sv_orphan".to_owned(), "cl-0000000000000000".to_owned());
+        let now = i64::try_from(harness.runtime.now.get()).unwrap();
+        let created = chrono::DateTime::from_timestamp_millis(now).unwrap();
+        api.created_at
+            .insert("sv_orphan".to_owned(), created.to_rfc3339());
         // someone else's server and user data
         api.servers
             .insert("sv_other".to_owned(), "web-1".to_owned());
@@ -714,12 +718,23 @@ fn a_server_listed_only_after_its_cleanup_gave_up_is_swept_as_an_orphan_once_set
             .insert("sv_hand".to_owned(), "cl-build-box".to_owned());
         api.created_at
             .insert("sv_hand".to_owned(), "2026-11-24T19:00:00+00:00".to_owned());
+        // another generation's late server, which Latitude.sh lists with no `created_at`
+        let undated = harness
+            .provider
+            .hostname(&owner.owner, Generation::new(2).unwrap());
+        api.servers.insert("sv_undated".to_owned(), undated);
     }
 
-    // inside the settle window it is only reported, as any recordless server is
+    // inside the settle window it is only reported, as any recordless server is, while the
+    // undated one has no age to wait on
     harness.runtime.now.set(CREATED + 9 * 60_000);
     let young = block_on(harness.provider.inventory()).unwrap();
-    assert!(young.managed.is_empty());
+    let swept: Vec<_> = young
+        .managed
+        .iter()
+        .map(|entry| (entry.id.as_str(), entry.tags.owner.as_str()))
+        .collect();
+    assert_eq!(swept, [("sv_undated", ORPHAN_OWNER)]);
     let reported: Vec<_> = young
         .unrecognized
         .iter()
@@ -732,8 +747,12 @@ fn a_server_listed_only_after_its_cleanup_gave_up_is_swept_as_an_orphan_once_set
     let settled = CREATED + u64::try_from(ORPHAN_SETTLE.as_millis()).unwrap();
     harness.runtime.now.set(settled);
     let inventory: Inventory<LatKind> = block_on(harness.provider.inventory()).unwrap();
-    assert_eq!(inventory.managed.len(), 1);
-    let orphan = &inventory.managed[0];
+    assert_eq!(inventory.managed.len(), 2);
+    let orphan = inventory
+        .managed
+        .iter()
+        .find(|entry| entry.id.as_str() == "sv_late")
+        .unwrap();
     assert_eq!(orphan.id.as_str(), "sv_late");
     assert_eq!(orphan.tags.owner.as_str(), ORPHAN_OWNER);
     assert_eq!(orphan.tags.kind, LatKind::Server);
@@ -753,9 +772,30 @@ fn a_server_listed_only_after_its_cleanup_gave_up_is_swept_as_an_orphan_once_set
             pause: Duration::from_secs(1),
         },
     ));
-    assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].outcome, DeleteOutcome::Gone);
+    assert_eq!(reports.len(), 2);
+    assert!(
+        reports
+            .iter()
+            .all(|report| report.outcome == DeleteOutcome::Gone)
+    );
     let api = harness.api.borrow();
     assert!(!api.servers.contains_key("sv_late"));
+    assert!(!api.servers.contains_key("sv_undated"));
     assert!(api.servers.contains_key("sv_hand"));
+}
+
+#[test]
+fn a_shell_script_travels_as_cloud_config_that_writes_and_runs_it() {
+    let script = "#!/bin/sh\necho 'hello'\n";
+    let boot = BootScript::shell(script).unwrap();
+    let document = boot.as_str();
+
+    assert!(document.starts_with("#cloud-config\n"));
+    assert!(document.contains(&format!("  - path: {SHELL_SCRIPT_PATH}\n")));
+    assert!(document.ends_with(&format!("runcmd:\n  - [sh, {SHELL_SCRIPT_PATH}]\n")));
+    let content = document
+        .lines()
+        .find_map(|line| line.strip_prefix("    content: "))
+        .unwrap();
+    assert_eq!(STANDARD.decode(content).unwrap(), script.as_bytes());
 }
