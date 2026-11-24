@@ -295,10 +295,20 @@ impl TryFrom<PermitRow> for Permit {
     }
 }
 
+/// Creates the gate's tables if they do not exist yet
+///
+/// An app moving permits from its own earlier tables calls this before copying rows into
+/// `cloudlease_permits` and `cloudlease_capacity_settings`, so it never repeats the schema.
+pub fn ensure_schema(sql: &SqlStorage) -> CloudleaseResult<()> {
+    sql.exec(CREATE_PERMITS, None)?;
+    sql.exec(CREATE_SETTINGS, None)?;
+
+    Ok(())
+}
+
 impl PermitStore {
     fn open(sql: SqlStorage) -> CloudleaseResult<Self> {
-        sql.exec(CREATE_PERMITS, None)?;
-        sql.exec(CREATE_SETTINGS, None)?;
+        ensure_schema(&sql)?;
 
         Ok(Self(sql))
     }
@@ -527,6 +537,20 @@ impl CapacityClient {
         .await?;
 
         Ok(())
+    }
+
+    /// Sets the stored limit override, or clears it with `None`, and returns the new snapshot
+    ///
+    /// The gate refuses a limit outside `1..=max_limit` with a 400 remote error.
+    pub async fn set_limit(&self, limit: Option<u16>) -> CloudleaseResult<Snapshot> {
+        call_json(
+            &self.0,
+            "capacity gate",
+            Method::Put,
+            &url(LIMIT_PATH),
+            Some(&serde_json::json!({ "limit": limit })),
+        )
+        .await
     }
 
     /// Reads every permit
