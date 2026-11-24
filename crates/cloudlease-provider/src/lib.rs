@@ -1,5 +1,5 @@
 //! The cloud provider boundary for cloudlease, the cleanup that drives it, and the
-//! DigitalOcean and phoenixNAP adapters
+//! DigitalOcean, phoenixNAP and Latitude.sh adapters
 //!
 //! Nothing here depends on a Worker runtime: clients take an injected [`http::HttpTransport`]
 //! and [`http::Runtime`], so the cleanup rules run under plain `cargo test`.
@@ -9,11 +9,13 @@
 //! - [`sweep::delete_doomed`]: deletes the resources a sweep doomed, lowest rank first
 //! - [`digitalocean`]: droplets and volumes over the DigitalOcean v2 API
 //! - [`phoenixnap`]: Bare Metal Cloud servers over the phoenixNAP BMC v1 API
+//! - [`latitude`]: bare metal servers and their user data over the Latitude.sh API
 //! - [`rest`]: retry, backoff and URL rules the REST clients share
 
 pub mod digitalocean;
 pub mod error;
 pub mod http;
+pub mod latitude;
 pub mod phoenixnap;
 pub mod provider;
 pub mod reaper;
