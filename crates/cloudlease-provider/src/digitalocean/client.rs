@@ -1,8 +1,8 @@
 //! A narrow DigitalOcean v2 REST client over an injected transport
 //!
-//! Ported from rembuild's client: reads and deletes retry with bounded exponential backoff
-//! and honor `Retry-After`; creates are never replayed, because DigitalOcean documents no
-//! idempotency for them; pagination is bounded and may not leave the API origin.
+//! Ported from rembuild's client. It follows the shared [`rest`](crate::rest) rules; creates
+//! are never replayed because DigitalOcean documents no idempotency for them, and pagination
+//! is bounded.
 
 use std::time::Duration;
 
@@ -12,7 +12,11 @@ use url::Url;
 
 use crate::{
     error::{ProviderError, ProviderErrorCode, ProviderResult},
-    http::{HttpMethod, HttpRequest, HttpResponse, HttpTransport, Runtime, TransportErrorKind},
+    http::{HttpMethod, HttpRequest, HttpResponse, HttpTransport, Runtime},
+    rest::{
+        RetryPolicy, classify_status, normalize_base_url, parse_retry_after, request_timeout,
+        transport_error, url_within,
+    },
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.digitalocean.com/v2/";
@@ -42,30 +46,6 @@ impl DigitalOceanToken {
 impl std::fmt::Debug for DigitalOceanToken {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("DigitalOceanToken(<redacted>)")
-    }
-}
-
-/// Bounded retries for reads and deletes
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RetryPolicy {
-    /// Attempts per request, at least one
-    pub max_attempts: u8,
-    /// The first backoff, before jitter
-    pub backoff_base: Duration,
-    /// The longest backoff, including jitter
-    pub backoff_max: Duration,
-    /// The longest `Retry-After` honored
-    pub max_retry_after: Duration,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 4,
-            backoff_base: Duration::from_millis(200),
-            backoff_max: Duration::from_secs(5),
-            max_retry_after: Duration::from_secs(30),
-        }
     }
 }
 
@@ -100,28 +80,13 @@ impl ClientOptions {
 
     /// Replaces the per-attempt timeout
     pub fn with_request_timeout(mut self, timeout: Duration) -> ProviderResult<Self> {
-        if timeout.is_zero() {
-            return Err(ProviderError::validation(
-                "the request timeout must be positive",
-            ));
-        }
-
-        self.request_timeout = timeout;
+        self.request_timeout = request_timeout(timeout)?;
         Ok(self)
     }
 
     /// Replaces the retry policy
     pub fn with_retry_policy(mut self, retry: RetryPolicy) -> ProviderResult<Self> {
-        if retry.max_attempts == 0
-            || retry.backoff_base.is_zero()
-            || retry.backoff_base > retry.backoff_max
-        {
-            return Err(ProviderError::validation(
-                "the retry policy must use positive bounded values",
-            ));
-        }
-
-        self.retry = retry;
+        self.retry = retry.validate()?;
         Ok(self)
     }
 }
@@ -329,22 +294,17 @@ impl<T: HttpTransport, R: Runtime> DigitalOceanClient<T, R> {
         let mut last_error = None;
         for attempt in 1..=attempts {
             if let Some(error) = &last_error {
-                self.runtime
-                    .sleep(self.retry_delay(attempt - 1, error))
-                    .await;
+                let delay = self
+                    .options
+                    .retry
+                    .delay(attempt - 1, error, self.runtime.random_u64());
+                self.runtime.sleep(delay).await;
             }
 
             let request = self.http_request(method, url.clone(), body.clone());
             let result = match self.transport.send(request).await {
                 Ok(response) => self.decode_response(&response, operation),
-                Err(error) => Err(ProviderError::new(
-                    match error.kind {
-                        TransportErrorKind::Network => ProviderErrorCode::Network,
-                        TransportErrorKind::Timeout => ProviderErrorCode::Timeout,
-                    },
-                    true,
-                    format!("{operation} failed: {error}"),
-                )),
+                Err(error) => Err(transport_error(&error, operation)),
             };
 
             match result {
@@ -423,40 +383,8 @@ impl<T: HttpTransport, R: Runtime> DigitalOceanClient<T, R> {
         })
     }
 
-    fn retry_delay(&self, attempt: u8, error: &ProviderError) -> Duration {
-        if let Some(retry_after) = error.retry_after {
-            return retry_after;
-        }
-
-        let retry = self.options.retry;
-        let base = millis(retry.backoff_base);
-        let max = millis(retry.backoff_max);
-        let exponential = base
-            .saturating_mul(2_u64.saturating_pow(u32::from(attempt.saturating_sub(1))))
-            .min(max);
-        let jitter = self.runtime.random_u64() % base.max(1);
-
-        Duration::from_millis(exponential.saturating_add(jitter).min(max))
-    }
-
     fn url_for(&self, path: &str) -> ProviderResult<Url> {
-        let url = match Url::parse(path) {
-            Ok(url) => url,
-            Err(url::ParseError::RelativeUrlWithoutBase) => self
-                .options
-                .base_url
-                .join(path.trim_start_matches('/'))
-                .map_err(|_| ProviderError::validation("the API path is invalid"))?,
-            Err(_) => return Err(ProviderError::validation("the API URL is invalid")),
-        };
-
-        if url.origin() != self.options.base_url.origin() {
-            return Err(ProviderError::invalid_response(
-                "a pagination link left the API origin",
-            ));
-        }
-
-        Ok(url)
+        url_within(&self.options.base_url, path)
     }
 
     fn resource_url(&self, collection: &str, id: &str) -> ProviderResult<Url> {
@@ -472,177 +400,4 @@ fn decode_root<Item: DeserializeOwned>(value: &Value, key: &str) -> ProviderResu
 
     serde_json::from_value(root.clone())
         .map_err(|error| ProviderError::invalid_response(format!("invalid {key}: {error}")))
-}
-
-fn normalize_base_url(mut url: Url) -> ProviderResult<Url> {
-    if url.scheme() != "https"
-        || url.cannot_be_a_base()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(ProviderError::validation(
-            "the API base URL must be an HTTPS URL without credentials, query or fragment",
-        ));
-    }
-
-    // a trailing slash makes `join` append to the path instead of replacing its last segment
-    if !url.path().ends_with('/') {
-        let path = format!("{}/", url.path());
-        url.set_path(&path);
-    }
-
-    Ok(url)
-}
-
-fn millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-/// Classifies an HTTP status with safe retry semantics
-#[must_use]
-pub fn classify_status(status: u16, message: impl Into<String>) -> ProviderError {
-    let (code, retryable) = match status {
-        404 => (ProviderErrorCode::NotFound, false),
-        401 | 403 => (ProviderErrorCode::PermissionDenied, false),
-        409 => (ProviderErrorCode::Conflict, false),
-        429 => (ProviderErrorCode::RateLimited, true),
-        500..=599 => (ProviderErrorCode::ServerError, true),
-        _ => (ProviderErrorCode::Validation, false),
-    };
-
-    ProviderError::new(code, retryable, message)
-}
-
-/// Parses a `Retry-After` header given in seconds or as an HTTP date, capped at `maximum`
-#[must_use]
-pub fn parse_retry_after(
-    value: Option<&str>,
-    now_millis: u64,
-    maximum: Duration,
-) -> Option<Duration> {
-    let value = value?.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    if let Ok(seconds) = value.parse::<f64>()
-        && seconds.is_finite()
-        && seconds >= 0.0
-    {
-        // a huge value saturates to the cap rather than overflowing
-        return Some(
-            Duration::try_from_secs_f64(seconds)
-                .unwrap_or(maximum)
-                .min(maximum),
-        );
-    }
-
-    let retry_at = parse_imf_fixdate_millis(value)?;
-    Some(Duration::from_millis(retry_at.saturating_sub(now_millis)).min(maximum))
-}
-
-fn parse_imf_fixdate_millis(value: &str) -> Option<u64> {
-    let mut parts = value.split_ascii_whitespace();
-    if !parts.next()?.ends_with(',') {
-        return None;
-    }
-
-    let day = parts.next()?.parse::<u8>().ok()?;
-    let month = match parts.next()? {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let year = parts.next()?.parse::<i64>().ok()?;
-    let time = parts.next()?;
-    if parts.next()? != "GMT" || parts.next().is_some() {
-        return None;
-    }
-
-    let mut clock = time.split(':');
-    let hour = clock.next()?.parse::<u8>().ok()?;
-    let minute = clock.next()?.parse::<u8>().ok()?;
-    let second = clock.next()?.parse::<u8>().ok()?;
-    if clock.next().is_some() || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 59
-    {
-        return None;
-    }
-
-    let days = days_from_civil(year, month, day)?;
-    let seconds = days
-        .checked_mul(86_400)?
-        .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))?;
-
-    u64::try_from(seconds).ok()?.checked_mul(1_000)
-}
-
-fn days_from_civil(year: i64, month: u8, day: u8) -> Option<i64> {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let month = i64::from(month);
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
-    if !(0..=365).contains(&day_of_year) {
-        return None;
-    }
-
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    Some(era * 146_097 + day_of_era - 719_468)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use super::{classify_status, parse_retry_after};
-    use crate::error::ProviderErrorCode;
-
-    #[test]
-    fn statuses_map_to_safe_retry_classes() {
-        let cases = [
-            (404, ProviderErrorCode::NotFound, false),
-            (401, ProviderErrorCode::PermissionDenied, false),
-            (409, ProviderErrorCode::Conflict, false),
-            (422, ProviderErrorCode::Validation, false),
-            (429, ProviderErrorCode::RateLimited, true),
-            (503, ProviderErrorCode::ServerError, true),
-        ];
-
-        for (status, code, retryable) in cases {
-            let error = classify_status(status, "failed");
-            assert_eq!((error.code, error.retryable), (code, retryable), "{status}");
-        }
-    }
-
-    #[test]
-    fn retry_after_accepts_seconds_and_dates_within_the_cap() {
-        let cap = Duration::from_secs(30);
-        // Tue, 24 Nov 2026 12:00:00 GMT
-        let now = 1_795_521_600_000;
-
-        assert_eq!(
-            parse_retry_after(Some("2"), now, cap),
-            Some(Duration::from_secs(2))
-        );
-        assert_eq!(parse_retry_after(Some("600"), now, cap), Some(cap));
-        assert_eq!(parse_retry_after(Some("1e300"), now, cap), Some(cap));
-        assert_eq!(
-            parse_retry_after(Some("Tue, 24 Nov 2026 12:00:10 GMT"), now, cap),
-            Some(Duration::from_secs(10))
-        );
-        assert_eq!(parse_retry_after(Some("soon"), now, cap), None);
-        assert_eq!(parse_retry_after(None, now, cap), None);
-    }
 }

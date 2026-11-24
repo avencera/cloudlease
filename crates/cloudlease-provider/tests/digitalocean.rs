@@ -22,7 +22,7 @@ use cloudlease_core::{
 use cloudlease_provider::{
     digitalocean::{
         BootScript, ClientOptions, DigitalOcean, DigitalOceanClient, DigitalOceanToken, DoKind,
-        DoSpec, DropletImage, DropletSpec, ResourceName, RetryPolicy, Slug, VolumeSpec,
+        DoSpec, DropletImage, DropletSpec, ResourceName, Slug, VolumeSpec,
     },
     error::ProviderErrorCode,
     http::{
@@ -30,6 +30,7 @@ use cloudlease_provider::{
     },
     provider::{CloudProvider, Presence},
     reaper::reap,
+    rest::RetryPolicy,
     sweep::{ConfirmPolicy, DeleteOutcome, delete_doomed},
 };
 use serde_json::{Value, json};

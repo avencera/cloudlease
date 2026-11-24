@@ -8,10 +8,13 @@
 //! - [`reaper::reap`]: one delete-and-confirm pass over a releasing holding
 //! - [`sweep::delete_doomed`]: deletes the resources a sweep doomed, lowest rank first
 //! - [`digitalocean`]: droplets and volumes over the DigitalOcean v2 API
+//! - [`rest`]: retry, backoff and URL rules the REST clients share
 
 pub mod digitalocean;
 pub mod error;
 pub mod http;
 pub mod provider;
 pub mod reaper;
+pub mod rest;
 pub mod sweep;
+mod validated;
