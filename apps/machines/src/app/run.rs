@@ -631,7 +631,7 @@ impl Run {
                      this run are logged, not alerted.",
                     run.run_id, run.name, run.class, record.hostname
                 ),
-                priority: Priority::High,
+                priority: Priority::Default,
             },
         )
         .await;
@@ -831,7 +831,7 @@ impl Run {
                      machines are being deleted and it takes no new ones.",
                     run.run_id, run.name, run.class, spend.accrued, run.spend_cap
                 ),
-                priority: Priority::Urgent,
+                priority: Priority::High,
             },
         )
         .await;
@@ -1241,6 +1241,6 @@ fn hourly_cap_alert(run: &RunRecord) -> Alert {
              already cost the hourly cap (HOURLY_SPEND_CAP_CENTS).",
             run.run_id, run.name, run.class
         ),
-        priority: Priority::Urgent,
+        priority: Priority::High,
     }
 }

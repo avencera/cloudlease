@@ -25,12 +25,15 @@ pub const REALERT_EVERY: u32 = 12;
 pub const SWEEP_KEY: &str = "sweep";
 
 /// How urgent an alert is, as ntfy priorities
+///
+/// There is no priority 5: the alerts topic may be one that a Superalert Mac app follows, and
+/// it sounds its alarm for every priority 5 message. cloudlease alerts are notifications.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Priority {
-    /// ntfy priority 4
+    /// ntfy priority 3, for something to look at
+    Default,
+    /// ntfy priority 4, for a cap that stopped machines or a sweep that keeps failing
     High,
-    /// ntfy priority 5
-    Urgent,
 }
 
 impl Priority {
@@ -38,8 +41,8 @@ impl Priority {
     #[must_use]
     pub const fn header(self) -> &'static str {
         match self {
+            Self::Default => "3",
             Self::High => "4",
-            Self::Urgent => "5",
         }
     }
 }

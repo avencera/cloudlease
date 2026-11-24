@@ -140,13 +140,17 @@ client starts a new run.
 Alerts go to the ntfy topic in `NTFY_URL`, with `NTFY_TOKEN` as a bearer when set, and to
 the Worker log either way:
 
-- a run reaching its spend cap (priority 5)
-- a create refused by the hourly cap (priority 5)
-- a provider create failure, once per run (priority 4)
+- a run reaching its spend cap (priority 4)
+- a create refused by the hourly cap (priority 4)
+- a provider create failure, once per run (priority 3)
 - a sweep deleting a resource whose lease no run had already ended, which means it leaked
-  (priority 4)
-- a run object failing to answer the sweep, or the sweep failing outright, on the third
-  sweep in a row and then hourly (the `Monitor` object counts the streaks)
+  (priority 3)
+- a run object failing to answer the sweep (priority 3), or the sweep failing outright
+  (priority 4), on the third sweep in a row and then hourly (the `Monitor` object counts the
+  streaks)
+
+No alert uses priority 5: the topic may be one a Superalert Mac app follows, which sounds its
+alarm for every priority 5 message.
 
 ## Configuration
 

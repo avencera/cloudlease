@@ -69,6 +69,9 @@ describe("cloudlease machines in miniflare", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    // priority 5 sounds the alarm of a Superalert Mac following the topic, and no
+    // cloudlease alert is meant to
+    expect(ntfy.sent.map((alert) => alert.priority).filter((priority) => !["3", "4"].includes(priority))).toEqual([]);
   });
 
   it("says which settings work without a credential", async () => {
@@ -435,7 +438,7 @@ describe("cloudlease machines in miniflare", () => {
     await expectError(await call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, body), 429, "spend_cap_reached");
     expect(fake.log.filter((entry) => entry.startsWith("POST"))).toEqual([]);
     expect(ntfy.titles()).toEqual(["cloudlease: hourly spend cap reached"]);
-    expect(ntfy.sent[0]).toMatchObject({ priority: "5", authorization: "Bearer test-ntfy-token" });
+    expect(ntfy.sent[0]).toMatchObject({ priority: "4", authorization: "Bearer test-ntfy-token" });
 
     // the refusal holds no slot of the run, so a retry is refused again rather than busy
     await expectError(await call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, body), 429, "spend_cap_reached");
@@ -494,6 +497,7 @@ describe("cloudlease machines in miniflare", () => {
     expect(fake.droplets.size).toBe(0);
     expect((await readRun(run.run_id)).state).toBe("released");
     expect(ntfy.titles()).toEqual([`cloudlease: run pool-test reached its spend cap`]);
+    expect(ntfy.sent[0]?.priority).toBe("4");
     expect(ntfy.sent[0]?.body).toContain(run.run_id);
   });
 

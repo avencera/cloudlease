@@ -105,7 +105,7 @@ async fn alert_orphans(env: &Env, deletes: &[SweepDelete<MachineKind>]) {
                  they were never recorded:\n{}",
                 orphans.join("\n")
             ),
-            priority: Priority::High,
+            priority: Priority::Default,
         },
     )
     .await;
@@ -136,7 +136,7 @@ fn failure_alert(key: &str, count: u32, report: Option<&SweepReport<MachineKind>
                 "The last {count} sweeps failed before asking any owner, so nothing was \
                  deleted by tag. Leases still end on their own alarms. See the Worker logs."
             ),
-            priority: Priority::Urgent,
+            priority: Priority::High,
         };
     }
 
@@ -154,6 +154,6 @@ fn failure_alert(key: &str, count: u32, report: Option<&SweepReport<MachineKind>
             "Run object {key} failed to answer the last {count} sweeps (latest: {error}), so \
              its resources are kept until it answers."
         ),
-        priority: Priority::High,
+        priority: Priority::Default,
     }
 }
