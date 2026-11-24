@@ -18,8 +18,9 @@
 //! Reading tags reverses the table and hands the result to the core
 //! [`TagScheme`](cloudlease_core::tags::TagScheme), so exact matching is the core's. Any
 //! assignment outside the table, such as a valueless `{p}-owner-x` or `{p}-managed` with a
-//! value, becomes a string with a dot, which no core tag can contain, so a near miss is
-//! never read as an exact set.
+//! value, becomes `.{name}.{value}`. The core reads any tag without the `{p}-` prefix as an
+//! extra tag, so a near miss is never read as an exact set, and a valueless `{p}-until-x`
+//! next to a real ceiling is not taken for a second, malformed ceiling.
 //!
 //! The server list is not paginated, so [`CloudProvider::find`] and
 //! [`CloudProvider::inventory`] list every server and match tags locally instead of relying
@@ -253,14 +254,21 @@ impl TagNames {
                 // it is reported as unrecognized rather than ignored as foreign
                 Some(value) if tag.name == self.managed => {
                     flat.push(self.managed.clone());
-                    flat.push(format!("{}.{value}", tag.name));
+                    flat.push(escaped(&tag.name, Some(value)));
                 }
-                value => flat.push(format!("{}.{}", tag.name, value.unwrap_or_default())),
+                value => flat.push(escaped(&tag.name, value)),
             }
         }
 
         flat
     }
+}
+
+/// Renders an assignment outside the tag table so the core can never parse it as one of its own
+///
+/// phoenixNAP tag names cannot start with a dot, so the result also never equals a real tag.
+fn escaped(name: &str, value: Option<&str>) -> String {
+    format!(".{name}.{}", value.unwrap_or_default())
 }
 
 /// The phoenixNAP adapter for one app's tag scheme
@@ -536,11 +544,11 @@ mod tests {
         assert_eq!(
             flat,
             [
-                "clm-owner-run_1.",
+                ".clm-owner-run_1.",
                 "clm-managed",
-                "clm-managed.yes",
-                "clm-gen.",
-                "team.ops"
+                ".clm-managed.yes",
+                ".clm-gen.",
+                ".team.ops"
             ]
         );
     }

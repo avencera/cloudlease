@@ -500,6 +500,18 @@ fn find_matches_the_exact_tag_set_and_inventory_reports_near_misses() {
         );
         // someone else's server
         api.add_server("000000000000000000000006", &[("team", Some("ops"))]);
+        // a deadline plus a valueless tag shaped like a second one
+        api.add_server(
+            "000000000000000000000007",
+            &[
+                ("cl-managed", None),
+                ("cl-owner", Some("run_1")),
+                ("cl-gen", Some("2")),
+                ("cl-kind", Some("server")),
+                ("cl-until", Some("1795525200")),
+                ("cl-until-123", None),
+            ],
+        );
     }
 
     let found = block_on(harness.provider.find(
@@ -535,8 +547,9 @@ fn find_matches_the_exact_tag_set_and_inventory_reports_near_misses() {
     assert_eq!(
         unrecognized,
         [
-            ("000000000000000000000002", UnrecognizedReason::InvalidValue),
+            ("000000000000000000000002", UnrecognizedReason::ExtraTag),
             ("000000000000000000000005", UnrecognizedReason::ExtraTag),
+            ("000000000000000000000007", UnrecognizedReason::ExtraTag),
         ]
     );
 }
