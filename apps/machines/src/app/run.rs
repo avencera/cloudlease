@@ -382,6 +382,9 @@ impl Run {
                 let generation = stores.runs.next_generation().map_err(internal)?;
                 let record = MachineRecord::pending(generation, &request, now);
                 stores.runs.put_record(&record).map_err(internal)?;
+                // the record reserves spend and a slot until it expires, so its expiry must be
+                // armed before the gate call, which this object may not outlive
+                self.rearm(stores, now).await.map_err(internal)?;
                 record
             }
         };
@@ -471,8 +474,10 @@ impl Run {
         let lease = match started {
             Ok(lease) => lease,
             Err(error) => {
-                stores.runs.delete_record(generation).map_err(internal)?;
+                // the permit goes back before the record goes, so a later create cannot reuse
+                // this generation and be handed the permit this return then deletes
                 return_permit(&gate, &permit).await;
+                stores.runs.delete_record(generation).map_err(internal)?;
                 return Err(error);
             }
         };
