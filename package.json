@@ -6,7 +6,9 @@
   "scripts": {
     "build:worker": "worker-build tests/worker --release",
     "test:worker": "pnpm run build:worker && vitest run --config vitest.worker.config.ts",
-    "typecheck": "tsc --project tests/worker/tsconfig.json --noEmit"
+    "build:machines": "worker-build apps/machines --release",
+    "test:machines": "pnpm run build:machines && vitest run --config vitest.machines.config.ts",
+    "typecheck": "tsc --project tests/worker/tsconfig.json --noEmit && tsc --project apps/machines/tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.20.2",

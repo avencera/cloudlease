@@ -1,0 +1,4 @@
+{
+  "extends": "../../tests/worker/tsconfig.json",
+  "include": ["test/**/*.ts", "../../tests/worker/test/fake-digitalocean.ts", "../../vitest.machines.config.ts"]
+}

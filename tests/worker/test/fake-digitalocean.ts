@@ -9,6 +9,7 @@ interface Droplet {
   id: number;
   name: string;
   tags: string[];
+  userData: string;
   // reads that still return the droplet after a delete request, as DigitalOcean deletes
   // droplets asynchronously
   readsUntilGone: number | null;
@@ -29,11 +30,15 @@ export class FakeDigitalOcean {
   readonly log: string[] = [];
   // reads that still return a droplet after its delete request
   dropletReadsAfterDelete = 1;
+  // answers every create with HTTP 422, as DigitalOcean does for a size out of stock
+  failCreates = false;
+  // answers every list with HTTP 500, so an inventory cannot be read
+  failLists = false;
   private nextId = 9_000;
   private readonly gates = new Map<string, Promise<void>>();
 
   addDroplet(id: number, tags: string[], name = `droplet-${id}`): void {
-    this.droplets.set(id, { id, name, tags, readsUntilGone: null });
+    this.droplets.set(id, { id, name, tags, userData: "", readsUntilGone: null });
   }
 
   addVolume(id: string, tags: string[] | null, dropletIds: number[] | null = []): void {
@@ -83,17 +88,47 @@ export class FakeDigitalOcean {
     this.log.push(`${method} ${path}`);
     const [collection, id] = path.split("/");
 
+    if (method === "POST" && this.failCreates) {
+      return Response.json({ id: "unprocessable_entity", message: "size unavailable" }, { status: 422 });
+    }
+    if (method === "GET" && id === undefined && this.failLists) {
+      return Response.json({ id: "server_error", message: "listing failed" }, { status: 500 });
+    }
     if (method === "POST" && collection === "droplets" && id === undefined) {
-      const body = (await request.json()) as { name: string; tags: string[] };
+      const body = (await request.json()) as {
+        name: string;
+        tags: string[];
+        user_data?: string;
+        volumes?: string[];
+      };
       const droplet: Droplet = {
         id: this.nextId++,
         name: body.name,
         tags: body.tags,
+        userData: body.user_data ?? "",
         readsUntilGone: null,
       };
       this.droplets.set(droplet.id, droplet);
+      for (const volumeId of body.volumes ?? []) {
+        const volume = this.volumes.get(volumeId);
+        if (volume !== undefined) {
+          volume.dropletIds = [...(volume.dropletIds ?? []), droplet.id];
+        }
+      }
       await this.gates.get(method);
       return Response.json({ droplet: dropletJson(droplet) }, { status: 202 });
+    }
+    if (method === "POST" && collection === "volumes" && id === undefined) {
+      const body = (await request.json()) as { name: string; tags: string[] };
+      const volume: Volume = {
+        id: `vol-${this.nextId++}`,
+        name: body.name,
+        tags: body.tags,
+        dropletIds: [],
+        deleted: false,
+      };
+      this.volumes.set(volume.id, volume);
+      return Response.json({ volume: volumeJson(volume) }, { status: 201 });
     }
 
     if (method === "GET" && collection === "droplets" && id === undefined) {
@@ -181,10 +216,16 @@ export function tags(
   generation: number,
   kind: "droplet" | "volume",
   untilSeconds?: number,
+  prefix = "cl",
 ): string[] {
-  const values = ["cl-managed", `cl-owner-${owner}`, `cl-gen-${generation}`, `cl-kind-${kind}`];
+  const values = [
+    `${prefix}-managed`,
+    `${prefix}-owner-${owner}`,
+    `${prefix}-gen-${generation}`,
+    `${prefix}-kind-${kind}`,
+  ];
   if (untilSeconds !== undefined) {
-    values.push(`cl-until-${untilSeconds}`);
+    values.push(`${prefix}-until-${untilSeconds}`);
   }
   return values;
 }

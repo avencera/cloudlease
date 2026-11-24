@@ -88,6 +88,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cloudlease-machines-worker"
+version = "0.1.0"
+dependencies = [
+ "cloudlease-core",
+ "cloudlease-machines",
+ "cloudlease-provider",
+ "cloudlease-worker",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "uuid",
+ "wasm-bindgen",
+ "worker",
+]
+
+[[package]]
 name = "cloudlease-provider"
 version = "0.1.0"
 dependencies = [

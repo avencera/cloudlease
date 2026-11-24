@@ -16,7 +16,13 @@ existed, such as leftovers from a crashed create.
 
 The app declares its own Durable Object classes and wraps the handlers in
 `cloudlease-worker`, so it keeps its own class names, bindings and settings.
-`tests/worker` is a complete example.
+`tests/worker` is a minimal example.
+
+## Apps
+
+| App | What it is |
+| --- | --- |
+| `apps/machines` (rules in `crates/cloudlease-machines`) | Temporary machines for client apps such as homebased: runs, leases renewed by the machine, spend caps and ntfy alerts. See its [README](apps/machines/README.md) |
 
 ## Lifetime rules
 
@@ -82,7 +88,7 @@ Requirements: stable Rust with the `wasm32-unknown-unknown` target, `worker-buil
 just fmt          # check formatting (just fmt-write applies it)
 just clippy       # native and wasm32, warnings as errors
 just test         # Rust unit and integration tests
-just test-worker  # builds tests/worker and runs the vitest suite in miniflare
+just test-worker  # builds tests/worker and apps/machines and runs their miniflare suites
 just check        # all of the above
 ```
 
@@ -101,5 +107,5 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
 ## Not covered yet
 
 - Providers other than DigitalOcean, and firewalls
-- Batch-job records, exit status and spend caps. These belong to the app, which builds on
-  holdings and the sweep report
+- Batch-job records and exit status. These belong to the app, which builds on holdings
+  and the sweep report

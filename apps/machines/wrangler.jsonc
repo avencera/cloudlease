@@ -1,0 +1,47 @@
+{
+  // the machines Worker; deploy it with ~/code/private-workbench/ops/cloudlease/machines-deploy.md
+  "name": "cloudlease-machines",
+  "main": "build/index.js",
+  "compatibility_date": "2026-08-06",
+  "durable_objects": {
+    "bindings": [
+      { "name": "RUNS", "class_name": "Run" },
+      { "name": "GATE", "class_name": "Gate" },
+      { "name": "MONITOR", "class_name": "Monitor" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Run", "Gate", "Monitor"] }],
+  // the tag sweep's cadence
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "observability": { "enabled": true },
+  // secrets, set with `wrangler secret put`: DIGITALOCEAN_TOKEN, CLIENT_TOKENS, NTFY_URL and
+  // optionally NTFY_TOKEN
+  "vars": {
+    // every resource this Worker creates or sweeps carries tags with this prefix; no other
+    // cloudlease app may use it
+    "CLOUDLEASE_TAG_PREFIX": "clm",
+    // the most the machines not yet confirmed gone may cost per hour, in US cents
+    "HOURLY_SPEND_CAP_CENTS": "100",
+    "MACHINES_CONFIG": {
+      // where machines renew; replace with the Worker's URL before deploying
+      "api_base": "https://cloudlease-machines.example.workers.dev",
+      "max_run_hours": 24,
+      "max_machines_per_run": 64,
+      "run_spend_cap_usd": "25.00",
+      // prices are DigitalOcean list prices per hour; check them with
+      // `doctl compute size list` before deploying
+      "classes": {
+        "do-c4": {
+          "region": "nyc3",
+          "size": "c-4",
+          "image": "ubuntu-24-04-x64",
+          "price_per_hour_usd": "0.125",
+          "max_hours": 24
+        }
+      },
+      "apps": { "homebased": { "classes": ["do-c4"] } }
+    }
+  }
+}

@@ -9,17 +9,18 @@ fmt-write:
 # lint native and wasm targets with warnings as errors
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
-    cargo clippy -p cloudlease-worker -p cloudlease-test-worker --target wasm32-unknown-unknown -- -D warnings
+    cargo clippy -p cloudlease-worker -p cloudlease-test-worker -p cloudlease-machines-worker --target wasm32-unknown-unknown -- -D warnings
 
 # run the Rust tests
 test:
     cargo test --workspace
 
-# build the test Worker and run the miniflare suite
+# build the test and machines Workers and run their miniflare suites
 test-worker:
     pnpm install --frozen-lockfile
     pnpm run typecheck
     pnpm run test:worker
+    pnpm run test:machines
 
 # everything CI runs
 check: fmt clippy test test-worker
