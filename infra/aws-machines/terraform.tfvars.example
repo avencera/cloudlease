@@ -1,0 +1,10 @@
+aws_account_id     = "123456789012"
+aws_region         = "us-east-1"
+availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]
+# aws ssm get-parameter --region us-east-1 \
+#   --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+#   --query Parameter.Value --output text
+ami_id = "ami-0123456789abcdef0"
+
+allowed_instance_type_patterns = ["c7a.*", "c8a.*", "m7a.*", "c7i.*"]
+max_root_volume_gib            = 200
