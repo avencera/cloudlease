@@ -288,6 +288,35 @@ describe("cloudlease machines in miniflare", () => {
     );
   });
 
+  it("deletes a droplet whose create was still in flight when its run was released", async () => {
+    const run = await createRun();
+    const finishCreate = fake.hold("POST");
+    const creating = call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-inflight-1"));
+    await vi.waitFor(() => expect(fake.log).toContain("POST droplets"));
+
+    const released = await call("POST", `/v1/runs/${run.run_id}/release`, CLIENT, { reason: "requested" });
+    expect(released.status).toBe(202);
+    expect(((await released.json()) as RunView).machines.map((machine) => machine.release)).toEqual([
+      expect.objectContaining({ reason: "run_released", by: "client" }),
+    ]);
+
+    // DigitalOcean answers the create only after the release, so the worker never records
+    // the droplet's ID and its cleanup has to find it by its tags
+    finishCreate();
+    const response = await creating;
+    expect(response.status).toBe(201);
+    const lease = (await response.json()) as LeaseView;
+    expect(lease.release).toMatchObject({ reason: "run_released", by: "client" });
+    const dropletId = dropletOf("hb-inflight-1")?.id;
+    expect(dropletId).toBeDefined();
+
+    expect((await settle(lease)).state).toBe("released");
+    expect(fake.deletesOf(dropletId as number)).toEqual([`DELETE droplets/${dropletId}`]);
+    expect(fake.droplets.size).toBe(0);
+    expect((await readRun(run.run_id)).state).toBe("released");
+    expect(ntfy.titles()).toEqual([]);
+  });
+
   it("refuses boot data too large once rendered, before admitting anything", async () => {
     const run = await createRun();
     // under the 32 KiB JSON limit, but each quote takes four bytes once shell-quoted
