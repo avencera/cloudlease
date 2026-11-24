@@ -25,39 +25,45 @@
     // the most the machines not yet confirmed gone may cost per hour, in US cents
     "HOURLY_SPEND_CAP_CENTS": "100",
     "MACHINES_CONFIG": {
-      // where machines renew; replace with the Worker's URL before deploying
-      "api_base": "https://cloudlease-machines.example.workers.dev",
-      "max_run_hours": 24,
-      "max_machines_per_run": 64,
-      "run_spend_cap_usd": "25.00",
+      // where machines renew: the deployed Worker on the Avencera account
+      "api_base": "https://cloudlease-machines.avencera.workers.dev",
+      // pilot limits from the first live test; raise them for a real pool, such as afv
+      "max_run_hours": 1,
+      "max_machines_per_run": 2,
+      "run_spend_cap_usd": "1.00",
       // a machine renews every 30 seconds; a run keeps the windows it was created with
       "heartbeat_ttl_secs": 180,
       // the boot grace of DigitalOcean classes; a phoenixNAP class waits 20 minutes, and any
       // class may set its own boot_grace_secs
       "boot_grace_secs": 480,
       // prices are list prices per hour; check DigitalOcean's with `doctl compute size list`
-      // and phoenixNAP's with its product availability API before deploying
+      // and phoenixNAP's with its product availability API before deploying. DigitalOcean's
+      // are from 2026-11-24. A homebased machine needs 10 GiB free disk by default to take CI
+      // jobs, so the 10 GB s-1vcpu-512mb-10gb size would never run one
       "classes": {
-        "do-c4": {
+        "do-s1-1g": {
           "region": "nyc3",
-          "size": "c-4",
+          "size": "s-1vcpu-1gb",
           "image": "ubuntu-24-04-x64",
-          "price_per_hour_usd": "0.125",
-          "max_hours": 24
-        },
-        // an E-2388G with 128 GB, billed every started hour; the locations are tried in
-        // order when one is out of stock. Stock changes daily, and s3.c3.medium ($0.47) had
-        // none anywhere on 2026-11-24
-        "pnap-s2-large": {
-          "provider": "phoenixnap",
-          "server_type": "s2.c2.large",
-          "locations": ["SEA", "NLD"],
-          "os": "ubuntu/jammy",
-          "price_per_hour_usd": "0.40",
-          "max_hours": 24
+          "price_per_hour_usd": "0.00893",
+          "max_hours": 1
         }
+        // the deployed Worker has no phoenixNAP credentials yet, and /v1/health fails while a
+        // phoenixNAP class is configured without them; add this back with them
+        // ,
+        // // an E-2388G with 128 GB, billed every started hour; the locations are tried in
+        // // order when one is out of stock. Stock changes daily, and s3.c3.medium ($0.47) had
+        // // none anywhere on 2026-11-24
+        // "pnap-s2-large": {
+        //   "provider": "phoenixnap",
+        //   "server_type": "s2.c2.large",
+        //   "locations": ["SEA", "NLD"],
+        //   "os": "ubuntu/jammy",
+        //   "price_per_hour_usd": "0.40",
+        //   "max_hours": 24
+        // }
       },
-      "apps": { "homebased": { "classes": ["do-c4", "pnap-s2-large"] } }
+      "apps": { "homebased": { "classes": ["do-s1-1g"] } }
     }
   }
 }
