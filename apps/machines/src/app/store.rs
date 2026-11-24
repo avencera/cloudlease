@@ -12,7 +12,8 @@ use worker::{SqlStorage, SqlStorageValue};
 const CREATE_RUN: &str = "
     CREATE TABLE IF NOT EXISTS machines_run (
         id INTEGER PRIMARY KEY CHECK (id = 1),
-        record TEXT NOT NULL
+        record TEXT NOT NULL,
+        last_generation INTEGER NOT NULL DEFAULT 0
     )
 ";
 
@@ -111,32 +112,30 @@ impl RunStore {
         Ok(())
     }
 
-    /// Returns the generation after every recorded one
+    /// Takes the next generation from the run's counter, which only goes up
     ///
-    /// Only a record that was never admitted is ever deleted, and nothing was created for
-    /// it, so reusing its generation cannot be confused with an earlier machine.
+    /// A pending record that expires or is refused is deleted, so the highest recorded
+    /// generation can go down; the counter never hands its generation out again, so a gate
+    /// reply still in flight for it cannot land on a later request.
     pub fn next_generation(&self) -> CloudleaseResult<Generation> {
         #[derive(Deserialize)]
-        struct Last {
-            generation: Option<i64>,
+        struct Next {
+            last_generation: i64,
         }
 
-        let last = self
+        let next = self
             .0
             .exec(
-                "SELECT MAX(generation) AS generation FROM machines_requests",
+                "UPDATE machines_run SET last_generation = last_generation + 1 WHERE id = 1 \
+                 RETURNING last_generation",
                 None,
             )?
-            .one::<Last>()?;
-        let Some(last) = last.generation else {
-            return Ok(Generation::FIRST);
-        };
+            .one::<Next>()?;
 
-        u64::try_from(last)
+        u64::try_from(next.last_generation)
             .ok()
             .and_then(|value| Generation::new(value).ok())
-            .and_then(Generation::next)
-            .ok_or_else(|| CloudleaseError::Storage("the generation counter is exhausted".into()))
+            .ok_or_else(|| CloudleaseError::Storage("the generation counter is invalid".into()))
     }
 
     fn first<T: DeserializeOwned>(

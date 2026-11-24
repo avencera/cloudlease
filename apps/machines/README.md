@@ -52,7 +52,8 @@ Errors are `{"error": {"code", "message", "retryable"}}`: `invalid_request`,
 `404`; a bearer that is neither a client token nor the lease's own token answers `401`.
 
 IDs route themselves: a run ID is `run_` and 24 hex digits derived from the app and its
-`request_id`, and a lease ID is `{run_id}-{generation}`.
+`request_id`, and a lease ID is `{run_id}-{generation}`. A run's generations only go up:
+one given to a create that was refused or expired is never given out again.
 
 ## How a machine's life is enforced
 
@@ -144,5 +145,5 @@ against the fake DigitalOcean API in `tests/worker/test` and a fake ntfy topic. 
 run and machine create idempotency, renew by lease token and refusal on another lease, a
 lapsed heartbeat, an immediate release, the hard deadline, `released` only after the droplet
 and volume are gone, `max_machines`, both spend caps and a client's lower run cap, a failed
-create, a stalled run object whose droplet is past its hard deadline, and the sweep's orphan
-and failure alerts.
+create, a create whose pending record expired while it waited on the gate, a stalled run
+object whose droplet is past its hard deadline, and the sweep's orphan and failure alerts.

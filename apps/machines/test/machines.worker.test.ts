@@ -523,6 +523,57 @@ describe("cloudlease machines in miniflare", () => {
     await expectError(
       await call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-full-2")),
       409,
+  it("never gives an expired pending create's generation to a later request", async () => {
+    const run = await createRun();
+    const stub = runStub(run.run_id);
+    let openGate!: () => void;
+    const gateClosed = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    const stall = runInDurableObject(gateStub(), (_instance, state) => state.blockConcurrencyWhile(() => gateClosed));
+
+    // the first create waits on the gate until its pending record has expired
+    const first = call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-expired-1"));
+    await vi.waitUntil(
+      () =>
+        runInDurableObject(stub, (_instance, state) => {
+          return state.storage.sql.exec("SELECT generation FROM machines_requests").toArray().length === 1;
+        }),
+      { timeout: 5_000, interval: 20 },
+    );
+    await runInDurableObject(stub, (_instance, state) => {
+      const row = state.storage.sql.exec("SELECT record FROM machines_requests").one();
+      const record = JSON.parse(row.record as string);
+      record.admission.since -= 11 * MINUTE;
+      state.storage.sql.exec("UPDATE machines_requests SET record = ?", JSON.stringify(record));
+    });
+    await runDurableObjectAlarm(stub);
+    expect(await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("SELECT * FROM machines_requests").toArray())).toEqual([]);
+
+    // a second create takes a new generation, so the first create's late gate reply cannot
+    // admit it with the first request's boot data
+    const second = call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-expired-2"));
+    await vi.waitUntil(
+      () =>
+        runInDurableObject(stub, (_instance, state) => {
+          return state.storage.sql.exec("SELECT generation FROM machines_requests").toArray().length === 1;
+        }),
+      { timeout: 5_000, interval: 20 },
+    );
+    openGate();
+    await stall;
+
+    await expectError(await first, 503, "busy");
+    const response = await second;
+    expect(response.status).toBe(201);
+    const lease = (await response.json()) as LeaseView;
+    expect(lease.hostname).toBe("hb-expired-2");
+    expect(generationOf(lease.lease_id)).toBe(2);
+    expect([...fake.droplets.values()].map((droplet) => droplet.name)).toEqual(["hb-expired-2"]);
+    // the late reply gave its permit back
+    expect((await permits()).map((permit) => permit.generation)).toEqual([2]);
+  }, 20_000);
+
       "run_full",
     );
     expect(fake.droplets.size).toBe(1);

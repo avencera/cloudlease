@@ -457,11 +457,15 @@ impl Run {
             .load()
             .map_err(internal)?
             .ok_or_else(|| internal("the run vanished"))?;
-        let current = stores
-            .runs
-            .record(generation)
-            .map_err(internal)?
-            .ok_or_else(|| internal("the pending machine vanished"))?;
+        let Some(current) = stores.runs.record(generation).map_err(internal)? else {
+            // the pending record expired while the gate answered; its generation is never
+            // handed out again, so only the permit needs undoing
+            return_permit(&gate, &permit).await;
+            return Err(ApiError::new(
+                ErrorCode::Busy,
+                "the create waited too long on the capacity gate; retry it",
+            ));
+        };
         if current.admitted().is_some() {
             return answer(200, &loaded.lease_view(generation)?);
         }
@@ -477,8 +481,6 @@ impl Run {
         let lease = match started {
             Ok(lease) => lease,
             Err(error) => {
-                // the permit goes back before the record goes, so a later create cannot reuse
-                // this generation and be handed the permit this return then deletes
                 return_permit(&gate, &permit).await;
                 stores.runs.delete_record(generation).map_err(internal)?;
                 return Err(error);
