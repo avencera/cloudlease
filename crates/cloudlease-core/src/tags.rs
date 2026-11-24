@@ -10,7 +10,9 @@
 //!
 //! A resource carrying `{p}-managed` with any other shape is [`TagMatch::Unrecognized`]: it
 //! is reported and never deleted automatically, because something other than this app may
-//! have made it.
+//! have made it. The one exception is a malformed ceiling on an otherwise exact set, which
+//! is [`CeilingTag::Malformed`]: the owner is still known, so the sweep asks it as if there
+//! were no ceiling, and never treats the resource as having no deadline.
 
 use std::{collections::HashSet, fmt::Debug, hash::Hash};
 
@@ -76,6 +78,43 @@ impl Ceiling {
     }
 }
 
+/// The ceiling tag as observed on a provider resource
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CeilingTag {
+    /// No ceiling tag
+    #[default]
+    Absent,
+    /// One ceiling tag in canonical form
+    At(Ceiling),
+    /// Ceiling tags that do not parse exactly, such as `until-07`, `until-soon` or two of
+    /// them
+    ///
+    /// The sweep cannot act on it, so it asks the owner instead; the owner's lease still
+    /// has its own hard deadline.
+    Malformed,
+}
+
+impl CeilingTag {
+    /// Reports whether the tag gives a ceiling that has been reached
+    ///
+    /// Only an exact ceiling can be reached; an absent or malformed one never lets the
+    /// sweep skip asking the owner.
+    #[must_use]
+    pub const fn is_reached_at(self, now: UnixMillis) -> bool {
+        match self {
+            Self::At(ceiling) => ceiling.is_reached_at(now),
+            Self::Absent | Self::Malformed => false,
+        }
+    }
+}
+
+impl From<Option<Ceiling>> for CeilingTag {
+    fn from(ceiling: Option<Ceiling>) -> Self {
+        ceiling.map_or(Self::Absent, Self::At)
+    }
+}
+
 /// The ownership part of a tag set, shared by every resource of one generation
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct OwnerTags {
@@ -95,12 +134,12 @@ impl OwnerTags {
             owner: self.owner.clone(),
             generation: self.generation,
             kind,
-            ceiling: self.ceiling,
+            ceiling: self.ceiling.into(),
         }
     }
 }
 
-/// A complete, parsed managed tag set
+/// A managed tag set as observed on a provider resource
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedTags<K> {
@@ -110,9 +149,9 @@ pub struct ManagedTags<K> {
     pub generation: Generation,
     /// The resource kind
     pub kind: K,
-    /// The latest time the resource may exist, if the app set one
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ceiling: Option<Ceiling>,
+    /// The latest time the resource may exist, as tagged
+    #[serde(default)]
+    pub ceiling: CeilingTag,
 }
 
 /// Why a resource with the managed tag is not safe to manage automatically
@@ -174,16 +213,19 @@ impl TagScheme {
     }
 
     /// Renders the exact tag set for one resource
+    ///
+    /// It takes [`OwnerTags`] rather than observed tags, so a malformed ceiling can never
+    /// be written.
     #[must_use]
-    pub fn render<K: ResourceKind>(&self, tags: &ManagedTags<K>) -> Vec<String> {
+    pub fn render<K: ResourceKind>(&self, owner: &OwnerTags, kind: K) -> Vec<String> {
         let prefix = &self.prefix;
         let mut rendered = vec![
             self.managed_tag(),
-            self.owner_tag(&tags.owner),
-            format!("{prefix}-gen-{}", tags.generation),
-            format!("{prefix}-kind-{}", tags.kind.tag_name()),
+            self.owner_tag(&owner.owner),
+            format!("{prefix}-gen-{}", owner.generation),
+            format!("{prefix}-kind-{}", kind.tag_name()),
         ];
-        if let Some(ceiling) = tags.ceiling {
+        if let Some(ceiling) = owner.ceiling {
             rendered.push(format!("{prefix}-until-{}", ceiling.as_unix_seconds()));
         }
 
@@ -216,7 +258,7 @@ impl TagScheme {
         let mut owner = None;
         let mut generation = None;
         let mut kind = None;
-        let mut ceiling = None;
+        let mut ceilings = Vec::new();
 
         for tag in tags.iter().filter(|tag| **tag != managed) {
             let Some(rest) = tag
@@ -232,7 +274,8 @@ impl TagScheme {
             } else if let Some(value) = rest.strip_prefix("kind-") {
                 (&mut kind, value)
             } else if let Some(value) = rest.strip_prefix("until-") {
-                (&mut ceiling, value)
+                ceilings.push(value);
+                continue;
             } else {
                 return Err(UnrecognizedReason::ExtraTag);
             };
@@ -245,31 +288,44 @@ impl TagScheme {
             return Err(UnrecognizedReason::WrongShape);
         };
 
-        let parsed = ManagedTags {
+        let ceiling = match ceilings.as_slice() {
+            [] => CeilingTag::Absent,
+            [value] => parse_canonical_u64(value).map_or(CeilingTag::Malformed, |seconds| {
+                CeilingTag::At(Ceiling(seconds))
+            }),
+            _ => CeilingTag::Malformed,
+        };
+        let owner = OwnerTags {
             owner: OwnerId::parse(owner).map_err(|_| UnrecognizedReason::InvalidValue)?,
             generation: parse_canonical_u64(generation)
                 .and_then(|value| Generation::new(value).ok())
                 .ok_or(UnrecognizedReason::InvalidValue)?,
-            kind: K::from_tag_name(kind).ok_or(UnrecognizedReason::InvalidValue)?,
             ceiling: match ceiling {
-                Some(value) => Some(Ceiling(
-                    parse_canonical_u64(value).ok_or(UnrecognizedReason::InvalidValue)?,
-                )),
-                None => None,
+                CeilingTag::At(ceiling) => Some(ceiling),
+                CeilingTag::Absent | CeilingTag::Malformed => None,
             },
         };
+        let kind = K::from_tag_name(kind).ok_or(UnrecognizedReason::InvalidValue)?;
 
         // a value such as `gen-07` parses but renders differently, so only a set that
-        // round-trips is exact
-        let mut rendered = self.render(&parsed);
-        let mut actual = tags.to_vec();
+        // round-trips is exact; malformed ceiling tags are left out of the comparison
+        let until = format!("{}-until-", self.prefix);
+        let mut rendered = self.render(&owner, kind);
+        let mut actual: Vec<_> = tags
+            .iter()
+            .filter(|tag| ceiling != CeilingTag::Malformed || !tag.starts_with(&until))
+            .cloned()
+            .collect();
         rendered.sort();
         actual.sort();
         if rendered != actual {
             return Err(UnrecognizedReason::InvalidValue);
         }
 
-        Ok(parsed)
+        Ok(ManagedTags {
+            ceiling,
+            ..owner.with_kind(kind)
+        })
     }
 }
 
@@ -284,7 +340,8 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::{
-        Ceiling, ManagedTags, OwnerTags, ResourceKind, TagMatch, TagScheme, UnrecognizedReason,
+        Ceiling, CeilingTag, ManagedTags, OwnerTags, ResourceKind, TagMatch, TagScheme,
+        UnrecognizedReason,
     };
     use crate::{
         ids::{Generation, OwnerId, TagPrefix},
@@ -319,13 +376,16 @@ mod tests {
         TagScheme::new(TagPrefix::parse("cl").unwrap())
     }
 
-    fn tags(ceiling: Option<Ceiling>) -> ManagedTags<Kind> {
+    fn owner(ceiling: Option<Ceiling>) -> OwnerTags {
         OwnerTags {
             owner: OwnerId::parse("job_1").unwrap(),
             generation: Generation::new(7).unwrap(),
             ceiling,
         }
-        .with_kind(Kind::Disk)
+    }
+
+    fn tags(ceiling: Option<Ceiling>) -> ManagedTags<Kind> {
+        owner(ceiling).with_kind(Kind::Disk)
     }
 
     fn strings(values: &[&str]) -> Vec<String> {
@@ -335,14 +395,17 @@ mod tests {
     #[test]
     fn rendered_tags_round_trip_with_and_without_a_ceiling() {
         let ceiling = Ceiling::at_or_before(UnixMillis::new(1_764_000_000_999).unwrap());
-        for expected in [tags(None), tags(Some(ceiling))] {
-            let rendered = scheme().render(&expected);
+        for ceiling in [None, Some(ceiling)] {
+            let rendered = scheme().render(&owner(ceiling), Kind::Disk);
 
-            assert_eq!(scheme().classify(&rendered), TagMatch::Managed(expected));
+            assert_eq!(
+                scheme().classify(&rendered),
+                TagMatch::Managed(tags(ceiling))
+            );
         }
 
         assert_eq!(
-            scheme().render(&tags(Some(ceiling))),
+            scheme().render(&owner(Some(ceiling)), Kind::Disk),
             strings(&[
                 "cl-managed",
                 "cl-owner-job_1",
@@ -421,9 +484,51 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_ceiling_keeps_the_owner_but_never_parses_as_a_deadline() {
+        let base = ["cl-managed", "cl-owner-job_1", "cl-gen-7", "cl-kind-disk"];
+        let malformed = [
+            vec!["cl-until-soon"],
+            vec!["cl-until-0100"],
+            vec!["cl-until-"],
+            vec!["cl-until-99999999999999999999"],
+            vec!["cl-until-100", "cl-until-200"],
+        ];
+
+        for until in malformed {
+            let tags_with_until: Vec<&str> = base.iter().copied().chain(until).collect();
+            let expected = ManagedTags {
+                ceiling: CeilingTag::Malformed,
+                ..tags(None)
+            };
+
+            assert_eq!(
+                scheme().classify(&strings(&tags_with_until)),
+                TagMatch::Managed(expected),
+                "{tags_with_until:?}"
+            );
+        }
+
+        let latest = UnixMillis::new(crate::time::MAX_SAFE_INTEGER).unwrap();
+        assert!(!CeilingTag::Malformed.is_reached_at(latest));
+
+        // a malformed ceiling does not excuse any other tag
+        let extra = strings(&[
+            "cl-managed",
+            "cl-owner-job_1",
+            "cl-gen-07",
+            "cl-kind-disk",
+            "cl-until-soon",
+        ]);
+        assert_eq!(
+            scheme().classify::<Kind>(&extra),
+            TagMatch::Unrecognized(UnrecognizedReason::InvalidValue)
+        );
+    }
+
+    #[test]
     fn another_prefix_never_matches() {
         let other = TagScheme::new(TagPrefix::parse("rb").unwrap());
-        let rendered = other.render(&tags(None));
+        let rendered = other.render(&owner(None), Kind::Disk);
 
         assert_eq!(scheme().classify::<Kind>(&rendered), TagMatch::Foreign);
     }

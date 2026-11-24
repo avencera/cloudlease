@@ -101,6 +101,15 @@ async function parkAlarm(stub: DurableObjectStub): Promise<number | null> {
   });
 }
 
+async function leaseOwner(owner: string, generation: number): Promise<void> {
+  const response = await ownerStub(owner).fetch("https://owner/lease", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ownerId: owner, generation, leaseId: `lease_${owner}` }),
+  });
+  expect(response.status).toBe(201);
+}
+
 async function holdings(owner: string): Promise<Array<{ state: { state: string } }>> {
   const response = await ownerStub(owner).fetch("https://owner/holdings");
   expect(response.status).toBe(200);
@@ -146,15 +155,38 @@ describe("cloudlease sweep in miniflare", () => {
     fake.addDroplet(301, tags("ghost_owner", 1, "droplet"));
     fake.addVolume("vol-301", tags("ghost_owner", 1, "volume"), [301]);
 
+    // another owner is mid-create: the droplet exists and is tagged, but its ID is not
+    // recorded yet, so only the intent saved before the create call protects it
+    await leaseOwner("job_creating", 1);
+    const release = fake.holdCreates();
+    const creating = ownerStub("job_creating").fetch("https://owner/droplet", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ generation: 1 }),
+    });
+    const inFlight = await vi.waitUntil(() =>
+      [...fake.droplets.values()].find((droplet) => droplet.tags.includes("cl-owner-job_creating")),
+    );
+    expect(inFlight.tags).toContain("cl-gen-1");
+    expect(inFlight.tags.some((tag) => tag.startsWith("cl-until-"))).toBe(true);
+
     const report = await sweep();
 
-    expect(report.managed).toBe(2);
-    expect(report.ownersAsked).toBe(1);
+    expect(report.managed).toBe(3);
+    expect(report.ownersAsked).toBe(2);
     expect(report.ownersFailed).toEqual([]);
     expect(outcomes(report)).toEqual([
       ["301", "unclaimed", "gone"],
       ["vol-301", "unclaimed", "gone"],
     ]);
+    expect(fake.droplets.has(inFlight.id)).toBe(true);
+
+    release();
+    const created = await creating;
+    expect(created.status).toBe(201);
+    expect(await created.json()).toMatchObject({ id: String(inFlight.id) });
+    expect(outcomes(await sweep())).toEqual([]);
+    expect(fake.droplets.has(inFlight.id)).toBe(true);
     // the droplet is confirmed gone before its attached volume is deleted
     expect(fake.deletesOf(301, "vol-301")).toEqual([
       "DELETE droplets/301",
@@ -162,7 +194,7 @@ describe("cloudlease sweep in miniflare", () => {
     ]);
     expect(fake.log).toContain("GET droplets/301");
     expect(fake.log).toContain("GET volumes/vol-301");
-    expect(fake.droplets.size).toBe(0);
+    expect([...fake.droplets.keys()]).toEqual([inFlight.id]);
     expect(fake.volumes.size).toBe(0);
     await expect(holdings("ghost_owner")).resolves.toEqual([]);
   });
@@ -226,6 +258,31 @@ describe("cloudlease sweep in miniflare", () => {
 
     expect(report.ownersAsked).toBe(0);
     expect(outcomes(report)).toEqual([["601", "pastCeiling", "gone"]]);
+  });
+
+  it("asks the owner about a droplet whose ceiling tag is malformed", async () => {
+    const now = Date.now();
+    await seedHolding(
+      "job_badceiling",
+      leasedHolding(
+        "job_badceiling",
+        1,
+        { startedAt: now, heartbeatDueAt: now + 10 * MINUTE, hardDeadline: now + 60 * MINUTE },
+        { droplet: { status: "created", id: "651" } },
+      ),
+    );
+    const malformed = (owner: string) => [...tags(owner, 1, "droplet"), "cl-until-soon"];
+    fake.addDroplet(651, malformed("job_badceiling"));
+    fake.addDroplet(652, malformed("ghost_badceiling"));
+
+    const report = await sweep();
+
+    // neither is read as past its ceiling or as having none: the live owner keeps its
+    // droplet and the owner that never existed loses its own
+    expect(report.unrecognized).toEqual([]);
+    expect(report.ownersAsked).toBe(2);
+    expect(outcomes(report)).toEqual([["652", "unclaimed", "gone"]]);
+    expect([...fake.droplets.keys()]).toEqual([651]);
   });
 
   it("keeps the resources of an owner that cannot answer", async () => {

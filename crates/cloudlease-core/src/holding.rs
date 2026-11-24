@@ -22,7 +22,7 @@ use crate::{
     deletes::{DeleteTarget, DeletesError, PendingDeletes},
     ids::{Generation, LeaseId, OwnerId, ResourceId},
     lease::{Expiry, Lease, LeaseError, LeasePolicy},
-    tags::{ManagedTags, ResourceKind},
+    tags::{Ceiling, ManagedTags, OwnerTags, ResourceKind},
     time::UnixMillis,
 };
 
@@ -197,6 +197,20 @@ impl<K: ResourceKind> Holding<K> {
             HoldingState::Leased { lease, .. } => Some(lease),
             _ => None,
         }
+    }
+
+    /// Returns the tags every resource of this leased generation is created with
+    ///
+    /// The ceiling is the lease's hard deadline, so the sweep deletes the resources at that
+    /// time even if this owner object is broken.
+    pub fn owner_tags(&self) -> Result<OwnerTags, HoldingError> {
+        let (lease, _) = self.leased_parts("tag resources for")?;
+
+        Ok(OwnerTags {
+            owner: self.owner.clone(),
+            generation: self.generation,
+            ceiling: Some(Ceiling::at_or_before(lease.hard_deadline())),
+        })
     }
 
     /// Records that a create request for `kind` is about to be sent

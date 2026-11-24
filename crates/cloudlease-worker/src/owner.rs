@@ -1,23 +1,28 @@
 //! The owner side of a lease: processing due holdings and answering the sweep
 //!
 //! An owner Durable Object keeps its holdings in a [`HoldingStore`], saves every change with
-//! [`save`], runs [`run_alarm`] from its `alarm` handler and serves [`answer_sweep`] at
-//! [`SWEEP_PATH`].
+//! [`save`], creates resources with [`create`], runs [`run_alarm`] from its `alarm` handler
+//! and serves [`answer_sweep`] at [`SWEEP_PATH`].
 
 use cloudlease_core::{
     alarm::{Backoff, Wake},
     holding::Holding,
+    ids::{Generation, ResourceId},
     sweep::{OwnerQuery, answer},
     tags::ResourceKind,
     time::UnixMillis,
 };
-use cloudlease_provider::{error::ProviderError, provider::CloudProvider, reaper::reap};
+use cloudlease_provider::{
+    error::ProviderError,
+    provider::{CloudProvider, CreateSpec},
+    reaper::reap,
+};
 use serde::de::DeserializeOwned;
 use worker::{Request, Response, Storage};
 
 use crate::{
     alarm::{rearm, rearm_after_failure},
-    error::CloudleaseResult,
+    error::{CloudleaseError, CloudleaseResult},
     http::{HttpError, json_response, read_json},
     store::HoldingStore,
 };
@@ -48,6 +53,52 @@ where
     let holdings = store.list::<K>()?;
 
     rearm(storage, holdings.iter().filter_map(Holding::wake), now).await
+}
+
+/// Creates one resource for a leased generation, saving the intent before the provider call
+///
+/// The `Requested` slot is saved first, so a sweep that runs while the create is in flight,
+/// or after this object dies before recording the ID, finds the resource claimed by a live
+/// lease. If the ID is never recorded, the lease's expiry turns the slot into a delete by
+/// tags. The resource's ceiling tag is the lease's hard deadline.
+///
+/// The holding is read again after the provider call, since an alarm may have ended the
+/// lease meanwhile; the ID is then not recorded, the holding error is returned, and cleanup
+/// finds the resource by its tags. A provider error leaves the slot requested for the same
+/// reason.
+pub async fn create<K, P>(
+    storage: &Storage,
+    store: &HoldingStore,
+    provider: &P,
+    generation: Generation,
+    spec: &P::Spec,
+    now: UnixMillis,
+) -> CloudleaseResult<(ResourceId, Holding<K>)>
+where
+    K: ResourceKind + DeserializeOwned,
+    P: CloudProvider<Kind = K>,
+{
+    let kind = spec.kind();
+    let holding = load(store, generation)?;
+    let tags = holding.owner_tags()?;
+    let requested = holding.request(kind, now)?;
+    save(storage, store, &requested, now).await?;
+
+    let id = provider.create(&tags, spec).await?;
+
+    let created = load(store, generation)?.record_created(kind, id.clone())?;
+    save(storage, store, &created, now).await?;
+
+    Ok((id, created))
+}
+
+fn load<K>(store: &HoldingStore, generation: Generation) -> CloudleaseResult<Holding<K>>
+where
+    K: ResourceKind + DeserializeOwned,
+{
+    store
+        .get(generation)?
+        .ok_or(CloudleaseError::UnknownGeneration(generation))
 }
 
 /// Expires overdue leases, runs a cleanup pass over each due holding, and re-arms the alarm

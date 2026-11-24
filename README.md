@@ -30,8 +30,9 @@ The app declares its own Durable Object classes and wraps the handlers in
   the owner revokes them.
 - The **sweep** lists every resource carrying the managed tag and asks each owner object
   which ones a live lease of the same generation claims. Anything not claimed is deleted.
-  An owner that does not answer keeps its resources until the next sweep. A resource past
-  its `until` ceiling tag is deleted without asking.
+  An owner object with no record of the resource claims nothing. An owner whose call
+  fails or times out is not counted as claiming nothing, so it keeps its resources until
+  the next sweep. A resource past its `until` ceiling tag is deleted without asking.
 - **Capacity permits** count against a global limit until the owner proves its resources
   absent. A suspect permit is released only by a sweep whose inventory was complete.
 
@@ -44,13 +45,18 @@ cl-managed  cl-owner-<owner>  cl-gen-<n>  cl-kind-droplet  [cl-until-<unix secs>
 ```
 
 A resource with the managed tag but any other tag shape is reported as unrecognized and
-left alone.
+left alone. The exception is a malformed `until` tag on an otherwise exact set: the sweep
+never reads it as a deadline or as the absence of one, and asks the owner instead.
 
 ## Wiring an app
 
 1. An owner Durable Object per owner ID. It stores holdings in a `HoldingStore`, calls
-   `owner::save` after each change, calls `owner::run_alarm` from `alarm()`, and answers
-   `POST owner::SWEEP_PATH` with `owner::answer_sweep`.
+   `owner::save` after each change, creates resources with `owner::create`, calls
+   `owner::run_alarm` from `alarm()`, and answers `POST owner::SWEEP_PATH` with
+   `owner::answer_sweep`. `owner::create` saves the create intent before calling the
+   provider, so a sweep that runs mid-create, or after the object dies before recording
+   the ID, still sees the resource as claimed. The resource's ceiling tag is the lease's
+   hard deadline.
 2. Optionally, a capacity Durable Object wrapping `capacity::CapacityGate`, used by the app
    through `capacity::CapacityClient`.
 3. A cron trigger that calls `sweep::run_sweep` with a `SweepConfig` naming the owner
@@ -73,10 +79,11 @@ just check        # all of the above
 The miniflare suite runs the test Worker against a fake DigitalOcean API, installed over
 `fetch`, and needs no account or token. It covers:
 
-- an orphan droplet and volume whose owner never existed
+- an orphan droplet and volume whose owner never existed, swept while another owner is
+  mid-create
 - resources past their hard deadline or ceiling
 - live resources that must be kept
-- failing owners and unrecognized tags
+- failing owners, unrecognized tags and malformed ceilings
 - capacity permit release
 - the owner alarm's delete-and-confirm loop
 - the cron trigger

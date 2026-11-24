@@ -26,6 +26,8 @@ export class FakeDigitalOcean {
   readonly droplets = new Map<number, Droplet>();
   readonly volumes = new Map<string, Volume>();
   readonly log: string[] = [];
+  private nextId = 9_000;
+  private createGate: Promise<void> | null = null;
 
   addDroplet(id: number, tags: string[], name = `droplet-${id}`): void {
     this.droplets.set(id, { id, name, tags, readsUntilGone: null });
@@ -44,6 +46,20 @@ export class FakeDigitalOcean {
     );
   }
 
+  // holds create responses until the returned function is called; the resource already
+  // exists meanwhile, as it does on DigitalOcean while a create response is in flight
+  holdCreates(): () => void {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.createGate = gate;
+    return () => {
+      this.createGate = null;
+      release();
+    };
+  }
+
   install(): void {
     const originalFetch = globalThis.fetch;
 
@@ -54,14 +70,28 @@ export class FakeDigitalOcean {
         return originalFetch(input, init);
       }
 
-      return this.handle(request.method, url);
+      return this.handle(request, url);
     });
   }
 
-  private handle(method: string, url: URL): Response {
+  private async handle(request: Request, url: URL): Promise<Response> {
+    const method = request.method;
     const path = url.pathname.replace(/^\/v2\//, "");
     this.log.push(`${method} ${path}`);
     const [collection, id] = path.split("/");
+
+    if (method === "POST" && collection === "droplets" && id === undefined) {
+      const body = (await request.json()) as { name: string; tags: string[] };
+      const droplet: Droplet = {
+        id: this.nextId++,
+        name: body.name,
+        tags: body.tags,
+        readsUntilGone: null,
+      };
+      this.droplets.set(droplet.id, droplet);
+      await this.createGate;
+      return Response.json({ droplet: dropletJson(droplet) }, { status: 202 });
+    }
 
     if (method === "GET" && collection === "droplets" && id === undefined) {
       const tag = url.searchParams.get("tag_name");

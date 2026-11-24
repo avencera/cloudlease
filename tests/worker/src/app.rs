@@ -8,7 +8,9 @@ use cloudlease_core::{
     ids::{Generation, LeaseId, OwnerId},
     lease::{Lease, LeasePolicy},
 };
-use cloudlease_provider::digitalocean::DoKind;
+use cloudlease_provider::digitalocean::{
+    BootScript, DoKind, DoSpec, DropletImage, DropletSpec, ResourceName, Slug,
+};
 use cloudlease_worker::{
     capacity::CapacityGate,
     digitalocean::{self, WorkersDigitalOcean},
@@ -75,6 +77,11 @@ impl DurableObject for Capacity {
 }
 
 #[derive(Deserialize)]
+struct CreateRequest {
+    generation: Generation,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LeaseRequest {
     owner_id: OwnerId,
@@ -106,6 +113,7 @@ impl DurableObject for Owner {
             (Method::Get, Some("holdings")) => self.list(&store),
             (Method::Post, Some("holdings")) => self.seed(&store, &mut request).await,
             (Method::Post, Some("lease")) => self.lease(&store, &mut request).await,
+            (Method::Post, Some("droplet")) => self.create_droplet(&store, &mut request).await,
             _ => Err(HttpError::not_found()),
         };
 
@@ -172,4 +180,42 @@ impl Owner {
 
         Ok(json_response(201, &holding)?)
     }
+
+    /// Creates a droplet for a leased generation the way an app would
+    async fn create_droplet(
+        &self,
+        store: &HoldingStore,
+        request: &mut Request,
+    ) -> Result<Response, HttpError> {
+        let body: CreateRequest = read_json(request).await?;
+        let provider = provider(&self.env)?;
+        let spec = droplet_spec().map_err(|error| HttpError::invalid_request(error.to_string()))?;
+        let (id, holding) = owner::create::<DoKind, _>(
+            &self.state.storage(),
+            store,
+            &provider,
+            body.generation,
+            &spec,
+            now(),
+        )
+        .await?;
+
+        Ok(json_response(
+            201,
+            &serde_json::json!({ "id": id, "holding": holding }),
+        )?)
+    }
+}
+
+fn droplet_spec() -> cloudlease_provider::error::ProviderResult<DoSpec> {
+    Ok(DoSpec::Droplet(DropletSpec {
+        name: ResourceName::parse("cloudlease-test")?,
+        region: Slug::parse("nyc3")?,
+        size: Slug::parse("s-1vcpu-1gb")?,
+        image: DropletImage::Slug(Slug::parse("ubuntu-24-04-x64")?),
+        boot: BootScript::parse("#!/bin/sh\ntrue\n")?,
+        ssh_key_ids: Vec::new(),
+        volume_ids: Vec::new(),
+        vpc_uuid: None,
+    }))
 }

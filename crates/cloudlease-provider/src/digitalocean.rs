@@ -308,7 +308,7 @@ impl<T: HttpTransport, R: Runtime> CloudProvider for DigitalOcean<T, R> {
     type Spec = DoSpec;
 
     async fn create(&self, owner: &OwnerTags, spec: &DoSpec) -> ProviderResult<ResourceId> {
-        let tags = self.scheme.render(&owner.with_kind(spec.kind()));
+        let tags = self.scheme.render(owner, spec.kind());
 
         match spec {
             DoSpec::Droplet(spec) => {

@@ -468,7 +468,7 @@ fn inventory_reports_wrong_shapes_and_ignores_foreign_resources() {
             2,
             FakeDroplet {
                 name: "mislabeled".to_owned(),
-                tags: scheme().render(&owner_tags("job_1", 1).with_kind(DoKind::Volume)),
+                tags: scheme().render(&owner_tags("job_1", 1), DoKind::Volume),
                 reads_until_gone: None,
             },
         );

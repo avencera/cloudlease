@@ -16,7 +16,7 @@ use cloudlease_core::{
         DoomReason, Inventory, Observed, OwnerAnswer, OwnerQuery, OwnerReply, Unrecognized, answer,
         doom, plan, releasable_permits,
     },
-    tags::{Ceiling, OwnerTags, ResourceKind, UnrecognizedReason},
+    tags::{Ceiling, CeilingTag, OwnerTags, ResourceKind, UnrecognizedReason},
     time::UnixMillis,
 };
 use serde::{Deserialize, Serialize};
@@ -336,12 +336,16 @@ fn the_sweep_deletes_orphans_expired_and_past_ceiling_resources_but_keeps_live_o
     let now = at(1_010_000);
     let live = half_created();
     let mut past_ceiling = observed("job_1", 1, Kind::Machine, "101");
-    past_ceiling.tags.ceiling = Some(Ceiling::at_or_before(at(1_000_000)));
+    past_ceiling.tags.ceiling = CeilingTag::At(Ceiling::at_or_before(at(1_000_000)));
+    // a malformed ceiling is never read as reached or as no deadline: the owner decides
+    let mut malformed = observed("ghost", 1, Kind::Machine, "202");
+    malformed.tags.ceiling = CeilingTag::Malformed;
     let inventory = Inventory {
         managed: vec![
             observed("job_1", 1, Kind::Disk, "vol-1"),
             past_ceiling.clone(),
             observed("ghost", 1, Kind::Machine, "201"),
+            malformed,
             observed("ghost", 1, Kind::Disk, "vol-2"),
             observed("down", 1, Kind::Machine, "301"),
         ],
@@ -381,6 +385,7 @@ fn the_sweep_deletes_orphans_expired_and_past_ceiling_resources_but_keeps_live_o
         vec![
             ("101", DoomReason::PastCeiling),
             ("201", DoomReason::Unclaimed),
+            ("202", DoomReason::Unclaimed),
             ("vol-2", DoomReason::Unclaimed),
         ]
     );

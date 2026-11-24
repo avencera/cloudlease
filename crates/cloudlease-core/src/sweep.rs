@@ -151,11 +151,7 @@ pub fn plan<K: ResourceKind>(
     let mut owners: BTreeMap<OwnerId, OwnerQuery<K>> = BTreeMap::new();
 
     for resource in &inventory.managed {
-        if resource
-            .tags
-            .ceiling
-            .is_some_and(|ceiling| ceiling.is_reached_at(now))
-        {
+        if resource.tags.ceiling.is_reached_at(now) {
             past_ceiling.push(resource.clone());
             continue;
         }

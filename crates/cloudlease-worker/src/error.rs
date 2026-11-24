@@ -1,6 +1,10 @@
 //! Errors from the Worker glue
 
-use cloudlease_core::{capacity::CapacityError, holding::HoldingError, ids::IdError};
+use cloudlease_core::{
+    capacity::CapacityError,
+    holding::HoldingError,
+    ids::{Generation, IdError},
+};
 use cloudlease_provider::error::ProviderError;
 use thiserror::Error;
 
@@ -36,6 +40,9 @@ pub enum CloudleaseError {
         /// The status it returned
         status: u16,
     },
+    /// The owner holds no record of this generation
+    #[error("no holding for generation {0}")]
+    UnknownGeneration(Generation),
     /// A binding or setting is missing or invalid
     #[error("configuration: {0}")]
     Config(String),
