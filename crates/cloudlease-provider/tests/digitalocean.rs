@@ -534,7 +534,7 @@ fn an_expired_holding_deletes_its_droplet_before_finding_and_deleting_a_lost_vol
     let holding = Holding::leased(owner.owner.clone(), owner.generation, lease)
         .request(DoKind::Droplet, at(0))
         .unwrap()
-        .record_created(DoKind::Droplet, droplet.clone())
+        .record_created(DoKind::Droplet, droplet.clone(), at(0))
         .unwrap()
         .request(DoKind::Volume, at(0))
         .unwrap();
@@ -594,7 +594,7 @@ fn a_failing_provider_turns_into_a_retry_without_losing_targets() {
     let releasing = Holding::leased(owner.owner.clone(), owner.generation, lease)
         .request(DoKind::Droplet, at(0))
         .unwrap()
-        .record_created(DoKind::Droplet, droplet.clone())
+        .record_created(DoKind::Droplet, droplet.clone(), at(0))
         .unwrap()
         .revoke(at(1_000));
 

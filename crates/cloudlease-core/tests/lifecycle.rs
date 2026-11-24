@@ -87,7 +87,7 @@ fn half_created() -> Holding<Kind> {
     leased()
         .request(Kind::Machine, start())
         .unwrap()
-        .record_created(Kind::Machine, id("101"))
+        .record_created(Kind::Machine, id("101"), start())
         .unwrap()
         .request(Kind::Disk, start())
         .unwrap()
@@ -241,12 +241,23 @@ fn a_stale_client_cannot_release_heartbeat_or_add_resources() {
         Err(HoldingError::SlotTaken)
     );
     assert_eq!(
-        holding.record_created(Kind::Machine, id("999")),
+        holding.record_created(Kind::Machine, id("999"), start()),
         Err(HoldingError::SlotMismatch)
     );
     assert_eq!(
-        holding.record_created(Kind::Machine, id("101")),
+        holding.record_created(Kind::Machine, id("101"), start()),
         Ok(holding.clone())
+    );
+    // a create that returns after the lease lapsed is not recorded, even before the
+    // expiry is stored, since the sweep has stopped counting the resource as claimed
+    assert_eq!(
+        leased()
+            .request(Kind::Machine, start())
+            .unwrap()
+            .record_created(Kind::Machine, id("101"), at(1_120_000)),
+        Err(HoldingError::Lease(LeaseError::Expired(
+            Expiry::HeartbeatMissed
+        )))
     );
 
     let releasing = holding.expire(at(1_120_000)).unwrap();

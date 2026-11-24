@@ -243,9 +243,20 @@ impl<K: ResourceKind> Holding<K> {
 
     /// Records the ID the provider returned for a requested kind
     ///
-    /// Recording the same ID twice is accepted, so a retried request is harmless.
-    pub fn record_created(&self, kind: K, id: ResourceId) -> Result<Self, HoldingError> {
+    /// Recording the same ID twice is accepted, so a retried request is harmless. A lease
+    /// that has expired by `now` is refused even before its expiry is stored: the sweep no
+    /// longer counts the resource as claimed, so reporting it as created would be wrong, and
+    /// the expired lease's cleanup finds it by its tags.
+    pub fn record_created(
+        &self,
+        kind: K,
+        id: ResourceId,
+        now: UnixMillis,
+    ) -> Result<Self, HoldingError> {
         let (lease, slots) = self.leased_parts("record a resource for")?;
+        if let Some(expiry) = lease.expiry(now) {
+            return Err(LeaseError::Expired(expiry).into());
+        }
         match slots.get(&kind) {
             Some(Slot::Requested) => {}
             Some(Slot::Created { id: existing }) if existing == &id => return Ok(self.clone()),

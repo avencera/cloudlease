@@ -62,10 +62,10 @@ where
 /// lease. If the ID is never recorded, the lease's expiry turns the slot into a delete by
 /// tags. The resource's ceiling tag is the lease's hard deadline.
 ///
-/// The holding is read again after the provider call, since an alarm may have ended the
-/// lease meanwhile; the ID is then not recorded, the holding error is returned, and cleanup
-/// finds the resource by its tags. A provider error leaves the slot requested for the same
-/// reason.
+/// The holding is read again after the provider call, and the clock too, since an alarm
+/// may have ended the lease meanwhile or it may have expired without one yet; the ID is
+/// then not recorded, the holding error is returned, and cleanup finds the resource by its
+/// tags. A provider error leaves the slot requested for the same reason.
 pub async fn create<K, P>(
     storage: &Storage,
     store: &HoldingStore,
@@ -86,8 +86,10 @@ where
 
     let id = provider.create(&tags, spec).await?;
 
-    let created = load(store, generation)?.record_created(kind, id.clone())?;
-    save(storage, store, &created, now).await?;
+    // a create can take seconds, so `now` from before it is too early to check the lease
+    let after = crate::runtime::now().max(now);
+    let created = load(store, generation)?.record_created(kind, id.clone(), after)?;
+    save(storage, store, &created, after).await?;
 
     Ok((id, created))
 }
