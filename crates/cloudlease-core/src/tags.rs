@@ -127,6 +127,8 @@ pub enum UnrecognizedReason {
     WrongShape,
     /// A tag value does not parse
     InvalidValue,
+    /// The kind tag names a different resource type than the provider reports
+    KindMismatch,
 }
 
 /// How a provider tag list relates to an app's tag scheme

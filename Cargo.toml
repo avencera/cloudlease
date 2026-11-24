@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cloudlease-core"]
+members = ["crates/cloudlease-core", "crates/cloudlease-provider"]
 resolver = "3"
 
 [workspace.package]

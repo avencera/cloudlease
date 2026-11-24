@@ -77,7 +77,7 @@ fn generation(value: u64) -> Generation {
 }
 
 fn leased() -> Holding<Kind> {
-    let lease = Lease::start(lease_id(), &policy(), start()).unwrap();
+    let lease = Lease::start(lease_id(), &policy(), start(), None).unwrap();
 
     Holding::leased(owner(), generation(1), lease)
 }
@@ -281,7 +281,7 @@ fn an_owner_alarm_follows_the_earliest_holding() {
     let late = Holding::leased(
         owner(),
         generation(2),
-        Lease::start(lease_id(), &policy(), at(1_060_000)).unwrap(),
+        Lease::start(lease_id(), &policy(), at(1_060_000), None).unwrap(),
     );
     let wakes = [&late, &early].into_iter().filter_map(Holding::wake);
 
@@ -475,4 +475,15 @@ fn unrecognized_resources_make_the_inventory_incomplete_and_are_never_doomed() {
     assert!(!inventory.is_complete());
     assert!(plan.owners.is_empty());
     assert!(doom(&plan, &BTreeMap::new()).is_empty());
+}
+
+#[test]
+fn an_owner_can_revoke_a_lease_once() {
+    let revoked = half_created().revoke(at(1_005_000));
+    let HoldingState::Releasing { reason, .. } = revoked.state() else {
+        panic!("a revoked lease must start releasing");
+    };
+
+    assert_eq!(*reason, ReleaseReason::Revoked);
+    assert_eq!(revoked.revoke(at(1_006_000)), revoked);
 }

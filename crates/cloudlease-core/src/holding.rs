@@ -53,6 +53,10 @@ pub enum ReleaseReason {
     HeartbeatMissed,
     /// The lease reached its maximum duration
     HardDeadline,
+    /// The owner ended the lease for its own reason, such as a spend cap or a failed create
+    ///
+    /// Apps that need finer reasons keep them in their own records.
+    Revoked,
 }
 
 impl From<Expiry> for ReleaseReason {
@@ -258,6 +262,15 @@ impl<K: ResourceKind> Holding<K> {
         lease.ensure_live(lease_id, now)?;
 
         Ok(self.end_lease(ReleaseReason::Released, now))
+    }
+
+    /// Ends a lease on the owner's authority, without the client's lease ID
+    ///
+    /// A holding that is already releasing or released is returned unchanged, so revoking
+    /// twice is harmless.
+    #[must_use]
+    pub fn revoke(&self, now: UnixMillis) -> Self {
+        self.end_lease(ReleaseReason::Revoked, now)
     }
 
     /// Ends an expired lease, or returns `None` when the lease is live or already ended

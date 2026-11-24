@@ -1,0 +1,17 @@
+//! The cloud provider boundary for cloudlease, the cleanup that drives it, and the
+//! DigitalOcean adapter
+//!
+//! Nothing here depends on a Worker runtime: clients take an injected [`http::HttpTransport`]
+//! and [`http::Runtime`], so the cleanup rules run under plain `cargo test`.
+//!
+//! - [`provider::CloudProvider`]: create, delete, presence, find by tags, inventory
+//! - [`reaper::reap`]: one delete-and-confirm pass over a releasing holding
+//! - [`sweep::delete_doomed`]: deletes the resources a sweep doomed, lowest rank first
+//! - [`digitalocean`]: droplets and volumes over the DigitalOcean v2 API
+
+pub mod digitalocean;
+pub mod error;
+pub mod http;
+pub mod provider;
+pub mod reaper;
+pub mod sweep;

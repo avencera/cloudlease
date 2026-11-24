@@ -15,6 +15,7 @@ use crate::{ids::LeaseId, time::UnixMillis};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LeasePolicy {
     heartbeat_timeout: Duration,
+    boot_grace: Duration,
     max_duration: Duration,
 }
 
@@ -28,14 +29,30 @@ impl LeasePolicy {
 
         Ok(Self {
             heartbeat_timeout,
+            boot_grace: heartbeat_timeout,
             max_duration,
         })
+    }
+
+    /// Allows a longer wait for the first heartbeat, while a machine boots
+    pub fn with_boot_grace(self, boot_grace: Duration) -> Result<Self, LeaseError> {
+        if boot_grace.is_zero() || boot_grace > self.max_duration {
+            return Err(LeaseError::InvalidPolicy);
+        }
+
+        Ok(Self { boot_grace, ..self })
     }
 
     /// Returns the longest allowed gap between heartbeats
     #[must_use]
     pub const fn heartbeat_timeout(&self) -> Duration {
         self.heartbeat_timeout
+    }
+
+    /// Returns the longest wait for the first heartbeat
+    #[must_use]
+    pub const fn boot_grace(&self) -> Duration {
+        self.boot_grace
     }
 
     /// Returns the longest allowed lease
@@ -98,12 +115,25 @@ pub struct Lease {
 
 impl Lease {
     /// Starts a lease at `now`
-    pub fn start(id: LeaseId, policy: &LeasePolicy, now: UnixMillis) -> Result<Self, LeaseError> {
-        let hard_deadline = now
+    ///
+    /// The hard deadline is `now` plus the policy's maximum duration, or `not_after` when that
+    /// is earlier, such as the deadline of a batch run the lease belongs to.
+    pub fn start(
+        id: LeaseId,
+        policy: &LeasePolicy,
+        now: UnixMillis,
+        not_after: Option<UnixMillis>,
+    ) -> Result<Self, LeaseError> {
+        let longest = now
             .checked_add(policy.max_duration)
             .ok_or(LeaseError::OutOfRange)?;
+        let hard_deadline = not_after.map_or(longest, |not_after| not_after.min(longest));
+        if hard_deadline <= now {
+            return Err(LeaseError::Expired(Expiry::HardDeadline));
+        }
+
         let heartbeat_due_at = now
-            .checked_add(policy.heartbeat_timeout)
+            .checked_add(policy.boot_grace)
             .ok_or(LeaseError::OutOfRange)?
             .min(hard_deadline);
 
@@ -276,7 +306,7 @@ mod tests {
     }
 
     fn start() -> Lease {
-        Lease::start(lease_id(), &policy(), at(1_000_000)).unwrap()
+        Lease::start(lease_id(), &policy(), at(1_000_000), None).unwrap()
     }
 
     #[test]
@@ -344,6 +374,30 @@ mod tests {
         assert_eq!(
             second.heartbeat(&lease_id(), 3, second.heartbeat_due_at(), &policy()),
             Err(LeaseError::Expired(Expiry::HeartbeatMissed))
+        );
+    }
+
+    #[test]
+    fn a_boot_grace_covers_only_the_first_heartbeat_and_a_cap_shortens_the_lease() {
+        let policy = policy().with_boot_grace(15 * MINUTE).unwrap();
+        let lease = Lease::start(lease_id(), &policy, at(0), None).unwrap();
+        assert_eq!(lease.heartbeat_due_at(), at(900_000));
+
+        let renewed = lease
+            .heartbeat(&lease_id(), 1, at(60_000), &policy)
+            .unwrap();
+        assert_eq!(renewed.heartbeat_due_at(), at(180_000));
+
+        let capped = Lease::start(lease_id(), &policy, at(0), Some(at(600_000))).unwrap();
+        assert_eq!(capped.hard_deadline(), at(600_000));
+        assert_eq!(capped.heartbeat_due_at(), at(600_000));
+        assert_eq!(
+            Lease::start(lease_id(), &policy, at(600_000), Some(at(600_000))),
+            Err(LeaseError::Expired(Expiry::HardDeadline))
+        );
+        assert_eq!(
+            policy.with_boot_grace(241 * MINUTE),
+            Err(LeaseError::InvalidPolicy)
         );
     }
 
