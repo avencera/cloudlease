@@ -1089,8 +1089,8 @@ fn run_spend_cap(
             ApiError::new(
                 ErrorCode::InvalidRequest,
                 format!(
-                    "spend_cap_cents may be at most the run spend cap of {}",
-                    config.run_spend_cap
+                    "spend_cap_cents may be at most {}",
+                    config.run_spend_cap.whole_cents()
                 ),
             )
         })

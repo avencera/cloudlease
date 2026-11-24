@@ -7,12 +7,12 @@
 //! 2. reads the capacity gate's suspect permits, when the app has a gate
 //! 3. deletes resources past their ceiling, before asking any owner, so a hard deadline never
 //!    waits on one
-//! 4. asks each owner object which of its resources it claims and which generations it is
-//!    already releasing; an owner object that never existed claims nothing, and an owner that
+//! 4. asks each owner object which of its resources it claims and which generations it has
+//!    already ended; an owner object that never existed claims nothing, and an owner that
 //!    fails or does not answer within [`SweepConfig::owner_timeout`] keeps its resources below
 //!    their ceiling until the next sweep
 //! 5. deletes every other resource no live lease claims; each delete reports whether the owner
-//!    was already releasing it, so an app can alert on orphans only
+//!    had already ended its lease, so an app can alert on orphans only
 //! 6. releases suspect permits once their resources are proven absent
 
 use std::{
@@ -25,7 +25,7 @@ use cloudlease_core::{
     ids::{OwnerId, PermitId},
     sweep::{
         OwnerAnswer, OwnerQuery, OwnerReply, Unrecognized, doom_past_ceiling, doom_unclaimed,
-        owner_releasing, plan, releasable_permits,
+        owner_ended, plan, releasable_permits,
     },
     tags::ResourceKind,
     time::UnixMillis,
@@ -96,9 +96,9 @@ pub struct SweepDelete<K> {
     /// What happened to it
     #[serde(flatten)]
     pub report: DeleteReport<K>,
-    /// Whether its owner answered that it was already releasing it; false marks an orphan, a
-    /// resource that outlived a lease its owner did not end, or an owner that did not answer
-    pub owner_releasing: bool,
+    /// Whether its owner answered that it had already ended its lease; false marks an orphan,
+    /// a resource that outlived a lease its owner did not end, or an owner that did not answer
+    pub owner_ended: bool,
 }
 
 impl<K> SweepReport<K> {
@@ -167,7 +167,7 @@ where
     let deletes: Vec<_> = reports
         .into_iter()
         .map(|report| SweepDelete {
-            owner_releasing: owner_releasing(&replies, &report.resource),
+            owner_ended: owner_ended(&replies, &report.resource),
             report,
         })
         .collect();

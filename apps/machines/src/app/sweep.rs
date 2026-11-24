@@ -71,10 +71,10 @@ fn log(report: &SweepReport<DoKind>) {
 }
 
 async fn alert_orphans(env: &Env, deletes: &[SweepDelete<DoKind>]) {
-    // a resource its owner is already releasing is routine cleanup; any other one leaked
+    // a resource of a lease its owner already ended is routine cleanup; any other one leaked
     let orphans: Vec<String> = deletes
         .iter()
-        .filter(|delete| !delete.owner_releasing)
+        .filter(|delete| !delete.owner_ended)
         .map(|SweepDelete { report, .. }| {
             format!(
                 "{:?} {} of {} generation {} ({:?}, {:?})",

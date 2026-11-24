@@ -560,21 +560,21 @@ describe("cloudlease machines in miniflare", () => {
     await expectError(await call("POST", "/v1/runs", CLIENT, runBody({ spend_cap_cents: 6 })), 400, "invalid_request");
     await expectError(await call("POST", "/v1/runs", CLIENT, runBody({ spend_cap_cents: 0 })), 400, "invalid_request");
 
-    const body = runBody({ spend_cap_cents: 1 });
+    const body = runBody({ spend_cap_cents: 2 });
     const created = await call("POST", "/v1/runs", CLIENT, body);
     expect(created.status).toBe(201);
     const run = (await created.json()) as RunView;
     expect((await call("POST", "/v1/runs", CLIENT, body)).status).toBe(200);
     await expectError(
-      await call("POST", "/v1/runs", CLIENT, { ...body, spend_cap_cents: 2 }),
+      await call("POST", "/v1/runs", CLIENT, { ...body, spend_cap_cents: 3 }),
       409,
       "request_conflict",
     );
     await expectError(await call("POST", "/v1/runs", CLIENT, { ...body, spend_cap_cents: undefined }), 409, "request_conflict");
 
-    // two hours at $0.01 is past the run's 1 cent cap but well inside the config's 5 cents
+    // three hours at $0.01 is past the run's 2 cent cap but inside the config's 5 cents
     const lease = await createMachine(run, "hb-client-cap-1");
-    await backdateMachine(lease, 2 * HOUR);
+    await backdateMachine(lease, 3 * HOUR);
     await expectError(
       await call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-client-cap-2")),
       429,

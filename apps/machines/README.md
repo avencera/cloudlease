@@ -79,18 +79,18 @@ until then the run object retries with backoff.
 ## Spend caps
 
 Prices come from the class table in `MACHINES_CONFIG`, in US dollars per hour. DigitalOcean
-bills droplets per second with a 60-second minimum, and a powered-off droplet still bills;
+bills droplets per second with a minimum of 60 seconds or $0.01, whichever is higher, and a
+powered-off droplet still bills;
 volumes bill hourly whether or not they are attached (DigitalOcean's billing docs, read
 2026-11-24). A class with a volume should include the volume's price in its hourly price.
 
-- **Per run**: the run's accrued spend is each machine's price times its billed life, at
-  least 60 seconds, from create until it was confirmed gone. Each create still waiting on
-  the gate reserves one 60-second minimum, so simultaneous creates cannot pass the cap
-  together. A run's cap is the client's `spend_cap_cents`, or else `run_spend_cap_usd`. A
-  create that would take the run past it is refused with `spend_cap_reached`, and is
-  checked again after the gate answers. When accrued spend
-  reaches the cap, the run object ends the run, releases every machine with reason
-  `spend_cap`, and alerts.
+- **Per run**: the run's accrued spend is each machine's price times its billed life, from
+  create until it was confirmed gone, and at least that minimum. Each create still waiting
+  on the gate reserves one minimum, so simultaneous creates cannot pass the cap together. A
+  run's cap is the client's `spend_cap_cents`, or else `run_spend_cap_usd`. A create that
+  would take the run past it is refused with `spend_cap_reached`, and is checked again
+  after the gate answers. When accrued spend reaches the cap, the run object ends the run,
+  releases every machine with reason `spend_cap`, and alerts.
 - **Per hour**: a rate cap. Every machine not yet confirmed gone holds a permit in the
   `Gate` object weighted by its class's price in cents per hour, rounded up. A create whose
   permit would take the total past `HOURLY_SPEND_CAP_CENTS` is refused with
@@ -108,7 +108,7 @@ the Worker log either way:
 - a run reaching its spend cap (priority 5)
 - a create refused by the hourly cap (priority 5)
 - a provider create failure, once per run (priority 4)
-- a sweep deleting a resource that no run was already releasing, which means it leaked
+- a sweep deleting a resource whose lease no run had already ended, which means it leaked
   (priority 4)
 - a run object failing to answer the sweep, or the sweep failing outright, on the third
   sweep in a row and then hourly (the `Monitor` object counts the streaks)

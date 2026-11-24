@@ -16,7 +16,7 @@ import { FakeDigitalOcean, tags } from "./fake-digitalocean";
 interface DeleteReport {
   resource: { id: string; tags: { owner: string; generation: number; kind: string } };
   reason: "pastCeiling" | "unclaimed";
-  ownerReleasing: boolean;
+  ownerEnded: boolean;
   outcome: { outcome: "gone" | "stillPresent" | "deferred" | "failed" };
 }
 
@@ -294,11 +294,11 @@ describe("cloudlease sweep in miniflare", () => {
 
     const report = await sweep();
 
-    // the owner is asked only afterwards, whether it was already releasing the droplet, which
-    // it was not
+    // the owner is asked only afterwards, whether it had already ended the droplet's lease,
+    // which it had not
     expect(report.ownersAsked).toBe(1);
     expect(outcomes(report)).toEqual([["601", "pastCeiling", "gone"]]);
-    expect(report.deletes[0]?.ownerReleasing).toBe(false);
+    expect(report.deletes[0]?.ownerEnded).toBe(false);
   });
 
   it("asks the owner about a droplet whose ceiling tag is malformed", async () => {
@@ -362,7 +362,7 @@ describe("cloudlease sweep in miniflare", () => {
     await stall;
 
     expect(outcomes(report)).toEqual([["711", "pastCeiling", "gone"]]);
-    expect(report.deletes[0]?.ownerReleasing).toBe(false);
+    expect(report.deletes[0]?.ownerEnded).toBe(false);
     expect(report.ownersFailed).toEqual([
       { owner: "job_stalled", error: "job_stalled did not answer within 2000ms" },
     ]);

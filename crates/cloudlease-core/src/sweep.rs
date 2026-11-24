@@ -6,15 +6,15 @@
 //! deleted. A resource past its [`Ceiling`](crate::tags::Ceiling) is deleted before any owner
 //! is asked, so a hard deadline never waits on an owner.
 //!
-//! Owners also say which of the queried generations they are already releasing. A doomed
-//! resource of such a generation is the owner's own cleanup racing the sweep; any other
-//! doomed resource is an orphan or outlived a lease its owner failed to end, which an app
-//! may want to alert on.
+//! Owners also say which of the queried generations they ended themselves, whether still
+//! releasing or already released. A doomed resource of such a generation is the owner's own
+//! cleanup racing the sweep; any other doomed resource is an orphan or outlived a lease its
+//! owner failed to end, which an app may want to alert on.
 //!
 //! ```text
 //! inventory --plan--> SweepPlan --doom_past_ceiling--> delete and confirm
 //!                         \--owners answer--> doom_unclaimed --> delete and confirm
-//!                                         \--> owner_releasing, releasable permits
+//!                                         \--> owner_ended, releasable permits
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -101,16 +101,19 @@ pub struct OwnerAnswer {
     pub claimed: BTreeSet<ResourceId>,
     /// Queried generations that are not yet confirmed gone
     pub busy: BTreeSet<Generation>,
-    /// Queried generations whose lease ended and whose resources the owner is deleting
+    /// Queried generations whose lease the owner ended, still releasing or already released
+    ///
+    /// Released counts too: the sweep deletes past-ceiling resources before it asks, so an
+    /// owner cleaning up the same resource may confirm it gone and record it released first.
     #[serde(default)]
-    pub releasing: BTreeSet<Generation>,
+    pub ended: BTreeSet<Generation>,
 }
 
 /// Answers a sweep query from an owner's holdings
 ///
 /// A generation is busy while it is leased or still releasing, since its owner may yet
 /// create or delete resources; only a released or unknown generation can have its permit
-/// released by the sweep. The releasing generations are reported apart, so the sweep can tell
+/// released by the sweep. The ended generations are reported apart, so the sweep can tell
 /// the owner's own cleanup from an orphan.
 #[must_use]
 pub fn answer<'a, K: ResourceKind>(
@@ -145,7 +148,12 @@ pub fn answer<'a, K: ResourceKind>(
     OwnerAnswer {
         claimed,
         busy: reported(|holding| !holding.is_released()),
-        releasing: reported(|holding| matches!(holding.state(), HoldingState::Releasing { .. })),
+        ended: reported(|holding| {
+            matches!(
+                holding.state(),
+                HoldingState::Releasing { .. } | HoldingState::Released { .. }
+            )
+        }),
     }
 }
 
@@ -272,14 +280,14 @@ pub fn doom_unclaimed<K: ResourceKind>(
         .collect()
 }
 
-/// Reports whether a doomed resource's owner said it was already releasing its generation
+/// Reports whether a doomed resource's owner said it had already ended its generation
 ///
 /// When true the delete is the owner's own cleanup racing the sweep; when false the resource
 /// is an orphan, outlived a lease its owner did not end, or its owner did not answer.
 #[must_use]
-pub fn owner_releasing<K>(replies: &BTreeMap<OwnerId, OwnerReply>, resource: &Observed<K>) -> bool {
+pub fn owner_ended<K>(replies: &BTreeMap<OwnerId, OwnerReply>, resource: &Observed<K>) -> bool {
     answer_of(replies, &resource.tags.owner)
-        .is_some_and(|answer| answer.releasing.contains(&resource.tags.generation))
+        .is_some_and(|answer| answer.ended.contains(&resource.tags.generation))
 }
 
 fn answer_of<'a>(

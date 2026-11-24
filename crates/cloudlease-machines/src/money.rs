@@ -1,10 +1,10 @@
 //! Prices, accrued spend and when a run reaches its cap
 //!
-//! DigitalOcean bills droplets per second with a 60 second minimum, and volumes hourly
-//! (docs.digitalocean.com droplet and volume pricing pages, checked 2026-11-24). A class's
-//! price is its droplet and volume together per hour, and spend is billed per millisecond
-//! from the lease's creation until its resources are confirmed gone, with the 60 second
-//! minimum. That counts from before the provider create until after the delete, so it never
+//! DigitalOcean bills droplets per second with a minimum of 60 seconds or $0.01, whichever
+//! is higher, and volumes hourly (docs.digitalocean.com droplet and volume pricing pages,
+//! checked 2026-11-24). A class's price is its droplet and volume together per hour, and
+//! spend is billed per millisecond from the lease's creation until its resources are
+//! confirmed gone, with the same minimum. That counts from before the provider create until after the delete, so it never
 //! undercounts what DigitalOcean bills.
 
 use std::{fmt, time::Duration};
@@ -15,6 +15,9 @@ use thiserror::Error;
 
 /// The shortest billed lifetime of a droplet
 pub const MINIMUM_BILLED: Duration = Duration::from_secs(60);
+
+/// The least DigitalOcean charges for a droplet, whatever its price and life
+pub const MINIMUM_CHARGE: MicroUsd = MicroUsd(MICROS_PER_CENT);
 
 const MICROS_PER_DOLLAR: u64 = 1_000_000;
 const MICROS_PER_CENT: u64 = 10_000;
@@ -86,6 +89,12 @@ impl MicroUsd {
         }
     }
 
+    /// Returns the whole cents in the amount, rounded down
+    #[must_use]
+    pub const fn whole_cents(self) -> u64 {
+        self.0 / MICROS_PER_CENT
+    }
+
     /// Adds without overflow
     #[must_use]
     pub const fn saturating_add(self, other: Self) -> Self {
@@ -109,7 +118,8 @@ impl fmt::Display for MicroUsd {
     }
 }
 
-/// What a resource at `price_per_hour` costs from `from` to `to`, at least the minimum
+/// What a resource at `price_per_hour` costs from `from` to `to`: at least
+/// [`MINIMUM_BILLED`] of its time, and at least [`MINIMUM_CHARGE`]
 #[must_use]
 pub fn billed(price_per_hour: MicroUsd, from: UnixMillis, to: UnixMillis) -> MicroUsd {
     let elapsed = to.as_millis().saturating_sub(from.as_millis());
@@ -117,7 +127,7 @@ pub fn billed(price_per_hour: MicroUsd, from: UnixMillis, to: UnixMillis) -> Mic
     let billed_millis = u128::from(elapsed.max(minimum));
     let micros = (u128::from(price_per_hour.0) * billed_millis).div_ceil(MILLIS_PER_HOUR);
 
-    MicroUsd(u64::try_from(micros).unwrap_or(u64::MAX))
+    MicroUsd(u64::try_from(micros).unwrap_or(u64::MAX)).max(MINIMUM_CHARGE)
 }
 
 /// One machine's billed life: from its lease's creation until its resources are gone
@@ -228,11 +238,16 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_is_billed_from_creation_to_gone_with_a_minute_minimum() {
+    fn a_machine_is_billed_from_creation_to_gone_with_a_minute_and_cent_minimum() {
         let price = dollars("36"); // a cent a second
         assert_eq!(billed(price, at(0), at(1_000)), dollars("0.60"));
         assert_eq!(billed(price, at(0), at(90_000)), dollars("0.90"));
         assert_eq!(billed(price, at(5_000), at(0)), dollars("0.60"));
+
+        // a minute of a $0.125/h droplet is about $0.002, but DigitalOcean charges a cent
+        let cheap = dollars("0.125");
+        assert_eq!(billed(cheap, at(0), at(60_000)), dollars("0.01"));
+        assert_eq!(billed(cheap, at(0), at(3_600_000)), dollars("0.125"));
     }
 
     #[test]
