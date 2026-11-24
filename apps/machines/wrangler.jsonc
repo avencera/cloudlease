@@ -17,7 +17,8 @@
   },
   "observability": { "enabled": true },
   // secrets, set with `wrangler secret put`: DIGITALOCEAN_TOKEN, CLIENT_TOKENS, NTFY_URL,
-  // optionally NTFY_TOKEN, and PNAP_CLIENT_ID with PNAP_CLIENT_SECRET for phoenixNAP classes
+  // optionally NTFY_TOKEN, PNAP_CLIENT_ID with PNAP_CLIENT_SECRET for phoenixNAP classes, and
+  // LATITUDE_API_KEY with LATITUDE_PROJECT (the project's proj_ ID) for Latitude.sh classes
   "vars": {
     // every resource this Worker creates or sweeps carries tags with this prefix; no other
     // cloudlease app may use it
@@ -35,8 +36,8 @@
       "run_spend_cap_usd": "0.40",
       // a machine renews every 30 seconds; a run keeps the windows it was created with
       "heartbeat_ttl_secs": 180,
-      // the boot grace of DigitalOcean classes; a phoenixNAP class waits 20 minutes, and any
-      // class may set its own boot_grace_secs
+      // the boot grace of DigitalOcean classes; a phoenixNAP class waits 20 minutes, a
+      // Latitude.sh class 15, and any class may set its own boot_grace_secs
       "boot_grace_secs": 480,
       // prices are list prices per hour; check DigitalOcean's with `doctl compute size list`
       // and phoenixNAP's with its product availability API before deploying. DigitalOcean's
@@ -74,6 +75,19 @@
           "price_per_hour_usd": "0.31",
           "max_hours": 1
         }
+        // a Latitude.sh class needs LATITUDE_API_KEY and LATITUDE_PROJECT; check the plan's
+        // hourly price and per-site stock with GET /plans?filter[slug]=m4-metal-medium first.
+        // On 2026-11-24 m4.metal.medium (EPYC 9124, 16 cores, 128 GB) cost $1.25 an hour
+        // with one in stock at each of DAL, CHI, MIA2 and SJC2
+        // ,
+        // "lat-m4-medium": {
+        //   "provider": "latitude",
+        //   "plan": "m4-metal-medium",
+        //   "sites": ["DAL", "CHI", "SJC2"],
+        //   "operating_system": "ubuntu_24_04_x64_lts",
+        //   "price_per_hour_usd": "1.25",
+        //   "max_hours": 1
+        // }
       },
       "apps": { "homebased": { "classes": ["do-s1-1g", "pnap-s2-large", "pnap-s2-small"] } }
     }

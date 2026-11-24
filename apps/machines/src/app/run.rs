@@ -18,10 +18,13 @@ use cloudlease_core::{
 use cloudlease_machines::{
     alert::{Alert, Priority},
     boot::{Boot, LeaseFile, VolumeMount, check_fits, render_user_data},
-    config::{DigitalOceanClass, MachineClass, MachinesConfig, PhoenixNapClass, ProviderClass},
+    config::{
+        DigitalOceanClass, LatitudeClass, MachineClass, MachinesConfig, PhoenixNapClass,
+        ProviderClass,
+    },
     ids::{AppName, ClassName, RunId},
     money::MicroUsd,
-    provider::{MachineKind, MachineSpec, PnapPlacement, ProviderName},
+    provider::{LatPlacement, LatitudeSpec, MachineKind, MachineSpec, PnapPlacement, ProviderName},
     run::{
         Admission, Admitted, LeaseEnd, MachineEntry, MachineRecord, RunEnd, RunRecord, admit,
         confirm, end_lease, lease_view, run_spend, run_view,
@@ -36,7 +39,9 @@ use cloudlease_machines::{
 use cloudlease_provider::{
     digitalocean::{BootScript, DoSpec, DropletSpec, ResourceName, VolumeSpec},
     error::ProviderErrorCode,
+    latitude::{self, UserDataSpec},
     phoenixnap::{self, ServerSpec},
+    provider::CreateSpec,
 };
 use cloudlease_worker::{
     alarm::{rearm, rearm_after_failure},
@@ -55,7 +60,8 @@ use crate::{
         alerts::notify,
         api::CALL_PATH,
         settings::{
-            MachineProviders, answer, config, error_response, internal, phoenixnap, provider,
+            MachineProviders, answer, config, error_response, internal, latitude, phoenixnap,
+            provider,
         },
     },
 };
@@ -583,6 +589,7 @@ impl Run {
         let provisioned = match &class.provider {
             ProviderClass::DigitalOcean(droplet) => provisioning.droplet(droplet).await,
             ProviderClass::PhoenixNap(server) => provisioning.server(server).await,
+            ProviderClass::Latitude(server) => provisioning.latitude(server).await,
         };
         provisioned.map_err(|error| CreateFailure {
             out_of_stock: !provisioning.created.get() && is_out_of_stock(&error),
@@ -1131,7 +1138,7 @@ struct Provisioning<'a> {
     record: &'a MachineRecord,
     lease: &'a LeaseFile<'a>,
     boot: &'a Boot,
-    // whether any resource of the machine was created, after which a failure may have
+    // whether any billed resource of the machine was created, after which a failure may have
     // something billed behind it
     created: Cell<bool>,
 }
@@ -1139,8 +1146,8 @@ struct Provisioning<'a> {
 /// A failed machine create
 struct CreateFailure {
     error: CloudleaseError,
-    /// Whether the provider refused the machine's first resource for lack of stock, so
-    /// nothing of it was created
+    /// Whether the provider refused the machine's first billed resource for lack of stock,
+    /// so nothing billed was created
     out_of_stock: bool,
 }
 
@@ -1154,8 +1161,8 @@ impl From<CloudleaseError> for CreateFailure {
 }
 
 fn is_out_of_stock(error: &CloudleaseError) -> bool {
-    // phoenixNAP answers no stock before it creates anything, and the adapter reports it
-    // only once every location of the class refused
+    // phoenixNAP and Latitude.sh answer no stock before they create anything, and the
+    // adapters report it only once every location or site of the class refused
     matches!(error, CloudleaseError::Provider(error) if error.code == ProviderErrorCode::NoCapacity)
 }
 
@@ -1170,7 +1177,11 @@ impl Provisioning<'_> {
             runtime::now(),
         )
         .await?;
-        self.created.set(true);
+        // a Latitude.sh user data record costs nothing, so a server refused for stock after
+        // it still leaves the machine unbilled
+        if spec.kind().is_billed() {
+            self.created.set(true);
+        }
 
         Ok(id)
     }
@@ -1236,6 +1247,35 @@ impl Provisioning<'_> {
 
         Ok(())
     }
+
+    /// Creates the user data record that names the machine's owner, then the server that
+    /// boots from it in the first of the class's sites that has stock
+    async fn latitude(&self, class: &LatitudeClass) -> CloudleaseResult<()> {
+        let user_data = self.user_data(None)?;
+        let record = MachineSpec::Latitude(LatitudeSpec::UserData(UserDataSpec {
+            boot: latitude::BootScript::parse(user_data.as_str())?,
+        }));
+        let record = self.create(&record).await?;
+
+        let first = class
+            .sites
+            .as_slice()
+            .first()
+            .ok_or_else(|| CloudleaseError::Config("a class has no sites".to_owned()))?;
+        let spec = MachineSpec::Latitude(LatitudeSpec::Server(LatPlacement {
+            server: latitude::ServerSpec {
+                plan: class.plan.clone(),
+                site: first.clone(),
+                operating_system: class.operating_system.clone(),
+                user_data: record,
+                ssh_key_ids: class.ssh_key_ids.clone(),
+            },
+            sites: class.sites.clone(),
+        }));
+        self.create(&spec).await?;
+
+        Ok(())
+    }
 }
 
 /// Refuses a class whose provider this Worker has no credentials for, before anything is
@@ -1244,16 +1284,21 @@ fn require_provider(env: &Env, name: &ClassName, class: &MachineClass) -> Result
     let configured = match class.provider.name() {
         ProviderName::DigitalOcean => true,
         ProviderName::PhoenixNap => phoenixnap(env).map_err(internal)?.is_some(),
+        ProviderName::Latitude => latitude(env).map_err(internal)?.is_some(),
     };
     if configured {
         return Ok(());
     }
 
+    let settings = match class.provider.name() {
+        ProviderName::DigitalOcean => "DIGITALOCEAN_TOKEN",
+        ProviderName::PhoenixNap => "PNAP_CLIENT_ID and PNAP_CLIENT_SECRET",
+        ProviderName::Latitude => "LATITUDE_API_KEY and LATITUDE_PROJECT",
+    };
     Err(ApiError::new(
         ErrorCode::UnknownClass,
         format!(
-            "class {name} uses {}, which this Worker has no credentials for \
-             (PNAP_CLIENT_ID and PNAP_CLIENT_SECRET)",
+            "class {name} uses {}, which this Worker has no credentials for ({settings})",
             class.provider.name()
         ),
     ))

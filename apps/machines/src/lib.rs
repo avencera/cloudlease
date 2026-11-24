@@ -1,5 +1,6 @@
-//! The cloudlease machines Worker: temporary DigitalOcean and phoenixNAP machines whose
-//! lifetime Cloudflare enforces, so no machine depends on an agent to be deleted
+//! The cloudlease machines Worker: temporary DigitalOcean, phoenixNAP and Latitude.sh
+//! machines whose lifetime Cloudflare enforces, so no machine depends on an agent to be
+//! deleted
 //!
 //! It serves the temporary machines contract (`/v1/runs`, `/v1/leases`) to homebased:
 //!
@@ -13,12 +14,13 @@
 //! - **`Monitor`** Durable Object: consecutive sweep failures, so a failing owner alerts on
 //!   its third sweep in a row rather than on every one.
 //! - A cron sweep every 5 minutes that deletes every resource with the app's tag prefix that
-//!   no live lease claims, droplets, volumes and phoenixNAP servers alike, and alerts on
-//!   orphans.
+//!   no live lease claims, droplets, volumes, phoenixNAP servers and Latitude.sh servers and
+//!   their user data alike, and alerts on orphans.
 //!
 //! Each machine class names its provider. Alerts go to the ntfy topic in `NTFY_URL`. The
-//! Worker has its own DigitalOcean token, optional phoenixNAP credentials and its own tag
-//! prefix, so it cannot touch another app's resources.
+//! Worker has its own DigitalOcean token, optional phoenixNAP credentials, an optional
+//! Latitude.sh key and project, and its own tag prefix, so it cannot touch another app's
+//! resources.
 
 #[cfg(target_arch = "wasm32")]
 mod app;
@@ -28,8 +30,8 @@ use std::time::Duration;
 use cloudlease_machines::config::MAX_RUN_LIFETIME;
 use cloudlease_provider::sweep::ConfirmPolicy;
 use cloudlease_worker::{
-    capacity::CapacityConfig, digitalocean::DigitalOceanBindings, phoenixnap::PhoenixNapBindings,
-    sweep::SweepConfig,
+    capacity::CapacityConfig, digitalocean::DigitalOceanBindings, latitude::LatitudeBindings,
+    phoenixnap::PhoenixNapBindings, sweep::SweepConfig,
 };
 
 /// The namespace binding of the run objects
@@ -65,6 +67,14 @@ pub const PHOENIXNAP: PhoenixNapBindings<'static> = PhoenixNapBindings {
     client_secret: "PNAP_CLIENT_SECRET",
     api_url: Some("PNAP_API_URL"),
     token_url: Some("PNAP_TOKEN_URL"),
+    tag_prefix: "CLOUDLEASE_TAG_PREFIX",
+};
+
+/// The Latitude.sh bindings; a Worker without the key and project refuses Latitude.sh classes
+pub const LATITUDE: LatitudeBindings<'static> = LatitudeBindings {
+    api_key: "LATITUDE_API_KEY",
+    project: "LATITUDE_PROJECT",
+    api_url: Some("LATITUDE_API_URL"),
     tag_prefix: "CLOUDLEASE_TAG_PREFIX",
 };
 

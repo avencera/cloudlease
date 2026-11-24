@@ -12,15 +12,16 @@ use cloudlease_worker::{
     digitalocean::{self, WorkersDigitalOcean},
     error::CloudleaseResult,
     http::{HttpError, json_response},
+    latitude::{self, WorkersLatitude},
     phoenixnap::{self, WorkersPhoenixNap},
 };
 use serde::Serialize;
 use worker::{Env, Response};
 
-use crate::{CLIENT_TOKENS, CONFIG_VAR, DIGITALOCEAN, PHOENIXNAP};
+use crate::{CLIENT_TOKENS, CONFIG_VAR, DIGITALOCEAN, LATITUDE, PHOENIXNAP};
 
 /// Every provider the Worker has credentials for
-pub type MachineProviders = Providers<WorkersDigitalOcean, WorkersPhoenixNap>;
+pub type MachineProviders = Providers<WorkersDigitalOcean, WorkersPhoenixNap, WorkersLatitude>;
 
 /// Turns any failure into a retryable `500 internal`
 pub fn internal(error: impl Display) -> ApiError {
@@ -66,17 +67,29 @@ pub fn phoenixnap(env: &Env) -> CloudleaseResult<Option<WorkersPhoenixNap>> {
     phoenixnap::from_env(env, PHOENIXNAP)
 }
 
-/// Builds the provider of every class: DigitalOcean always, phoenixNAP when configured
+/// Builds the Latitude.sh adapter, or `None` when the Worker has no Latitude.sh key and
+/// project
+pub fn latitude(env: &Env) -> CloudleaseResult<Option<WorkersLatitude>> {
+    latitude::from_env(env, LATITUDE)
+}
+
+/// Builds the provider of every class: DigitalOcean always, phoenixNAP and Latitude.sh when
+/// configured
 ///
-/// Broken phoenixNAP credentials, such as one secret set without the other, leave phoenixNAP
-/// out rather than failing, so they never stop DigitalOcean deletes; health reports them.
+/// Broken optional settings, such as one secret set without the other, leave that provider
+/// out rather than failing, so they never stop the other providers' deletes; health reports
+/// them.
 pub fn provider(env: &Env) -> CloudleaseResult<MachineProviders> {
     let phoenixnap = phoenixnap(env).unwrap_or_else(|error| {
         worker::console_error!("cloudlease machines: phoenixNAP left out: {error}");
         None
     });
+    let latitude = latitude(env).unwrap_or_else(|error| {
+        worker::console_error!("cloudlease machines: Latitude.sh left out: {error}");
+        None
+    });
 
-    Ok(Providers::new(digitalocean(env)?, phoenixnap))
+    Ok(Providers::new(digitalocean(env)?, phoenixnap, latitude))
 }
 
 /// Answers with a JSON body

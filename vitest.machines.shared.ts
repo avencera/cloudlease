@@ -12,6 +12,13 @@ export const PHOENIXNAP_BINDINGS = {
   PNAP_TOKEN_URL: "https://auth.phoenixnap.test/token",
 };
 
+// the Latitude.sh key, project and fake API; a Worker without them refuses Latitude.sh classes
+export const LATITUDE_BINDINGS = {
+  LATITUDE_API_KEY: "test-latitude-key",
+  LATITUDE_PROJECT: "proj_test",
+  LATITUDE_API_URL: "https://api.latitude.test/",
+};
+
 // the machines Worker in miniflare against the fake providers, with the suite's classes and
 // client tokens "client-homebased" and "client-other"
 export function machinesConfig(include: string[], extraBindings: Record<string, string>) {
@@ -73,9 +80,18 @@ export function machinesConfig(include: string[], extraBindings: Record<string, 
                   price_per_hour_usd: "0.02",
                   max_hours: 12,
                 },
+                // a Latitude.sh server, billed by the started hour until its rounding is known
+                lat: {
+                  provider: "latitude",
+                  plan: "m4-metal-medium",
+                  sites: ["DAL", "CHI"],
+                  operating_system: "ubuntu_24_04_x64_lts",
+                  price_per_hour_usd: "0.02",
+                  max_hours: 12,
+                },
               },
               apps: {
-                homebased: { classes: ["small", "disk", "huge", "metal"] },
+                homebased: { classes: ["small", "disk", "huge", "metal", "lat"] },
                 other: { classes: ["small"] },
               },
             },

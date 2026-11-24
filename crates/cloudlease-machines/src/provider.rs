@@ -8,6 +8,9 @@
 //!
 //! Adding a provider is one more [`MachineKind`] per resource kind, one more
 //! [`MachineSpec`] variant and one more field here.
+//!
+//! A Latitude.sh machine is two resources: the user data record that names its owner, then
+//! the server that boots from it. Only the server is billed.
 
 use std::fmt;
 
@@ -19,12 +22,13 @@ use cloudlease_core::{
 use cloudlease_provider::{
     digitalocean::{DoKind, DoSpec},
     error::{ProviderError, ProviderErrorCode, ProviderResult},
+    latitude::{self, LatKind, LatSpec},
     phoenixnap::{Location, PnapKind, PnapSpec, ServerSpec},
     provider::{CloudProvider, CreateSpec, Presence},
 };
 use serde::{Deserialize, Serialize};
 
-/// The most locations a phoenixNAP class may try in turn
+/// The most locations a phoenixNAP class, or sites a Latitude.sh class, may try in turn
 ///
 /// Each attempt can take the client's 30 second request timeout, and a create still in flight
 /// when its lease ends is found only by the sweep once the core's tag search settles, so the
@@ -39,6 +43,8 @@ pub enum ProviderName {
     DigitalOcean,
     /// phoenixNAP Bare Metal Cloud servers
     PhoenixNap,
+    /// Latitude.sh bare metal servers
+    Latitude,
 }
 
 impl ProviderName {
@@ -48,6 +54,7 @@ impl ProviderName {
         match self {
             Self::DigitalOcean => "digitalocean",
             Self::PhoenixNap => "phoenixnap",
+            Self::Latitude => "latitude",
         }
     }
 }
@@ -68,6 +75,10 @@ pub enum MachineKind {
     Volume,
     /// A phoenixNAP Bare Metal Cloud server
     PnapServer,
+    /// A Latitude.sh server
+    LatServer,
+    /// The Latitude.sh user data record a server boots from, which names its owner
+    LatUserData,
 }
 
 impl MachineKind {
@@ -77,27 +88,45 @@ impl MachineKind {
         match self {
             Self::Droplet | Self::Volume => ProviderName::DigitalOcean,
             Self::PnapServer => ProviderName::PhoenixNap,
+            Self::LatServer | Self::LatUserData => ProviderName::Latitude,
         }
     }
 
-    /// Reports whether this kind is the machine itself rather than its storage
+    /// Reports whether this kind is the machine itself rather than its storage or records
     #[must_use]
     pub const fn is_machine(self) -> bool {
-        matches!(self, Self::Droplet | Self::PnapServer)
+        matches!(self, Self::Droplet | Self::PnapServer | Self::LatServer)
+    }
+
+    /// Reports whether the provider bills for a resource of this kind
+    ///
+    /// A machine whose only created resources are unbilled, such as a Latitude.sh user data
+    /// record before a server create refused for stock, has cost nothing.
+    #[must_use]
+    pub const fn is_billed(self) -> bool {
+        !matches!(self, Self::LatUserData)
     }
 }
 
 impl ResourceKind for MachineKind {
-    const ALL: &'static [Self] = &[Self::Droplet, Self::Volume, Self::PnapServer];
+    const ALL: &'static [Self] = &[
+        Self::Droplet,
+        Self::Volume,
+        Self::PnapServer,
+        Self::LatServer,
+        Self::LatUserData,
+    ];
 
     // each provider writes and parses its own kind tags, so these only have to match them;
-    // the names are distinct today, and a later provider whose tag repeats one must not rely
-    // on `from_tag_name`
+    // Latitude.sh's `server` repeats phoenixNAP's, so nothing may parse a machine kind with
+    // `from_tag_name`
     fn tag_name(self) -> &'static str {
         match self {
             Self::Droplet => DoKind::Droplet.tag_name(),
             Self::Volume => DoKind::Volume.tag_name(),
             Self::PnapServer => PnapKind::Server.tag_name(),
+            Self::LatServer => LatKind::Server.tag_name(),
+            Self::LatUserData => LatKind::UserData.tag_name(),
         }
     }
 
@@ -106,6 +135,8 @@ impl ResourceKind for MachineKind {
             Self::Droplet => DoKind::Droplet.delete_rank(),
             Self::Volume => DoKind::Volume.delete_rank(),
             Self::PnapServer => PnapKind::Server.delete_rank(),
+            Self::LatServer => LatKind::Server.delete_rank(),
+            Self::LatUserData => LatKind::UserData.delete_rank(),
         }
     }
 }
@@ -127,18 +158,28 @@ impl From<PnapKind> for MachineKind {
     }
 }
 
-/// The phoenixNAP locations a class tries, in order, each at most once
+impl From<LatKind> for MachineKind {
+    fn from(kind: LatKind) -> Self {
+        match kind {
+            LatKind::Server => Self::LatServer,
+            LatKind::UserData => Self::LatUserData,
+        }
+    }
+}
+
+/// The places a class tries, in order, each at most once: phoenixNAP locations or
+/// Latitude.sh sites
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Locations(Vec<Location>);
+pub struct Locations<L = Location>(Vec<L>);
 
 /// A rejected location list
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("locations must be 1 to {MAX_LOCATIONS} distinct location codes")]
 pub struct LocationsError;
 
-impl Locations {
+impl<L: PartialEq> Locations<L> {
     /// Checks a location list: not empty, at most [`MAX_LOCATIONS`], no repeats
-    pub fn new(locations: Vec<Location>) -> Result<Self, LocationsError> {
+    pub fn new(locations: Vec<L>) -> Result<Self, LocationsError> {
         let repeated = locations
             .iter()
             .enumerate()
@@ -152,7 +193,7 @@ impl Locations {
 
     /// Returns the locations in the order they are tried
     #[must_use]
-    pub fn as_slice(&self) -> &[Location] {
+    pub fn as_slice(&self) -> &[L] {
         &self.0
     }
 }
@@ -166,6 +207,24 @@ pub struct PnapPlacement {
     pub locations: Locations,
 }
 
+/// A Latitude.sh server and the sites it may be created in
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LatPlacement {
+    /// The server; its `site` is replaced by each site in turn
+    pub server: latitude::ServerSpec,
+    /// Where to try, first to last
+    pub sites: Locations<latitude::Slug>,
+}
+
+/// A Latitude.sh create request
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LatitudeSpec {
+    /// The user data record, created first
+    UserData(latitude::UserDataSpec),
+    /// The server, tried in each site until one has stock
+    Server(LatPlacement),
+}
+
 /// A create request for one resource of a machine
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MachineSpec {
@@ -173,6 +232,8 @@ pub enum MachineSpec {
     DigitalOcean(DoSpec),
     /// A phoenixNAP server, tried in each location until one has stock
     PhoenixNap(PnapPlacement),
+    /// A Latitude.sh user data record or server
+    Latitude(LatitudeSpec),
 }
 
 impl CreateSpec for MachineSpec {
@@ -182,30 +243,35 @@ impl CreateSpec for MachineSpec {
         match self {
             Self::DigitalOcean(spec) => spec.kind().into(),
             Self::PhoenixNap(_) => MachineKind::PnapServer,
+            Self::Latitude(LatitudeSpec::UserData(_)) => MachineKind::LatUserData,
+            Self::Latitude(LatitudeSpec::Server(_)) => MachineKind::LatServer,
         }
     }
 }
 
 /// Every provider the machines app can use, as one [`CloudProvider`]
 ///
-/// DigitalOcean is always configured. phoenixNAP is optional: without it, a phoenixNAP
-/// create, delete, read or tag search fails with a validation error, and the inventory
-/// holds DigitalOcean resources only.
-pub struct Providers<D, P> {
+/// DigitalOcean is always configured. phoenixNAP and Latitude.sh are optional: without one,
+/// its creates, deletes, reads and tag searches fail with a validation error, and the
+/// inventory holds the other providers' resources only.
+pub struct Providers<D, P, L> {
     digitalocean: D,
     phoenixnap: Option<P>,
+    latitude: Option<L>,
 }
 
-impl<D, P> Providers<D, P>
+impl<D, P, L> Providers<D, P, L>
 where
     D: CloudProvider<Kind = DoKind, Spec = DoSpec>,
     P: CloudProvider<Kind = PnapKind, Spec = PnapSpec>,
+    L: CloudProvider<Kind = LatKind, Spec = LatSpec>,
 {
     /// Combines the configured adapters
-    pub const fn new(digitalocean: D, phoenixnap: Option<P>) -> Self {
+    pub const fn new(digitalocean: D, phoenixnap: Option<P>, latitude: Option<L>) -> Self {
         Self {
             digitalocean,
             phoenixnap,
+            latitude,
         }
     }
 
@@ -215,7 +281,53 @@ where
         match provider {
             ProviderName::DigitalOcean => true,
             ProviderName::PhoenixNap => self.phoenixnap.is_some(),
+            ProviderName::Latitude => self.latitude.is_some(),
         }
+    }
+
+    fn latitude(&self) -> ProviderResult<&L> {
+        self.latitude.as_ref().ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorCode::Validation,
+                false,
+                "Latitude.sh is not configured: set LATITUDE_API_KEY and LATITUDE_PROJECT",
+            )
+        })
+    }
+
+    /// Creates the server in each site in turn until one has stock
+    ///
+    /// Like phoenixNAP's locations, only `SERVERS_OUT_OF_STOCK` moves on, since it means
+    /// Latitude.sh created nothing.
+    async fn create_latitude_server(
+        &self,
+        owner: &OwnerTags,
+        placement: &LatPlacement,
+    ) -> ProviderResult<ResourceId> {
+        let latitude = self.latitude()?;
+        let mut out_of_stock = Vec::new();
+        for site in placement.sites.as_slice() {
+            let spec = LatSpec::Server(latitude::ServerSpec {
+                site: site.clone(),
+                ..placement.server.clone()
+            });
+            match latitude.create(owner, &spec).await {
+                Err(error) if error.code == ProviderErrorCode::NoCapacity => {
+                    out_of_stock.push(site.as_str());
+                }
+                result => return result,
+            }
+        }
+
+        Err(ProviderError::new(
+            ProviderErrorCode::NoCapacity,
+            false,
+            format!(
+                "Latitude.sh has no {} in stock at {}",
+                placement.server.plan.as_str(),
+                out_of_stock.join(", ")
+            ),
+        ))
     }
 
     fn phoenixnap(&self) -> ProviderResult<&P> {
@@ -264,11 +376,22 @@ where
     }
 }
 
-fn digitalocean_kind(kind: MachineKind) -> Option<DoKind> {
-    match kind {
-        MachineKind::Droplet => Some(DoKind::Droplet),
-        MachineKind::Volume => Some(DoKind::Volume),
-        MachineKind::PnapServer => None,
+/// One provider's own kind for a machine kind
+enum ProviderKind {
+    DigitalOcean(DoKind),
+    PhoenixNap(PnapKind),
+    Latitude(LatKind),
+}
+
+impl From<MachineKind> for ProviderKind {
+    fn from(kind: MachineKind) -> Self {
+        match kind {
+            MachineKind::Droplet => Self::DigitalOcean(DoKind::Droplet),
+            MachineKind::Volume => Self::DigitalOcean(DoKind::Volume),
+            MachineKind::PnapServer => Self::PhoenixNap(PnapKind::Server),
+            MachineKind::LatServer => Self::Latitude(LatKind::Server),
+            MachineKind::LatUserData => Self::Latitude(LatKind::UserData),
+        }
     }
 }
 
@@ -303,10 +426,11 @@ fn add<K: Into<MachineKind>>(
     into.unlisted.extend(inventory.unlisted);
 }
 
-impl<D, P> CloudProvider for Providers<D, P>
+impl<D, P, L> CloudProvider for Providers<D, P, L>
 where
     D: CloudProvider<Kind = DoKind, Spec = DoSpec>,
     P: CloudProvider<Kind = PnapKind, Spec = PnapSpec>,
+    L: CloudProvider<Kind = LatKind, Spec = LatSpec>,
 {
     type Kind = MachineKind;
     type Spec = MachineSpec;
@@ -315,20 +439,30 @@ where
         match spec {
             MachineSpec::DigitalOcean(spec) => self.digitalocean.create(owner, spec).await,
             MachineSpec::PhoenixNap(placement) => self.create_server(owner, placement).await,
+            MachineSpec::Latitude(LatitudeSpec::UserData(spec)) => {
+                self.latitude()?
+                    .create(owner, &LatSpec::UserData(spec.clone()))
+                    .await
+            }
+            MachineSpec::Latitude(LatitudeSpec::Server(placement)) => {
+                self.create_latitude_server(owner, placement).await
+            }
         }
     }
 
     async fn delete(&self, kind: MachineKind, id: &ResourceId) -> ProviderResult<()> {
-        match digitalocean_kind(kind) {
-            Some(kind) => self.digitalocean.delete(kind, id).await,
-            None => self.phoenixnap()?.delete(PnapKind::Server, id).await,
+        match kind.into() {
+            ProviderKind::DigitalOcean(kind) => self.digitalocean.delete(kind, id).await,
+            ProviderKind::PhoenixNap(kind) => self.phoenixnap()?.delete(kind, id).await,
+            ProviderKind::Latitude(kind) => self.latitude()?.delete(kind, id).await,
         }
     }
 
     async fn presence(&self, kind: MachineKind, id: &ResourceId) -> ProviderResult<Presence> {
-        match digitalocean_kind(kind) {
-            Some(kind) => self.digitalocean.presence(kind, id).await,
-            None => self.phoenixnap()?.presence(PnapKind::Server, id).await,
+        match kind.into() {
+            ProviderKind::DigitalOcean(kind) => self.digitalocean.presence(kind, id).await,
+            ProviderKind::PhoenixNap(kind) => self.phoenixnap()?.presence(kind, id).await,
+            ProviderKind::Latitude(kind) => self.latitude()?.presence(kind, id).await,
         }
     }
 
@@ -338,13 +472,14 @@ where
         generation: Generation,
         kind: MachineKind,
     ) -> ProviderResult<Vec<ResourceId>> {
-        match digitalocean_kind(kind) {
-            Some(kind) => self.digitalocean.find(owner, generation, kind).await,
-            None => {
-                self.phoenixnap()?
-                    .find(owner, generation, PnapKind::Server)
-                    .await
+        match kind.into() {
+            ProviderKind::DigitalOcean(kind) => {
+                self.digitalocean.find(owner, generation, kind).await
             }
+            ProviderKind::PhoenixNap(kind) => {
+                self.phoenixnap()?.find(owner, generation, kind).await
+            }
+            ProviderKind::Latitude(kind) => self.latitude()?.find(owner, generation, kind).await,
         }
     }
 
@@ -369,6 +504,13 @@ where
                 phoenixnap.inventory().await,
             );
         }
+        if let Some(latitude) = &self.latitude {
+            add(
+                &mut inventory,
+                ProviderName::Latitude,
+                latitude.inventory().await,
+            );
+        }
 
         Ok(inventory)
     }
@@ -383,10 +525,17 @@ mod tests {
 
     #[test]
     fn machine_kinds_keep_their_providers_tags_and_delete_order() {
+        // only the kinds whose tag names are unique round-trip; providers parse their own
         for kind in MachineKind::ALL {
-            assert_eq!(MachineKind::from_tag_name(kind.tag_name()), Some(*kind));
+            if *kind != MachineKind::LatServer {
+                assert_eq!(MachineKind::from_tag_name(kind.tag_name()), Some(*kind));
+            }
         }
         assert_eq!(MachineKind::PnapServer.tag_name(), "server");
+        assert_eq!(MachineKind::LatServer.tag_name(), "server");
+        // a Latitude.sh record is deleted only once its server is gone, and is never billed
+        assert!(MachineKind::LatServer.delete_rank() < MachineKind::LatUserData.delete_rank());
+        assert!(!MachineKind::LatUserData.is_billed() && MachineKind::LatServer.is_billed());
         assert!(MachineKind::Droplet.delete_rank() < MachineKind::Volume.delete_rank());
         assert_eq!(MachineKind::from(DoKind::Volume), MachineKind::Volume);
         assert!(MachineKind::PnapServer.is_machine() && !MachineKind::Volume.is_machine());
@@ -397,7 +546,7 @@ mod tests {
         let location = |code: &str| Location::parse(code).unwrap();
 
         assert!(Locations::new(vec![location("SEA"), location("NLD")]).is_ok());
-        assert!(Locations::new(Vec::new()).is_err());
+        assert!(Locations::<Location>::new(Vec::new()).is_err());
         assert!(Locations::new(vec![location("SEA"), location("SEA")]).is_err());
         assert!(
             Locations::new(vec![

@@ -8,6 +8,8 @@
 //!   checked 2026-11-24).
 //! - phoenixNAP bills every started hour in full, with a minimum of one hour, from deploy until
 //!   the server is deleted (phoenixNAP billing knowledge base, checked 2026-11-24).
+//! - Latitude.sh documents an hourly price but not how it rounds a partial hour, so it is
+//!   counted like phoenixNAP until a live test shows otherwise.
 //!
 //! Spend counts from the lease's creation, before the provider create, until its resources
 //! are confirmed gone, so it never undercounts what the provider bills.
@@ -150,6 +152,9 @@ impl Billing {
         minimum_secs: SECS_PER_HOUR,
         minimum_charge: MicroUsd::ZERO,
     };
+
+    /// Latitude.sh: every started hour, at least one hour, until its rounding is known
+    pub const LATITUDE: Self = Self::PHOENIXNAP;
 
     /// Bills in a coarser increment than the provider's, such as a class priced by the hour
     ///

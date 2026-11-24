@@ -22,6 +22,7 @@ use cloudlease_core::{
 };
 use cloudlease_provider::{
     digitalocean::{DropletImage, Slug},
+    latitude,
     phoenixnap::{Location, OsImage, ServerType, SshKeyIds},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -46,6 +47,12 @@ pub const DEFAULT_BOOT_GRACE: Duration = Duration::from_secs(8 * 60);
 /// phoenixNAP quotes 60 seconds to 15 minutes to provision, by OS, and applies cloud-init
 /// with a reboot on top.
 pub const PHOENIXNAP_BOOT_GRACE: Duration = Duration::from_secs(20 * 60);
+
+/// The boot grace of a Latitude.sh class that sets none
+///
+/// Latitude.sh deploys in under 10 seconds when the plan, site and OS are listed in the
+/// plan's `deploys_instantly`, and in about 10 minutes otherwise.
+pub const LATITUDE_BOOT_GRACE: Duration = Duration::from_secs(15 * 60);
 
 /// The shortest heartbeat window a config may set, so a few lost renews do not end a lease
 pub const MIN_HEARTBEAT_TTL: Duration = Duration::from_secs(60);
@@ -141,6 +148,16 @@ struct RawPhoenixNapClass {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawLatitudeClass {
+    plan: String,
+    sites: Vec<String>,
+    operating_system: String,
+    #[serde(default)]
+    ssh_key_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawVolume {
     size_gib: NonZeroU32,
     mount: String,
@@ -192,6 +209,23 @@ pub struct PhoenixNapClass {
     pub ssh_key_ids: SshKeyIds,
 }
 
+/// A Latitude.sh bare metal server, billed hourly
+///
+/// The server boots from a user data record the lease creates first, in the Worker's
+/// Latitude.sh project.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LatitudeClass {
+    /// The plan slug, such as `m4-metal-medium`
+    pub plan: latitude::Slug,
+    /// The sites to try in order, such as `DAL`; one without stock moves the create on
+    pub sites: Locations<latitude::Slug>,
+    /// The operating system slug, which must support user data, such as
+    /// `ubuntu_24_04_x64_lts`
+    pub operating_system: latitude::Slug,
+    /// IDs of project SSH keys installed for break-glass access
+    pub ssh_key_ids: Vec<ResourceId>,
+}
+
 /// The provider a class uses and the machine it asks that provider for
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderClass {
@@ -199,6 +233,8 @@ pub enum ProviderClass {
     DigitalOcean(DigitalOceanClass),
     /// A phoenixNAP server
     PhoenixNap(PhoenixNapClass),
+    /// A Latitude.sh server
+    Latitude(LatitudeClass),
 }
 
 impl ProviderClass {
@@ -208,6 +244,7 @@ impl ProviderClass {
         match self {
             Self::DigitalOcean(_) => ProviderName::DigitalOcean,
             Self::PhoenixNap(_) => ProviderName::PhoenixNap,
+            Self::Latitude(_) => ProviderName::Latitude,
         }
     }
 
@@ -216,7 +253,7 @@ impl ProviderClass {
     pub fn volume_mount(&self) -> Option<&MountPath> {
         match self {
             Self::DigitalOcean(class) => class.volume.as_ref().map(|volume| &volume.mount),
-            Self::PhoenixNap(_) => None,
+            Self::PhoenixNap(_) | Self::Latitude(_) => None,
         }
     }
 }
@@ -464,7 +501,10 @@ fn machine_class(
     let provider = match raw.remove("provider") {
         None => ProviderName::DigitalOcean,
         Some(value) => ProviderName::deserialize(value).map_err(|_| {
-            ConfigError::invalid(field("provider"), "must be digitalocean or phoenixnap")
+            ConfigError::invalid(
+                field("provider"),
+                "must be digitalocean, phoenixnap or latitude",
+            )
         })?,
     };
     // the common fields are split off, so each part is checked for unknown fields alone
@@ -485,6 +525,11 @@ fn machine_class(
             ProviderClass::PhoenixNap(phoenixnap_class(name, parse_class(name, raw)?)?),
             Billing::PHOENIXNAP,
             PHOENIXNAP_BOOT_GRACE,
+        ),
+        ProviderName::Latitude => (
+            ProviderClass::Latitude(latitude_class(name, parse_class(name, raw)?)?),
+            Billing::LATITUDE,
+            LATITUDE_BOOT_GRACE,
         ),
     };
 
@@ -612,6 +657,34 @@ fn phoenixnap_class(
     })
 }
 
+fn latitude_class(name: &ClassName, raw: RawLatitudeClass) -> Result<LatitudeClass, ConfigError> {
+    let field = |key: &str| format!("classes.{name}.{key}");
+    let slug = |key: &str, value: String| {
+        latitude::Slug::parse(value).map_err(|error| ConfigError::invalid(field(key), error))
+    };
+
+    let sites = raw
+        .sites
+        .into_iter()
+        .map(|site| slug("sites", site))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ssh_key_ids = raw
+        .ssh_key_ids
+        .into_iter()
+        .map(|id| {
+            ResourceId::parse(id).map_err(|error| ConfigError::invalid(field("ssh_key_ids"), error))
+        })
+        .collect::<Result<_, _>>()?;
+
+    Ok(LatitudeClass {
+        plan: slug("plan", raw.plan)?,
+        sites: Locations::new(sites)
+            .map_err(|error| ConfigError::invalid(field("sites"), error))?,
+        operating_system: slug("operating_system", raw.operating_system)?,
+        ssh_key_ids,
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::time::Duration;
@@ -655,9 +728,19 @@ pub(crate) mod tests {
                     "ssh_key_ids": ["5fa54d1e91867c03a0a7b4a4"],
                     "price_per_hour_usd": "0.40",
                     "max_hours": 12
+                },
+                "lat-m4": {
+                    "provider": "latitude",
+                    "plan": "m4-metal-medium",
+                    "sites": ["DAL", "CHI"],
+                    "operating_system": "ubuntu_24_04_x64_lts",
+                    "price_per_hour_usd": "1.25",
+                    "max_hours": 12
                 }
             },
-            "apps": { "homebased": { "classes": ["do-c16", "do-c16-disk", "pnap-s2"] } }
+            "apps": {
+                "homebased": { "classes": ["do-c16", "do-c16-disk", "pnap-s2", "lat-m4"] }
+            }
         })
     }
 
@@ -696,6 +779,19 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(locations, ["SEA", "NLD"]);
         assert_eq!(pnap.provider.volume_mount(), None);
+
+        // a Latitude.sh class bills by the hour for now and waits 15 minutes for its boot
+        let lat = config
+            .class_for(&homebased, &ClassName::parse("lat-m4").unwrap())
+            .unwrap();
+        assert_eq!(lat.billing, Billing::LATITUDE);
+        assert_eq!(lat.heartbeat.boot_grace(), Duration::from_secs(900));
+        assert_eq!(lat.gate_units.get(), 125);
+        let ProviderClass::Latitude(server) = &lat.provider else {
+            panic!("lat-m4 is a Latitude.sh class");
+        };
+        let sites: Vec<&str> = server.sites.as_slice().iter().map(|s| s.as_str()).collect();
+        assert_eq!(sites, ["DAL", "CHI"]);
         assert_eq!(
             config.class_for(&AppName::parse("other").unwrap(), &class),
             Err(UnknownClass)
@@ -750,6 +846,11 @@ pub(crate) mod tests {
         // billing finer than phoenixNAP's hour would undercount
         assert!(broken(&["classes", "pnap-s2", "billing_increment_secs"], json!(60)).is_err());
         assert!(broken(&["classes", "pnap-s2", "boot_grace_secs"], json!(30)).is_err());
+        assert!(broken(&["classes", "lat-m4", "sites"], json!(["DAL", "DAL"])).is_err());
+        assert!(broken(&["classes", "lat-m4", "sites"], json!([])).is_err());
+        assert!(broken(&["classes", "lat-m4", "plan"], json!("m4 metal")).is_err());
+        assert!(broken(&["classes", "lat-m4", "locations"], json!(["DAL"])).is_err());
+        assert!(broken(&["classes", "lat-m4", "billing_increment_secs"], json!(60)).is_err());
         assert!(broken(&["heartbeat_ttl_secs"], json!(30)).is_err());
         // the boot grace may not be shorter than the window it precedes
         assert!(broken(&["heartbeat_ttl_secs"], json!(600)).is_err());

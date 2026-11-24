@@ -28,7 +28,7 @@ use worker::{Env, Headers, Method, Request, RequestInit, Response};
 use crate::{
     NTFY_URL, RUNS,
     app::settings::{
-        client_tokens, config, digitalocean, error_response, internal, phoenixnap, secret,
+        client_tokens, config, digitalocean, error_response, internal, latitude, phoenixnap, secret,
     },
 };
 
@@ -189,9 +189,35 @@ fn health(env: &Env) -> Result<Response, ApiError> {
         result.is_ok()
     };
     let parsed = config(env);
-    let needs_phoenixnap = parsed
-        .as_ref()
-        .is_ok_and(|config| config.providers().contains(&ProviderName::PhoenixNap));
+    let needs = |provider: ProviderName| {
+        parsed
+            .as_ref()
+            .is_ok_and(|config| config.providers().contains(&provider))
+    };
+    // null when no setting is present and no class needs the provider
+    let optional =
+        |name: &str, built: Result<bool, String>, needed: bool, missing: &str| match built {
+            Ok(true) => Some(true),
+            Ok(false) if !needed => None,
+            Ok(false) => Some(check(name, Err(missing.to_owned()))),
+            Err(error) => Some(check(name, Err(error))),
+        };
+    let phoenixnap = optional(
+        "phoenixnap",
+        phoenixnap(env)
+            .map(|built| built.is_some())
+            .map_err(|e| e.to_string()),
+        needs(ProviderName::PhoenixNap),
+        "a class uses phoenixNAP, but PNAP_CLIENT_ID and PNAP_CLIENT_SECRET are not set",
+    );
+    let latitude = optional(
+        "latitude",
+        latitude(env)
+            .map(|built| built.is_some())
+            .map_err(|e| e.to_string()),
+        needs(ProviderName::Latitude),
+        "a class uses Latitude.sh, but LATITUDE_API_KEY and LATITUDE_PROJECT are not set",
+    );
     let config = check("config", parsed.map(drop).map_err(|e| e.message));
     let tokens = check(
         "client_tokens",
@@ -201,28 +227,17 @@ fn health(env: &Env) -> Result<Response, ApiError> {
         "digitalocean",
         digitalocean(env).map(drop).map_err(|e| e.to_string()),
     );
-    // null when neither credential is set and no class needs them
-    let phoenixnap = match phoenixnap(env) {
-        Ok(Some(_)) => Some(true),
-        Ok(None) if !needs_phoenixnap => None,
-        Ok(None) => Some(check(
-            "phoenixnap",
-            Err(
-                "a class uses phoenixNAP, but PNAP_CLIENT_ID and PNAP_CLIENT_SECRET are not set"
-                    .to_owned(),
-            ),
-        )),
-        Err(error) => Some(check("phoenixnap", Err(error.to_string()))),
-    };
     let ntfy = secret(env, NTFY_URL).is_some();
     // ntfy is reported but not required: without it alerts still reach the log
-    let ok = config && tokens && digitalocean && phoenixnap != Some(false);
+    let ok =
+        config && tokens && digitalocean && phoenixnap != Some(false) && latitude != Some(false);
     let checks = serde_json::json!({
         "ok": ok,
         "config": config,
         "client_tokens": tokens,
         "digitalocean": digitalocean,
         "phoenixnap": phoenixnap,
+        "latitude": latitude,
         "ntfy": ntfy,
     });
 

@@ -1,3 +1,6 @@
-import { machinesConfig, PHOENIXNAP_BINDINGS } from "./vitest.machines.shared";
+import { LATITUDE_BINDINGS, machinesConfig, PHOENIXNAP_BINDINGS } from "./vitest.machines.shared";
 
-export default machinesConfig(["apps/machines/test/**/*.worker.test.ts"], PHOENIXNAP_BINDINGS);
+export default machinesConfig(["apps/machines/test/**/*.worker.test.ts"], {
+  ...PHOENIXNAP_BINDINGS,
+  ...LATITUDE_BINDINGS,
+});

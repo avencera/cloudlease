@@ -8,6 +8,7 @@
 //! - [`sweep`]: the scheduled tag sweep
 //! - [`digitalocean`]: builds the DigitalOcean adapter from Worker bindings
 //! - [`phoenixnap`]: builds the phoenixNAP adapter from Worker bindings, when it has them
+//! - [`latitude`]: builds the Latitude.sh adapter from Worker bindings, when it has them
 //!
 //! Durable Object classes are declared by the app, which wraps the handlers here, so each
 //! app keeps its own class names, bindings and settings.
@@ -17,6 +18,7 @@ pub mod capacity;
 pub mod digitalocean;
 pub mod error;
 pub mod http;
+pub mod latitude;
 pub mod owner;
 pub mod phoenixnap;
 pub mod runtime;
