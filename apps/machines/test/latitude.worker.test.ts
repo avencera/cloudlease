@@ -10,6 +10,7 @@ import {
   createMachine,
   createRun,
   editHolding,
+  expectError,
   gateStub,
   type LeaseView,
   machineBody,
@@ -267,6 +268,26 @@ describe("Latitude.sh machines in miniflare", () => {
     expect(latitude.userData.has("ud_ghost")).toBe(false);
     expect(latitude.servers.has(claimed.id)).toBe(true);
     expect(recordOf(run.run_id)).toBeDefined();
+  });
+
+  it("refuses boot data that fits as a script but not once wrapped as cloud-config", async () => {
+    const run = await latRun();
+    // about 56 KB once shell-quoted, which a DigitalOcean class takes, but 75 KB in base64
+    const body = {
+      ...machineBody("hb-lat-big-boot"),
+      boot: { files: [], run: [["'".repeat(14_000)]] },
+    };
+
+    await expectError(await call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, body), 400, "invalid_boot");
+    expect(latitude.log.filter((entry) => entry.startsWith("POST"))).toEqual([]);
+    expect(await permits()).toEqual([]);
+
+    const droplets = await createRun({ name: "pool-do-big-boot" });
+    const response = await call("POST", `/v1/runs/${droplets.run_id}/machines`, CLIENT, {
+      ...body,
+      request_id: crypto.randomUUID(),
+    });
+    expect(response.status).toBe(201);
   });
 
   it("reports latitude on health", async () => {

@@ -312,8 +312,13 @@ impl<T: HttpTransport, R: Runtime> Latitude<T, R> {
         }
         let settled = match server.attributes.created_at.as_deref() {
             // Latitude.sh documents `created_at` as nullable; with no age to wait on, the
-            // record ordering alone shows the server outlived its lease's cleanup
-            None => now,
+            // record ordering alone shows the server outlived its lease's cleanup. Its
+            // ceiling is put a settle window back, so the sweep, which reads its clock before
+            // listing, sees it reached
+            None => UnixMillis::new(
+                now.as_millis()
+                    .saturating_sub(u64::try_from(ORPHAN_SETTLE.as_millis()).ok()?),
+            )?,
             Some(created) => {
                 let created = chrono::DateTime::parse_from_rfc3339(created).ok()?;
                 let settled = u64::try_from(created.timestamp_millis())

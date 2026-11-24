@@ -735,6 +735,11 @@ fn a_server_listed_only_after_its_cleanup_gave_up_is_swept_as_an_orphan_once_set
         .map(|entry| (entry.id.as_str(), entry.tags.owner.as_str()))
         .collect();
     assert_eq!(swept, [("sv_undated", ORPHAN_OWNER)]);
+    // a settle window back, so a sweep whose clock was read before it listed sees it reached
+    assert_eq!(
+        young.managed[0].tags.ceiling,
+        CeilingTag::At(Ceiling::at_or_before(at(CREATED - 60_000)))
+    );
     let reported: Vec<_> = young
         .unrecognized
         .iter()

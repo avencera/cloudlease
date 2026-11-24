@@ -21,7 +21,7 @@ use cloudlease_core::{
     lease::{LeaseError, LeasePolicy},
 };
 use cloudlease_provider::{
-    digitalocean::{DropletImage, Slug},
+    digitalocean::{BootScript, DropletImage, Slug},
     latitude,
     phoenixnap::{Location, OsImage, ServerType, SshKeyIds},
 };
@@ -30,7 +30,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    boot::MountPath,
+    boot::{BootError, MountPath},
     ids::{AppName, ClassName},
     money::{Billing, MicroUsd},
     provider::{Locations, ProviderName},
@@ -245,6 +245,22 @@ impl ProviderClass {
             Self::DigitalOcean(_) => ProviderName::DigitalOcean,
             Self::PhoenixNap(_) => ProviderName::PhoenixNap,
             Self::Latitude(_) => ProviderName::Latitude,
+        }
+    }
+
+    /// Checks that a rendered boot script, in the form this provider sends it, fits the
+    /// provider's user data limit
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BootError::UserDataTooLarge`] when it does not.
+    pub fn check_user_data(&self, script: &BootScript) -> Result<(), BootError> {
+        match self {
+            Self::DigitalOcean(_) | Self::PhoenixNap(_) => Ok(()),
+            // Latitude.sh boots the script base64-encoded inside a cloud-config document
+            Self::Latitude(_) => latitude::BootScript::shell(script.as_str())
+                .map(drop)
+                .map_err(|_| BootError::UserDataTooLarge),
         }
     }
 

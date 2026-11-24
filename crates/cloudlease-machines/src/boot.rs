@@ -278,12 +278,18 @@ pub fn render_user_data(
     BootScript::parse(script).map_err(|_| BootError::UserDataTooLarge)
 }
 
-/// Checks that boot data renders within the provider's user data limit for any lease
+/// Checks that boot data renders within the user data limit for any lease, and returns the
+/// largest script it can render
 ///
 /// It renders with the longest lease ID, token, deadline and volume name a run can produce,
 /// so boot data too large once rendered is refused before a machine is admitted or anything
-/// is created.
-pub fn check_fits(boot: &Boot, api_base: &str, mount: Option<&MountPath>) -> Result<(), BootError> {
+/// is created. A provider that wraps the script checks the result again with
+/// [`ProviderClass::check_user_data`](crate::config::ProviderClass::check_user_data).
+pub fn check_fits(
+    boot: &Boot,
+    api_base: &str,
+    mount: Option<&MountPath>,
+) -> Result<BootScript, BootError> {
     let longest_run = format!("run_{}", "f".repeat(24));
     let lease_id = format!("{longest_run}-{}", u64::MAX);
     let token = format!("cll_{}", "f".repeat(64));
@@ -303,7 +309,7 @@ pub fn check_fits(boot: &Boot, api_base: &str, mount: Option<&MountPath>) -> Res
         mount,
     });
 
-    render_user_data(&lease, volume, boot).map(drop)
+    render_user_data(&lease, volume, boot)
 }
 
 /// Quotes a value for a POSIX shell: inside single quotes nothing is special except the
@@ -356,7 +362,7 @@ mod tests {
         let mount = MountPath::parse("/mnt/data").unwrap();
         let api_base = "https://machines.example.test";
         assert_eq!(
-            check_fits(&Boot::new(payload()).unwrap(), api_base, Some(&mount)),
+            check_fits(&Boot::new(payload()).unwrap(), api_base, Some(&mount)).map(drop),
             Ok(())
         );
 
@@ -367,7 +373,7 @@ mod tests {
         };
         let boot = Boot::new(quotes).unwrap();
         assert_eq!(
-            check_fits(&boot, api_base, None),
+            check_fits(&boot, api_base, None).map(drop),
             Err(BootError::UserDataTooLarge)
         );
     }

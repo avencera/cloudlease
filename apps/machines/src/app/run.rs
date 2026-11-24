@@ -394,6 +394,7 @@ impl Run {
         let class = run_class(&config, &loaded.run)?;
         require_provider(&self.env, &loaded.run.class, class)?;
         check_fits(&boot, &config.api_base, class.provider.volume_mount())
+            .and_then(|script| class.provider.check_user_data(&script))
             .map_err(|error| ApiError::new(ErrorCode::InvalidBoot, error.to_string()))?;
 
         let record = match existing {

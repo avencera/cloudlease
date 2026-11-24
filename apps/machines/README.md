@@ -33,7 +33,8 @@ Bodies:
   applies when it is absent; a retry must repeat it, or leave it out again.
 - machine create: `{request_id, hostname, boot: {files: [{path, mode, content}], run: [[argv]]}}`.
   `boot` is at most 32 KiB as JSON, 16 files and 8 commands, and must render to at most
-  64 KiB of user data; anything else is `400 invalid_boot` before a machine is admitted.
+  64 KiB of user data (on Latitude.sh, once wrapped in base64 cloud-config, so about 48 KiB of
+  script); anything else is `400 invalid_boot` before a machine is admitted.
 - run release: `{"reason": "requested"}`
 - lease release: `{"reason": "requested" | "idle" | "done"}`
 - renew: `{}`
