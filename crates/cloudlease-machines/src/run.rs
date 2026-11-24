@@ -270,6 +270,19 @@ impl MachineEntry<'_> {
         }
     }
 
+    /// Reports whether the machine takes one of the run's `max_machines`
+    ///
+    /// A create refused for stock left no machine, so it frees its slot at once, though its
+    /// holding stays live while it waits out the provider's tag search.
+    fn takes_a_slot(&self) -> bool {
+        let refused = self
+            .record
+            .admitted()
+            .is_some_and(|admitted| admitted.out_of_stock);
+
+        self.is_live() && !refused
+    }
+
     fn billed_life(&self) -> Option<BilledLife> {
         let admitted = self
             .record
@@ -339,7 +352,10 @@ pub fn admit(
         return Err(run_ended());
     }
 
-    let live = machines.iter().filter(|machine| machine.is_live()).count();
+    let live = machines
+        .iter()
+        .filter(|machine| machine.takes_a_slot())
+        .count();
     if live >= usize::from(run.max_machines) {
         return Err(ApiError::new(
             ErrorCode::RunFull,
@@ -419,6 +435,10 @@ pub enum LeaseEnd<'a> {
 /// Ends a leased holding and records why, or returns `None` when there is nothing to end:
 /// the lease already ended, or for [`LeaseEnd::Expire`], it has not expired
 ///
+/// [`LeaseEnd::OutOfStock`] on a lease that already ended, such as one the client released
+/// while its create waited on the provider, keeps that ending and only records that
+/// nothing was created.
+///
 /// Every lease ending goes through here, so the record always says who ended it and why,
 /// with the heartbeat deadline it had.
 pub fn end_lease(
@@ -427,11 +447,18 @@ pub fn end_lease(
     end: LeaseEnd<'_>,
     now: UnixMillis,
 ) -> Result<Option<(Holding<MachineKind>, Admitted)>, HoldingError> {
+    let out_of_stock = matches!(end, LeaseEnd::OutOfStock);
     let Some(lease) = holding.lease() else {
-        return Ok(None);
+        if !out_of_stock || admitted.out_of_stock {
+            return Ok(None);
+        }
+        let refused = Admitted {
+            out_of_stock: true,
+            ..admitted.clone()
+        };
+        return Ok(Some((holding.clone(), refused)));
     };
 
-    let out_of_stock = matches!(end, LeaseEnd::OutOfStock);
     let (ended, reason, by) = match end {
         LeaseEnd::Release {
             lease_id,
@@ -950,6 +977,43 @@ mod tests {
         assert_eq!(run_spend(&run, &stock, at(2_000)).accrued, MicroUsd::ZERO);
         let view = lease_view(&run, &record, record.admitted().unwrap(), &ended);
         assert_eq!(view.release.unwrap().reason, ReleaseReason::CreateFailed);
+        // its holding is still being cleaned up, but it no longer fills the run
+        let one = RunRecord {
+            max_machines: 1,
+            spend_cap: MicroUsd::parse_dollars("36").unwrap(),
+            ..run.clone()
+        };
+        assert_eq!(admit(&one, &stock, at(2_000)), Ok(()));
+
+        // released by the client while its create waited, it keeps that ending and still
+        // counts nothing once the provider refuses it
+        let lease_id = record.machine_id(&run.run_id).lease_id().unwrap();
+        let release = LeaseEnd::Release {
+            lease_id: &lease_id,
+            reason: ReleaseReason::Done,
+            by: ReleasedBy::Client,
+        };
+        let (released_holding, released) = end_lease(&holding, &admitted, release, at(500))
+            .unwrap()
+            .unwrap();
+        let (late_holding, late) = end_lease(
+            &released_holding,
+            &released,
+            LeaseEnd::OutOfStock,
+            at(1_000),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(late.release.unwrap().reason, ReleaseReason::Done);
+        let late = MachineRecord {
+            admission: Admission::Admitted(late),
+            ..record.clone()
+        };
+        let late_entries = entries(&[(&late, Some(&late_holding))]);
+        assert_eq!(
+            run_spend(&run, &late_entries, at(2_000)).accrued,
+            MicroUsd::ZERO
+        );
 
         // any other failed create may have left a server behind, so its hour still counts
         let failed = LeaseEnd::Revoke {
