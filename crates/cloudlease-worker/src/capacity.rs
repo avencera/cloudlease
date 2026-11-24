@@ -30,7 +30,7 @@ use cloudlease_core::{
     alarm::Wake,
     capacity::{
         AcquireDecision, AcquireRequest, CapacityLimit, Permit, PermitStatus, PermitTtl,
-        ReleaseRequest, decide_acquire,
+        PermitUnits, ReleaseRequest, decide_acquire,
     },
     ids::{Generation, OwnerId, PermitId},
     time::UnixMillis,
@@ -59,6 +59,7 @@ const CREATE_PERMITS: &str = "
         permit_id TEXT PRIMARY KEY,
         owner_id TEXT NOT NULL,
         generation INTEGER NOT NULL,
+        units INTEGER NOT NULL DEFAULT 1 CHECK (units > 0),
         expires_at INTEGER NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('active', 'suspect')),
         UNIQUE(owner_id, generation)
@@ -182,7 +183,7 @@ impl CapacityGate {
         let existing = store.find(&request.owner_id, request.generation)?;
         let limit = self.limit(store)?;
 
-        match decide_acquire(existing.as_ref(), store.held_count()?, limit) {
+        match decide_acquire(existing.as_ref(), store.held_units()?, request.units, limit) {
             AcquireDecision::Existing(permit) => Ok(json_response(200, permit)?),
             AcquireDecision::Exhausted => Err(HttpError::new(
                 409,
@@ -194,7 +195,7 @@ impl CapacityGate {
                 let now = now();
                 let permit_id = PermitId::parse(format!("cap_{}", uuid::Uuid::new_v4()))
                     .map_err(CloudleaseError::from)?;
-                let permit = Permit::grant(permit_id, request.key(), now, ttl)
+                let permit = Permit::grant(permit_id, request.key(), request.units, now, ttl)
                     .map_err(CloudleaseError::from)?;
                 store.insert(&permit)?;
                 self.rearm(store, now).await?;
@@ -271,6 +272,7 @@ struct PermitRow {
     permit_id: String,
     owner_id: String,
     generation: i64,
+    units: i64,
     expires_at: i64,
     status: PermitStatus,
 }
@@ -283,6 +285,9 @@ impl TryFrom<PermitRow> for Permit {
             permit_id: PermitId::parse(row.permit_id)?,
             owner_id: OwnerId::parse(row.owner_id)?,
             generation: Generation::new(from_sql(row.generation)?)?,
+            units: u16::try_from(row.units)
+                .map_err(|_| CloudleaseError::Storage("invalid permit units".to_owned()))
+                .and_then(|units| Ok(PermitUnits::new(units)?))?,
             expires_at: UnixMillis::new(from_sql(row.expires_at)?)
                 .ok_or_else(|| CloudleaseError::Storage("invalid expiry".to_owned()))?,
             status: row.status,
@@ -301,7 +306,7 @@ impl PermitStore {
     fn find(&self, owner: &OwnerId, generation: Generation) -> CloudleaseResult<Option<Permit>> {
         self.0
             .exec(
-                "SELECT permit_id, owner_id, generation, expires_at, status \
+                "SELECT permit_id, owner_id, generation, units, expires_at, status \
                  FROM cloudlease_permits WHERE owner_id = ? AND generation = ?",
                 vec![
                     SqlStorageValue::from(owner.as_str()),
@@ -315,29 +320,34 @@ impl PermitStore {
             .transpose()
     }
 
-    fn held_count(&self) -> CloudleaseResult<u64> {
+    fn held_units(&self) -> CloudleaseResult<u64> {
         #[derive(Deserialize)]
         struct Row {
-            count: i64,
+            units: i64,
         }
 
         // suspect permits count, because their resources may still exist
         let row = self
             .0
-            .exec("SELECT COUNT(*) AS count FROM cloudlease_permits", None)?
+            .exec(
+                "SELECT COALESCE(SUM(units), 0) AS units FROM cloudlease_permits",
+                None,
+            )?
             .one::<Row>()?;
 
-        from_sql(row.count)
+        from_sql(row.units)
     }
 
     fn insert(&self, permit: &Permit) -> CloudleaseResult<()> {
         self.0.exec(
-            "INSERT INTO cloudlease_permits (permit_id, owner_id, generation, expires_at, status) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO cloudlease_permits \
+             (permit_id, owner_id, generation, units, expires_at, status) \
+             VALUES (?, ?, ?, ?, ?, ?)",
             vec![
                 SqlStorageValue::from(permit.permit_id.as_str()),
                 SqlStorageValue::from(permit.owner_id.as_str()),
                 to_sql(permit.generation.get())?,
+                to_sql(u64::from(permit.units.get()))?,
                 to_sql(permit.expires_at.as_millis())?,
                 SqlStorageValue::from(permit.status.as_str()),
             ],
@@ -401,7 +411,7 @@ impl PermitStore {
     fn list(&self) -> CloudleaseResult<Vec<Permit>> {
         self.0
             .exec(
-                "SELECT permit_id, owner_id, generation, expires_at, status \
+                "SELECT permit_id, owner_id, generation, units, expires_at, status \
                  FROM cloudlease_permits ORDER BY expires_at",
                 None,
             )?

@@ -1,7 +1,8 @@
 //! Global capacity permits that stay counted until absence is proven
 //!
 //! An owner acquires a permit before it creates resources and releases it only with proof
-//! that they are gone. A permit whose time-to-live passes turns [`PermitStatus::Suspect`]
+//! that they are gone. Each permit takes [`PermitUnits`] of the limit: one for a gate that
+//! counts machines, or a price for a gate that caps hourly spend. A permit whose time-to-live passes turns [`PermitStatus::Suspect`]
 //! rather than disappearing: its owner may have crashed with resources still running, so the
 //! permit keeps counting against the limit until a cleanup proves absence.
 
@@ -27,6 +28,9 @@ pub enum CapacityError {
     /// The permit lifetime is out of range
     #[error("the permit lifetime must be positive and at most the maximum")]
     InvalidTtl,
+    /// The permit weight is zero or out of range
+    #[error("permit units must be an integer from 1 through 65535")]
+    InvalidUnits,
 }
 
 /// The number of permits that may be held at once
@@ -99,7 +103,49 @@ pub struct PermitKey {
     pub generation: Generation,
 }
 
-/// One held unit of capacity
+/// How much of the limit one permit takes, one by default
+///
+/// A gate that counts machines leaves every permit at one unit. A gate that caps spend
+/// weighs each permit by its resource's price, such as cents per hour, so the limit bounds
+/// the hourly cost of everything not yet proven gone.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct PermitUnits(NonZeroU16);
+
+impl PermitUnits {
+    /// One unit, the weight of a permit that counts one machine
+    pub const ONE: Self = Self(NonZeroU16::MIN);
+
+    /// Creates a positive weight
+    pub fn new(value: u16) -> Result<Self, CapacityError> {
+        NonZeroU16::new(value)
+            .map(Self)
+            .ok_or(CapacityError::InvalidUnits)
+    }
+
+    /// Returns the weight
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
+impl Default for PermitUnits {
+    fn default() -> Self {
+        Self::ONE
+    }
+}
+
+impl<'de> Deserialize<'de> for PermitUnits {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(u16::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+/// One held share of capacity
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Permit {
@@ -109,6 +155,9 @@ pub struct Permit {
     pub owner_id: OwnerId,
     /// The generation the permit covers
     pub generation: Generation,
+    /// How much of the limit the permit takes
+    #[serde(default)]
+    pub units: PermitUnits,
     /// When the permit turns suspect unless released
     pub expires_at: UnixMillis,
     /// Whether the permit is within its lifetime
@@ -120,6 +169,7 @@ impl Permit {
     pub fn grant(
         permit_id: PermitId,
         key: PermitKey,
+        units: PermitUnits,
         now: UnixMillis,
         ttl: PermitTtl,
     ) -> Result<Self, CapacityError> {
@@ -127,6 +177,7 @@ impl Permit {
             permit_id,
             owner_id: key.owner_id,
             generation: key.generation,
+            units,
             expires_at: now.checked_add(ttl.0).ok_or(CapacityError::InvalidTtl)?,
             status: PermitStatus::Active,
         })
@@ -185,21 +236,24 @@ pub enum AcquireDecision<'a> {
     Existing(&'a Permit),
     /// Grant a new permit
     Grant,
-    /// Every unit of capacity is held, by active or suspect permits
+    /// The new permit's units would take the held units past the limit, counting active and
+    /// suspect permits
     Exhausted,
 }
 
-/// Decides an acquire from the owner's existing permit and the number of held permits
+/// Decides an acquire from the owner's existing permit, the units already held and the
+/// units the new permit would take
 #[must_use]
 pub fn decide_acquire(
     existing: Option<&Permit>,
-    held: u64,
+    held_units: u64,
+    units: PermitUnits,
     limit: CapacityLimit,
 ) -> AcquireDecision<'_> {
     if let Some(permit) = existing {
         return AcquireDecision::Existing(permit);
     }
-    if held >= u64::from(limit.get()) {
+    if held_units.saturating_add(u64::from(units.get())) > u64::from(limit.get()) {
         return AcquireDecision::Exhausted;
     }
 
@@ -216,6 +270,9 @@ pub struct AcquireRequest {
     pub generation: Generation,
     /// The requested lifetime in milliseconds
     pub ttl_ms: u64,
+    /// How much of the limit the permit takes, one when absent
+    #[serde(default)]
+    pub units: PermitUnits,
 }
 
 impl AcquireRequest {
@@ -280,8 +337,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AcquireDecision, CapacityLimit, Permit, PermitKey, PermitStatus, PermitTtl, ReleaseRequest,
-        decide_acquire,
+        AcquireDecision, AcquireRequest, CapacityError, CapacityLimit, Permit, PermitKey,
+        PermitStatus, PermitTtl, PermitUnits, ReleaseRequest, decide_acquire,
     };
     use crate::{
         ids::{Generation, OwnerId, PermitId},
@@ -299,7 +356,9 @@ mod tests {
     fn expired_permits_turn_suspect_and_keep_counting() {
         let ttl = PermitTtl::new(Duration::from_secs(60), Duration::from_secs(3_600)).unwrap();
         let now = UnixMillis::new(1_000).unwrap();
-        let permit = Permit::grant(PermitId::parse("cap_1").unwrap(), key(), now, ttl).unwrap();
+        let one = PermitUnits::ONE;
+        let permit =
+            Permit::grant(PermitId::parse("cap_1").unwrap(), key(), one, now, ttl).unwrap();
         let limit = CapacityLimit::new(1, 100).unwrap();
 
         assert_eq!(permit.at(now).status, PermitStatus::Active);
@@ -307,12 +366,49 @@ mod tests {
         assert_eq!(expired.status, PermitStatus::Suspect);
 
         // a suspect permit is still held, so it blocks new owners and is returned on retry
-        assert_eq!(decide_acquire(None, 1, limit), AcquireDecision::Exhausted);
         assert_eq!(
-            decide_acquire(Some(&expired), 1, limit),
+            decide_acquire(None, 1, one, limit),
+            AcquireDecision::Exhausted
+        );
+        assert_eq!(
+            decide_acquire(Some(&expired), 1, one, limit),
             AcquireDecision::Existing(&expired)
         );
-        assert_eq!(decide_acquire(None, 0, limit), AcquireDecision::Grant);
+        assert_eq!(decide_acquire(None, 0, one, limit), AcquireDecision::Grant);
+    }
+
+    #[test]
+    fn weighted_permits_fill_the_limit_by_their_units() {
+        // a spend gate in cents per hour: $15/h, with machines at $4.76/h each
+        let limit = CapacityLimit::new(1_500, u16::MAX).unwrap();
+        let machine = PermitUnits::new(476).unwrap();
+
+        assert_eq!(
+            decide_acquire(None, 952, machine, limit),
+            AcquireDecision::Grant
+        );
+        assert_eq!(
+            decide_acquire(None, 1_428, machine, limit),
+            AcquireDecision::Exhausted
+        );
+        // a permit heavier than the whole limit can never be granted
+        assert_eq!(
+            decide_acquire(None, 0, PermitUnits::new(1_501).unwrap(), limit),
+            AcquireDecision::Exhausted
+        );
+        assert_eq!(PermitUnits::new(0), Err(CapacityError::InvalidUnits));
+
+        // requests and stored permits without units weigh one, as before weights existed
+        let request: AcquireRequest =
+            serde_json::from_value(json!({ "ownerId": "job_1", "generation": 1, "ttlMs": 1 }))
+                .unwrap();
+        assert_eq!(request.units, PermitUnits::ONE);
+        assert!(
+            serde_json::from_value::<AcquireRequest>(
+                json!({ "ownerId": "job_1", "generation": 1, "ttlMs": 1, "units": 0 })
+            )
+            .is_err()
+        );
     }
 
     #[test]

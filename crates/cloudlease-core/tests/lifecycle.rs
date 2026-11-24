@@ -7,7 +7,7 @@ use std::{
 
 use cloudlease_core::{
     alarm::{Backoff, Wake, next_alarm},
-    capacity::{Permit, PermitKey, PermitStatus},
+    capacity::{Permit, PermitKey, PermitStatus, PermitUnits},
     deletes::{DeleteTarget, DeletesError},
     holding::{Holding, HoldingError, HoldingState, ReleaseReason, Retry, TAG_SEARCH_SETTLE},
     ids::{Generation, LeaseId, OwnerId, PermitId, ResourceId},
@@ -430,6 +430,7 @@ fn suspect_permits_are_released_only_with_a_complete_inventory_and_an_idle_owner
         permit_id: PermitId::parse(format!("cap_{owner}")).unwrap(),
         owner_id: OwnerId::parse(owner).unwrap(),
         generation: generation(generation_value),
+        units: PermitUnits::ONE,
         expires_at: at(1),
         status: PermitStatus::Suspect,
     };

@@ -38,7 +38,9 @@ The app declares its own Durable Object classes and wraps the handlers in
   fails or times out is not counted as claiming nothing, so it keeps its resources until
   the next sweep. A resource past its `until` ceiling tag is deleted without asking.
 - **Capacity permits** count against a global limit until the owner proves its resources
-  absent. A suspect permit is released only by a sweep whose inventory was complete.
+  absent. A permit takes one unit by default; a gate that caps spend weighs each permit by
+  its price, such as cents per hour. A suspect permit is released only by a sweep whose
+  inventory was complete.
 
 ## Tags
 
