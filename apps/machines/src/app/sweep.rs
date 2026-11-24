@@ -3,12 +3,12 @@
 use std::collections::BTreeSet;
 
 use cloudlease_machines::alert::{Alert, Priority, SWEEP_KEY};
-use cloudlease_provider::{digitalocean::DoKind, sweep::DeleteReport};
+use cloudlease_provider::digitalocean::DoKind;
 use cloudlease_worker::{
     error::CloudleaseResult,
     http::call_json,
     runtime::{WorkersRuntime, now},
-    sweep::{SweepReport, run_sweep},
+    sweep::{SweepDelete, SweepReport, run_sweep},
 };
 use worker::{Env, Method};
 
@@ -70,12 +70,12 @@ fn log(report: &SweepReport<DoKind>) {
     }
 }
 
-async fn alert_orphans(env: &Env, deletes: &[DeleteReport<DoKind>]) {
+async fn alert_orphans(env: &Env, deletes: &[SweepDelete<DoKind>]) {
     // a resource its owner is already releasing is routine cleanup; any other one leaked
     let orphans: Vec<String> = deletes
         .iter()
-        .filter(|report| !report.owner_releasing)
-        .map(|report| {
+        .filter(|delete| !delete.owner_releasing)
+        .map(|SweepDelete { report, .. }| {
             format!(
                 "{:?} {} of {} generation {} ({:?}, {:?})",
                 report.resource.tags.kind,

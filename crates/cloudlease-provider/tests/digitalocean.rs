@@ -15,7 +15,7 @@ use cloudlease_core::{
     holding::{Holding, HoldingState, ReleaseReason},
     ids::{Generation, LeaseId, OwnerId, ResourceId, TagPrefix},
     lease::{Lease, LeasePolicy},
-    sweep::{DoomReason, OwnerAnswer, OwnerReply, doom, plan},
+    sweep::{DoomReason, OwnerAnswer, OwnerReply, doom_unclaimed, plan},
     tags::{OwnerTags, TagScheme, UnrecognizedReason},
     time::UnixMillis,
 };
@@ -635,7 +635,7 @@ fn the_sweep_deletes_an_orphaned_droplet_and_volume_in_rank_order() {
         orphan.owner.clone(),
         OwnerReply::Answered(OwnerAnswer::default()),
     )]);
-    let doomed = doom(&plan, &replies);
+    let doomed = doom_unclaimed(&plan, &replies);
     assert!(
         doomed
             .iter()
@@ -682,7 +682,7 @@ fn the_sweep_defers_a_volume_while_its_droplet_is_still_present() {
     attach(&harness, &volume, &droplet);
 
     let inventory = block_on(harness.provider.inventory()).unwrap();
-    let doomed = doom(
+    let doomed = doom_unclaimed(
         &plan(&inventory, &[], at(0)),
         &BTreeMap::from([(
             orphan.owner.clone(),

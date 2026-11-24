@@ -622,6 +622,22 @@ describe("cloudlease machines in miniflare", () => {
     expect(ntfy.titles()).toEqual([]);
   });
 
+  it("deletes a stalled run's droplet past its hard deadline on the next sweep", async () => {
+    const run = await createRun();
+    const past = Math.floor(Date.now() / 1000) - 10;
+    fake.addDroplet(7009, tags(run.run_id, 9, "droplet", past, "clm"));
+    // the run object takes no events for longer than the sweep's 5 second owner timeout
+    const stall = runInDurableObject(runStub(run.run_id), (_instance, state) =>
+      state.blockConcurrencyWhile(() => new Promise((resolve) => setTimeout(resolve, 7_000))),
+    );
+
+    await scheduled();
+    await stall;
+
+    expect(fake.log).toContain("DELETE droplets/7009");
+    expect(fake.droplets.has(7009)).toBe(false);
+  }, 30_000);
+
   it("alerts when the sweep keeps failing", async () => {
     fake.failLists = true;
 

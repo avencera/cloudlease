@@ -13,13 +13,21 @@ use cloudlease_core::{
     ids::{Generation, LeaseId, OwnerId, PermitId, ResourceId},
     lease::{Expiry, Lease, LeaseError, LeasePolicy},
     sweep::{
-        DoomReason, Inventory, Observed, OwnerAnswer, OwnerQuery, OwnerReply, Unrecognized, answer,
-        doom, plan, releasable_permits,
+        DoomReason, Doomed, Inventory, Observed, OwnerAnswer, OwnerQuery, OwnerReply, SweepPlan,
+        Unrecognized, answer, doom_past_ceiling, doom_unclaimed, owner_releasing, plan,
+        releasable_permits,
     },
     tags::{Ceiling, CeilingTag, OwnerTags, ResourceKind, UnrecognizedReason},
     time::UnixMillis,
 };
 use serde::{Deserialize, Serialize};
+
+// the sweep deletes past-ceiling resources before it asks owners, then the unclaimed ones
+fn doom(plan: &SweepPlan<Kind>, replies: &BTreeMap<OwnerId, OwnerReply>) -> Vec<Doomed<Kind>> {
+    let mut doomed = doom_past_ceiling(plan);
+    doomed.extend(doom_unclaimed(plan, replies));
+    doomed
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -472,7 +480,7 @@ fn only_resources_their_owner_is_not_already_releasing_are_marked_as_orphans() {
             (
                 doomed.resource.id.as_str().to_owned(),
                 doomed.reason,
-                doomed.owner_releasing,
+                owner_releasing(&replies, &doomed.resource),
             )
         })
         .collect();

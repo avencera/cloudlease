@@ -3,8 +3,8 @@
 //! The sweep is deny by default. It lists every resource with the app's managed tag and asks
 //! each owner which of its resources it claims. A resource is kept only when its owner
 //! answers and claims it; an owner that does not exist claims nothing, so its resources are
-//! deleted. A resource past its [`Ceiling`](crate::tags::Ceiling) is deleted whatever its
-//! owner answers.
+//! deleted. A resource past its [`Ceiling`](crate::tags::Ceiling) is deleted before any owner
+//! is asked, so a hard deadline never waits on an owner.
 //!
 //! Owners also say which of the queried generations they are already releasing. A doomed
 //! resource of such a generation is the owner's own cleanup racing the sweep; any other
@@ -12,8 +12,9 @@
 //! may want to alert on.
 //!
 //! ```text
-//! inventory --plan--> SweepPlan --owners answer--> doom --> delete and confirm
-//!                                                      \--> releasable permits
+//! inventory --plan--> SweepPlan --doom_past_ceiling--> delete and confirm
+//!                         \--owners answer--> doom_unclaimed --> delete and confirm
+//!                                         \--> owner_releasing, releasable permits
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -168,8 +169,8 @@ pub fn plan<K: ResourceKind>(
     let mut owners: BTreeMap<OwnerId, OwnerQuery<K>> = BTreeMap::new();
 
     for resource in &inventory.managed {
-        // the owner is asked about a resource past its ceiling too, but only to learn whether
-        // it was already deleting it; its answer cannot keep the resource
+        // the owner is asked about a resource past its ceiling too, after the sweep deleted it,
+        // only to learn whether it was already deleting it
         let query = owners
             .entry(resource.tags.owner.clone())
             .or_insert_with(empty_query);
@@ -230,52 +231,65 @@ pub struct Doomed<K> {
     pub resource: Observed<K>,
     /// Why it is deleted
     pub reason: DoomReason,
-    /// Whether its owner reported the generation as releasing, so its own cleanup was already
-    /// deleting the resource; when false the resource is an orphan or outlived a lease its
-    /// owner did not end
-    pub owner_releasing: bool,
 }
 
-/// Selects the resources to delete from the plan and the owners' replies
+/// Selects the resources past their ceiling, which the sweep deletes before asking any owner
+///
+/// The ceiling tag alone decides, so a stalled or broken owner never delays a hard deadline.
+#[must_use]
+pub fn doom_past_ceiling<K: ResourceKind>(plan: &SweepPlan<K>) -> Vec<Doomed<K>> {
+    plan.past_ceiling
+        .iter()
+        .map(|resource| Doomed {
+            resource: resource.clone(),
+            reason: DoomReason::PastCeiling,
+        })
+        .collect()
+}
+
+/// Selects the resources below their ceiling that no live lease claims
 ///
 /// An owner missing from `replies` counts as [`OwnerReply::Failed`], so a resource is never
 /// deleted because a reply was lost.
 #[must_use]
-pub fn doom<K: ResourceKind>(
+pub fn doom_unclaimed<K: ResourceKind>(
     plan: &SweepPlan<K>,
     replies: &BTreeMap<OwnerId, OwnerReply>,
 ) -> Vec<Doomed<K>> {
-    let answer_of = |owner: &OwnerId| match replies.get(owner) {
+    plan.owners
+        .iter()
+        .filter_map(|(owner, query)| answer_of(replies, owner).map(|answer| (query, answer)))
+        .flat_map(|(query, answer)| {
+            query
+                .resources
+                .iter()
+                .filter(|resource| !answer.claimed.contains(&resource.id))
+                .map(|resource| Doomed {
+                    resource: resource.clone(),
+                    reason: DoomReason::Unclaimed,
+                })
+        })
+        .collect()
+}
+
+/// Reports whether a doomed resource's owner said it was already releasing its generation
+///
+/// When true the delete is the owner's own cleanup racing the sweep; when false the resource
+/// is an orphan, outlived a lease its owner did not end, or its owner did not answer.
+#[must_use]
+pub fn owner_releasing<K>(replies: &BTreeMap<OwnerId, OwnerReply>, resource: &Observed<K>) -> bool {
+    answer_of(replies, &resource.tags.owner)
+        .is_some_and(|answer| answer.releasing.contains(&resource.tags.generation))
+}
+
+fn answer_of<'a>(
+    replies: &'a BTreeMap<OwnerId, OwnerReply>,
+    owner: &OwnerId,
+) -> Option<&'a OwnerAnswer> {
+    match replies.get(owner) {
         Some(OwnerReply::Answered(answer)) => Some(answer),
         Some(OwnerReply::Failed) | None => None,
-    };
-    let owner_releasing = move |resource: &Observed<K>| {
-        answer_of(&resource.tags.owner)
-            .is_some_and(|answer| answer.releasing.contains(&resource.tags.generation))
-    };
-
-    let past_ceiling = plan.past_ceiling.iter().map(move |resource| Doomed {
-        resource: resource.clone(),
-        reason: DoomReason::PastCeiling,
-        owner_releasing: owner_releasing(resource),
-    });
-    let unclaimed = plan.owners.iter().flat_map(move |(owner, query)| {
-        let answer = answer_of(owner);
-
-        query
-            .resources
-            .iter()
-            .filter(move |resource| {
-                answer.is_some_and(|answer| !answer.claimed.contains(&resource.id))
-            })
-            .map(move |resource| Doomed {
-                resource: resource.clone(),
-                reason: DoomReason::Unclaimed,
-                owner_releasing: owner_releasing(resource),
-            })
-    });
-
-    past_ceiling.chain(unclaimed).collect()
+    }
 }
 
 /// Selects the suspect permits a sweep may release

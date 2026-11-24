@@ -279,7 +279,7 @@ describe("cloudlease sweep in miniflare", () => {
     expect([...fake.volumes.keys()]).toEqual(["vol-501"]);
   });
 
-  it("deletes a claimed droplet past its ceiling whatever its owner answers", async () => {
+  it("deletes a claimed droplet past its ceiling before asking its owner", async () => {
     const now = Date.now();
     await seedHolding(
       "job_ceiling",
@@ -294,7 +294,8 @@ describe("cloudlease sweep in miniflare", () => {
 
     const report = await sweep();
 
-    // the owner is asked only whether it was already releasing the droplet, which it was not
+    // the owner is asked only afterwards, whether it was already releasing the droplet, which
+    // it was not
     expect(report.ownersAsked).toBe(1);
     expect(outcomes(report)).toEqual([["601", "pastCeiling", "gone"]]);
     expect(report.deletes[0]?.ownerReleasing).toBe(false);
@@ -341,6 +342,33 @@ describe("cloudlease sweep in miniflare", () => {
     expect(report.deletes).toEqual([]);
     expect(fake.droplets.has(701)).toBe(true);
   });
+
+  it("deletes a stalled owner's droplet past its ceiling, and times the owner out", async () => {
+    const now = Date.now();
+    fake.addDroplet(711, tags("job_stalled", 1, "droplet", Math.floor(now / 1000) - 10));
+    fake.addDroplet(712, tags("job_stalled", 2, "droplet"));
+    const stub = ownerStub("job_stalled");
+    await holdings("job_stalled");
+    // the owner takes no events until the sweep has deleted the past-ceiling droplet, which
+    // fails if the sweep waits on the owner first, then for longer than the 2 second timeout
+    const stall = runInDurableObject(stub, (_instance, state) =>
+      state.blockConcurrencyWhile(async () => {
+        await vi.waitUntil(() => fake.log.includes("DELETE droplets/711"), { timeout: 1_500, interval: 20 });
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
+      }),
+    );
+
+    const report = await sweep();
+    await stall;
+
+    expect(outcomes(report)).toEqual([["711", "pastCeiling", "gone"]]);
+    expect(report.deletes[0]?.ownerReleasing).toBe(false);
+    expect(report.ownersFailed).toEqual([
+      { owner: "job_stalled", error: "job_stalled did not answer within 2000ms" },
+    ]);
+    // the droplet below its ceiling waits for an answer
+    expect([...fake.droplets.keys()]).toEqual([712]);
+  }, 20_000);
 
   it("leaves resources with an unrecognized tag shape alone", async () => {
     fake.addDroplet(801, ["cl-managed", "team-x"]);

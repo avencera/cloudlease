@@ -5,20 +5,29 @@
 //!
 //! 1. lists every resource with the app's managed tag; if that fails, nothing is deleted
 //! 2. reads the capacity gate's suspect permits, when the app has a gate
-//! 3. asks each owner object which of its resources it claims and which generations it is
+//! 3. deletes resources past their ceiling, before asking any owner, so a hard deadline never
+//!    waits on one
+//! 4. asks each owner object which of its resources it claims and which generations it is
 //!    already releasing; an owner object that never existed claims nothing, and an owner that
-//!    fails to answer keeps its resources until the next sweep
-//! 4. deletes resources past their ceiling whatever their owner answers, and every other
-//!    resource no live lease claims; each delete reports whether the owner was already
-//!    releasing it, so an app can alert on orphans only
-//! 5. releases suspect permits once their resources are proven absent
+//!    fails or does not answer within [`SweepConfig::owner_timeout`] keeps its resources below
+//!    their ceiling until the next sweep
+//! 5. deletes every other resource no live lease claims; each delete reports whether the owner
+//!    was already releasing it, so an app can alert on orphans only
+//! 6. releases suspect permits once their resources are proven absent
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use cloudlease_core::{
     capacity::{AbsenceProof, Permit, PermitKey, PermitStatus, ReleaseRequest},
     ids::{OwnerId, PermitId},
-    sweep::{OwnerAnswer, OwnerReply, Unrecognized, doom, plan, releasable_permits},
+    sweep::{
+        OwnerAnswer, OwnerQuery, OwnerReply, Unrecognized, doom_past_ceiling, doom_unclaimed,
+        owner_releasing, plan, releasable_permits,
+    },
+    tags::ResourceKind,
     time::UnixMillis,
 };
 use cloudlease_provider::{
@@ -27,10 +36,14 @@ use cloudlease_provider::{
     sweep::{ConfirmPolicy, DeleteOutcome, DeleteReport, delete_doomed},
 };
 use serde::Serialize;
-use worker::{Env, Method};
+use worker::{Env, Method, ObjectNamespace};
 
 use crate::{
-    capacity::CapacityClient, error::CloudleaseResult, http::call_json, owner::SWEEP_PATH,
+    capacity::CapacityClient,
+    error::{CloudleaseError, CloudleaseResult},
+    http::call_json,
+    owner::SWEEP_PATH,
+    runtime::within,
 };
 
 /// Where the sweep finds an app's objects
@@ -42,6 +55,8 @@ pub struct SweepConfig<'a> {
     pub capacity: Option<(&'a str, &'a str)>,
     /// How long to wait for deleted resources to disappear
     pub confirm: ConfirmPolicy,
+    /// How long to wait for one owner's answer before counting it as failed this sweep
+    pub owner_timeout: Duration,
 }
 
 /// An owner that could not answer
@@ -66,12 +81,24 @@ pub struct SweepReport<K> {
     pub owners_asked: usize,
     /// Owners that did not answer
     pub owners_failed: Vec<OwnerFailure>,
-    /// Every resource the sweep tried to delete
-    pub deletes: Vec<DeleteReport<K>>,
+    /// Every resource the sweep tried to delete, past their ceiling first
+    pub deletes: Vec<SweepDelete<K>>,
     /// Suspect permits released after their resources were proven absent
     pub released_permits: Vec<PermitId>,
     /// Capacity gate failures, which never block deletion
     pub capacity_errors: Vec<String>,
+}
+
+/// One resource the sweep tried to delete
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SweepDelete<K> {
+    /// What happened to it
+    #[serde(flatten)]
+    pub report: DeleteReport<K>,
+    /// Whether its owner answered that it was already releasing it; false marks an orphan, a
+    /// resource that outlived a lease its owner did not end, or an owner that did not answer
+    pub owner_releasing: bool,
 }
 
 impl<K> SweepReport<K> {
@@ -83,7 +110,7 @@ impl<K> SweepReport<K> {
             && self
                 .deletes
                 .iter()
-                .all(|report| report.outcome == DeleteOutcome::Gone)
+                .all(|delete| delete.report.outcome == DeleteOutcome::Gone)
     }
 }
 
@@ -115,25 +142,14 @@ where
     let suspect_keys: Vec<PermitKey> = permits.iter().map(Permit::key).collect();
 
     let plan = plan(&inventory, &suspect_keys, now);
+    let mut reports =
+        delete_doomed(provider, runtime, doom_past_ceiling(&plan), config.confirm).await;
+
     let namespace = env.durable_object(config.owner_binding)?;
     let mut replies = BTreeMap::new();
     let mut owners_failed = Vec::new();
     for (owner, query) in &plan.owners {
-        let answer: CloudleaseResult<OwnerAnswer> = match namespace.get_by_name(owner.as_str()) {
-            Ok(stub) => {
-                call_json(
-                    &stub,
-                    owner.as_str(),
-                    Method::Post,
-                    &format!("https://owner{SWEEP_PATH}"),
-                    Some(query),
-                )
-                .await
-            }
-            Err(error) => Err(error.into()),
-        };
-
-        let reply = match answer {
+        let reply = match ask_owner(&namespace, owner, query, config.owner_timeout).await {
             Ok(answer) => OwnerReply::Answered(answer),
             Err(error) => {
                 owners_failed.push(OwnerFailure {
@@ -146,13 +162,20 @@ where
         replies.insert(owner.clone(), reply);
     }
 
-    let doomed = doom(&plan, &replies);
-    let deletes = delete_doomed(provider, runtime, doomed, config.confirm).await;
+    let unclaimed = doom_unclaimed(&plan, &replies);
+    reports.extend(delete_doomed(provider, runtime, unclaimed, config.confirm).await);
+    let deletes: Vec<_> = reports
+        .into_iter()
+        .map(|report| SweepDelete {
+            owner_releasing: owner_releasing(&replies, &report.resource),
+            report,
+        })
+        .collect();
 
     let gone: BTreeSet<_> = deletes
         .iter()
-        .filter(|report| report.outcome == DeleteOutcome::Gone)
-        .map(|report| report.resource.id.clone())
+        .filter(|delete| delete.report.outcome == DeleteOutcome::Gone)
+        .map(|delete| delete.report.resource.id.clone())
         .collect();
     let survivors: BTreeSet<PermitKey> = inventory
         .managed
@@ -190,6 +213,24 @@ where
         deletes,
         released_permits,
         capacity_errors,
+    })
+}
+
+async fn ask_owner<K: ResourceKind>(
+    namespace: &ObjectNamespace,
+    owner: &OwnerId,
+    query: &OwnerQuery<K>,
+    timeout: Duration,
+) -> CloudleaseResult<OwnerAnswer> {
+    let stub = namespace.get_by_name(owner.as_str())?;
+    let url = format!("https://owner{SWEEP_PATH}");
+    let call = call_json(&stub, owner.as_str(), Method::Post, &url, Some(query));
+
+    within(timeout, call).await.unwrap_or_else(|| {
+        Err(CloudleaseError::Timeout {
+            object: owner.as_str().to_owned(),
+            limit: timeout,
+        })
     })
 }
 

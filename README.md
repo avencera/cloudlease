@@ -42,8 +42,9 @@ The app declares its own Durable Object classes and wraps the handlers in
   which ones a live lease of the same generation claims. Anything not claimed is deleted.
   An owner object with no record of the resource claims nothing. An owner whose call
   fails or times out is not counted as claiming nothing, so it keeps its resources until
-  the next sweep. A resource past its `until` ceiling tag is deleted whatever its owner
-  answers.
+  the next sweep. A resource past its `until` ceiling tag is deleted before any owner is
+  asked, so a stalled owner never delays a hard deadline; `SweepConfig::owner_timeout`
+  bounds each owner call.
 - Each owner also says which of the asked generations it is already releasing. A sweep
   delete of such a generation is the owner's own cleanup racing the sweep; every other
   delete is reported with `ownerReleasing: false`, which apps use to alert on orphans.
@@ -99,7 +100,7 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
   mid-create
 - resources past their hard deadline or ceiling
 - live resources that must be kept
-- failing owners, unrecognized tags and malformed ceilings
+- failing and stalled owners, unrecognized tags and malformed ceilings
 - capacity permit release
 - the owner alarm's delete-and-confirm loop, and a create that returns after its lease lapsed
 - the cron trigger

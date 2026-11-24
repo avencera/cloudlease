@@ -66,8 +66,6 @@ pub struct DeleteReport<K> {
     pub resource: Observed<K>,
     /// Why it was doomed
     pub reason: DoomReason,
-    /// Whether its owner was already releasing it; false marks an orphan
-    pub owner_releasing: bool,
     /// What happened
     pub outcome: DeleteOutcome,
 }
@@ -147,7 +145,6 @@ where
             reports.push(DeleteReport {
                 resource: doomed.resource.clone(),
                 reason: doomed.reason,
-                owner_releasing: doomed.owner_releasing,
                 outcome,
             });
         }

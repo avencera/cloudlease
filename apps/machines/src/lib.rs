@@ -76,6 +76,9 @@ pub const SWEEP: SweepConfig<'static> = SweepConfig {
         reads: 10,
         pause: Duration::from_secs(3),
     },
+    // a run object answers from its own SQLite, so 5 seconds means it is stalled; a timeout
+    // only keeps its resources below their ceiling until the next sweep
+    owner_timeout: Duration::from_secs(5),
 };
 
 /// How long a pending create may wait on the gate before a retry of the same request takes

@@ -109,6 +109,24 @@ const fn method(method: HttpMethod) -> Method {
     }
 }
 
+/// Waits for `future` at most `limit`, returning `None` once the limit passes
+///
+/// A future that is already done wins over the timer. The future is dropped at the limit; a
+/// fetch it started may still complete, unobserved.
+pub async fn within<F: Future>(limit: Duration, future: F) -> Option<F::Output> {
+    let mut future = std::pin::pin!(future);
+    let mut timer = std::pin::pin!(Delay::from(limit));
+
+    poll_fn(|context| {
+        if let Poll::Ready(output) = future.as_mut().poll(context) {
+            return Poll::Ready(Some(output));
+        }
+
+        timer.as_mut().poll(context).map(|()| None)
+    })
+    .await
+}
+
 /// `Date.now()`, timer delays and `crypto.getRandomValues`
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorkersRuntime;

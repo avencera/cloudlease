@@ -45,4 +45,5 @@ pub const SWEEP: SweepConfig<'static> = SweepConfig {
         reads: 5,
         pause: Duration::from_millis(50),
     },
+    owner_timeout: Duration::from_secs(2),
 };

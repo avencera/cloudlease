@@ -1,5 +1,7 @@
 //! Errors from the Worker glue
 
+use std::time::Duration;
+
 use cloudlease_core::{
     capacity::CapacityError,
     holding::HoldingError,
@@ -39,6 +41,14 @@ pub enum CloudleaseError {
         object: String,
         /// The status it returned
         status: u16,
+    },
+    /// Another object did not answer in time
+    #[error("{object} did not answer within {}ms", limit.as_millis())]
+    Timeout {
+        /// The object asked
+        object: String,
+        /// How long the caller waited
+        limit: Duration,
     },
     /// The owner holds no record of this generation
     #[error("no holding for generation {0}")]

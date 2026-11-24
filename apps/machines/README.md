@@ -65,7 +65,10 @@ it, with a core holding.
    boot). A missed heartbeat ends the lease on the alarm, or on any earlier read or renew
    of it; a release ends it at once.
 3. **Tag sweep.** Every 5 minutes the cron trigger lists every droplet and volume tagged
-   with `CLOUDLEASE_TAG_PREFIX` and deletes any that no live lease claims.
+   with `CLOUDLEASE_TAG_PREFIX`. It first deletes every one past its `until` tag, without
+   asking any run object, then asks each run object which of the rest it claims and deletes
+   those no live lease claims. A run object that does not answer within 5 seconds keeps its
+   other resources until the next sweep.
 4. **Spend caps.** See below.
 
 A machine is `released` only after the droplet, then the volume, are confirmed absent;
@@ -137,5 +140,5 @@ commands in order.
 against the fake DigitalOcean API in `tests/worker/test` and a fake ntfy topic. It covers
 run and machine create idempotency, renew by lease token and refusal on another lease, a
 lapsed heartbeat, an immediate release, the hard deadline, `released` only after the droplet
-and volume are gone, `max_machines`, both spend caps, a failed create, and the sweep's
-orphan and failure alerts.
+and volume are gone, `max_machines`, both spend caps, a failed create, a stalled run object
+whose droplet is past its hard deadline, and the sweep's orphan and failure alerts.
