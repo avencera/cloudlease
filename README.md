@@ -119,12 +119,11 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
 
 ## Not covered yet
 
-- Live bare metal. The machines Worker runs phoenixNAP and Latitude.sh classes against
-  fake APIs in miniflare; their live tests are tracked in the deploy runbook
-- Live AWS in this repository. rembuild runs the AWS adapter in production; the machines
-  Worker's AWS classes are tested only against fake EC2 APIs (`crates/cloudlease-provider/tests/aws.rs`
-  and `apps/machines/test/fake-ec2.ts`), and the IAM setup in `infra/aws-machines` has not
-  been applied
+- Some live paths. Each provider ran one live machine through the machines Worker on
+  2026-11-24 (create, join, idle release, confirmed gone; see the deploy runbook), but
+  heartbeat-lapse and hard-deadline deletes ran live only on DigitalOcean, out-of-stock
+  fall-through only on Latitude.sh, and a real AWS Spot interruption (rather than an
+  out-of-band terminate) has not run
 - Firewalls on DigitalOcean, phoenixNAP and Latitude.sh. `firewall::IngressPolicy` has only
   the AWS shared security group implementation
 - Batch-job records and exit status. These belong to the app, which builds on holdings
