@@ -191,18 +191,22 @@ data "aws_iam_policy_document" "guardrails" {
 
   # CloudFormation runs a stack's later operations with the service role it already has, and
   # the caller needs no iam:PassRole for that, so these stacks would act as administrator
-  statement {
-    sid    = "NoWritesToAdminRoleStacks"
-    effect = "Deny"
-    not_actions = [
-      "cloudformation:Describe*",
-      "cloudformation:Detect*",
-      "cloudformation:Get*",
-      "cloudformation:List*",
-    ]
-    resources = [
-      for stack in var.admin_role_stack_names : "arn:${local.partition}:cloudformation:*:${var.aws_account_id}:stack/${stack}/*"
-    ]
+  dynamic "statement" {
+    for_each = length(var.admin_role_stack_names) > 0 ? [var.admin_role_stack_names] : []
+
+    content {
+      sid    = "NoWritesToAdminRoleStacks"
+      effect = "Deny"
+      not_actions = [
+        "cloudformation:Describe*",
+        "cloudformation:Detect*",
+        "cloudformation:Get*",
+        "cloudformation:List*",
+      ]
+      resources = [
+        for stack in statement.value : "arn:${local.partition}:cloudformation:*:${var.aws_account_id}:stack/${stack}/*"
+      ]
+    }
   }
 }
 

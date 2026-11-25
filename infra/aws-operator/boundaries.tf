@@ -113,6 +113,15 @@ data "aws_iam_policy_document" "machines_boundary" {
       values   = ["true"]
     }
   }
+
+  # same-account resource policies that name the user can grant past an implicit deny in a
+  # boundary, so everything outside EC2 is denied outright
+  statement {
+    sid         = "NothingButEc2"
+    effect      = "Deny"
+    not_actions = ["ec2:*"]
+    resources   = ["*"]
+  }
 }
 
 data "aws_iam_policy_document" "rembuild_boundary" {
@@ -240,6 +249,15 @@ data "aws_iam_policy_document" "rembuild_boundary" {
       variable = "ec2:ResourceTag/rb-managed"
       values   = local.rembuild_managed_values
     }
+  }
+
+  # same-account resource policies that name the user can grant past an implicit deny in a
+  # boundary, so everything outside EC2 is denied outright
+  statement {
+    sid         = "NothingButEc2"
+    effect      = "Deny"
+    not_actions = ["ec2:*"]
+    resources   = ["*"]
   }
 }
 

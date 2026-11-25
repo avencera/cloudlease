@@ -33,7 +33,9 @@ volume size and exact tag sets). The boundaries leave those out on purpose, so m
 AMI or subnet stays an operator change and does not need an administrator.
 
 Neither boundary allows IAM, STS, S3 or any service besides EC2, another region, or the other
-app's instances. Changing what a service user may do beyond that means changing its boundary
+app's instances. Each also denies everything outside EC2 outright, because a same-account
+resource policy (an S3 bucket policy, say) that names the user would otherwise grant past a
+boundary's implicit deny. Changing what a service user may do beyond that means changing its boundary
 here, with administrator credentials.
 
 When rembuild drops its legacy tag shape, remove `rembuild` from `rembuild_managed_values` in
