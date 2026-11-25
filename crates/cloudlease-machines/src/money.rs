@@ -252,6 +252,69 @@ impl Billing {
     }
 }
 
+/// How long before its paid time ends an idle machine asks for its release
+///
+/// The provider must stop billing before the next increment starts. phoenixNAP took about 2 to
+/// 2.5 minutes to deprovision a server in the live test of 2026-11-24; whether its billing
+/// stops at the delete request or once the server is gone is unconfirmed, as it is for
+/// Latitude.sh, so this covers the whole deletion, the machine's renew round and a retried
+/// release.
+pub const IDLE_RELEASE_MARGIN: Duration = Duration::from_secs(5 * 60);
+
+/// A provider's own billing increment, which an idle machine can use up for free
+///
+/// It is the provider's increment, not a class's coarser counting one: holding an idle droplet
+/// counted by the hour still costs DigitalOcean's per-second price.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaidTime {
+    increment: Duration,
+}
+
+impl PaidTime {
+    /// Every started hour is billed in full
+    pub const HOURLY: Self = Self {
+        increment: Duration::from_secs(SECS_PER_HOUR),
+    };
+
+    /// Returns until when an idle machine may stay without starting a new paid increment, or
+    /// `None` when holding it gains nothing
+    ///
+    /// The provider's billing starts at a moment cloudlease is not told, such as phoenixNAP's
+    /// `provisionedOn`, but it is no earlier than the lease's `created`, which is saved before
+    /// the provider create, and no later than `billing_starts_by` after it. Increments are
+    /// counted from `created` here, so the hold ends no later than the provider's real
+    /// increment and never starts a counted one, which keeps the run's spend where it was.
+    /// When the provider's increment may have turned less than `billing_starts_by` ago, the
+    /// next one could start at any moment, so there is no hold. A hold that would pass
+    /// `hard_deadline` is dropped, and the machine releases as it would without one.
+    #[must_use]
+    pub fn idle_hold_until(
+        self,
+        created: UnixMillis,
+        billing_starts_by: Duration,
+        hard_deadline: UnixMillis,
+        now: UnixMillis,
+    ) -> Option<UnixMillis> {
+        let increment = u64::try_from(self.increment.as_millis()).ok()?;
+        let starts_by = u64::try_from(billing_starts_by.as_millis()).ok()?;
+        let elapsed = now.as_millis().checked_sub(created.as_millis())?;
+        if elapsed % increment < starts_by {
+            return None;
+        }
+
+        let paid_until = created.saturating_add(Duration::from_millis(
+            (elapsed / increment + 1).saturating_mul(increment),
+        ));
+        let until = UnixMillis::new(
+            paid_until
+                .as_millis()
+                .checked_sub(u64::try_from(IDLE_RELEASE_MARGIN.as_millis()).ok()?)?,
+        )?;
+
+        (now < until && until <= hard_deadline).then_some(until)
+    }
+}
+
 /// One machine's billed life: from its lease's creation until its resources are gone
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BilledLife {
@@ -377,7 +440,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use super::{BilledLife, Billing, MicroUsd, MoneyError, Spend};
+    use super::{BilledLife, Billing, IDLE_RELEASE_MARGIN, MicroUsd, MoneyError, PaidTime, Spend};
 
     const DO: Billing = Billing::DIGITALOCEAN;
     const PNAP: Billing = Billing::PHOENIXNAP;
@@ -567,5 +630,44 @@ mod tests {
         assert_eq!(second.accrued, dollars("0.94"));
         assert_eq!(second.reaches_cap_at(cap, at(HOUR)), Some(at(2 * HOUR)));
         assert!(Spend::of(PNAP, price, machines, at(2 * HOUR)).has_reached(cap));
+    }
+
+    #[test]
+    fn an_idle_machine_holds_to_just_before_its_paid_hour_ends() {
+        const MINUTE: u64 = 60_000;
+        let grace = Duration::from_secs(20 * 60);
+        let far = at(10 * HOUR);
+        let hold = |now| PaidTime::HOURLY.idle_hold_until(at(0), grace, far, at(now));
+
+        // billing may start up to the boot grace after the lease, so the provider's hour
+        // may turn that long after the counted one, and there is no hold until it surely has
+        assert_eq!(hold(19 * MINUTE), None);
+        assert_eq!(hold(20 * MINUTE), Some(at(55 * MINUTE)));
+        assert_eq!(hold(54 * MINUTE), Some(at(55 * MINUTE)));
+        // inside the margin the machine releases at once
+        assert_eq!(hold(55 * MINUTE), None);
+        assert_eq!(hold(HOUR + 19 * MINUTE), None);
+        assert_eq!(hold(HOUR + 30 * MINUTE), Some(at(HOUR + 55 * MINUTE)));
+
+        // the hold never ends in a counted hour the run has not paid for, so the spend stays
+        let held = hold(HOUR + 30 * MINUTE).unwrap();
+        let price = dollars("0.40");
+        assert_eq!(
+            PNAP.billed(price, at(0), held),
+            PNAP.billed(price, at(0), at(HOUR + 30 * MINUTE))
+        );
+        assert!(held.as_millis() + IDLE_RELEASE_MARGIN.as_millis() as u64 <= 2 * HOUR);
+    }
+
+    #[test]
+    fn a_hold_that_would_pass_the_hard_deadline_is_dropped() {
+        const MINUTE: u64 = 60_000;
+        let grace = Duration::from_secs(15 * 60);
+        let hold = |deadline| {
+            PaidTime::HOURLY.idle_hold_until(at(0), grace, at(deadline), at(30 * MINUTE))
+        };
+
+        assert_eq!(hold(55 * MINUTE), Some(at(55 * MINUTE)));
+        assert_eq!(hold(54 * MINUTE), None);
     }
 }

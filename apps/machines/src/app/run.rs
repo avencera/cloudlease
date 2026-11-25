@@ -775,6 +775,10 @@ impl Run {
                     &RenewView {
                         heartbeat_deadline_at: Timestamp(heartbeat),
                         hard_deadline_at: Timestamp(machine.admitted.hard_deadline_at),
+                        idle_hold_until: machine
+                            .admitted
+                            .idle_hold_until(&loaded.run, now)
+                            .map(Timestamp),
                     },
                 )
             }

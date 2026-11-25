@@ -39,7 +39,7 @@ use cloudlease_provider::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::boot::InterruptionNotice;
+use crate::{boot::InterruptionNotice, money::PaidTime};
 
 /// The most locations a phoenixNAP class, or sites a Latitude.sh class, may try in turn
 ///
@@ -91,6 +91,19 @@ impl ProviderName {
         match self {
             Self::Aws => Some(InterruptionNotice::AwsImds),
             Self::DigitalOcean | Self::PhoenixNap | Self::Latitude => None,
+        }
+    }
+
+    /// Returns the provider's billing increment when it is long enough for an idle machine to
+    /// wait out, or `None` for one that bills by the second
+    ///
+    /// phoenixNAP bills every started hour from the server's `provisionedOn`, and Latitude.sh
+    /// every started hour from within about a minute of the create (live tests of 2026-11-24).
+    #[must_use]
+    pub const fn paid_time(self) -> Option<PaidTime> {
+        match self {
+            Self::PhoenixNap | Self::Latitude => Some(PaidTime::HOURLY),
+            Self::DigitalOcean | Self::Aws => None,
         }
     }
 }

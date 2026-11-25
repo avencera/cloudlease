@@ -176,6 +176,22 @@ pub struct Admitted {
 }
 
 impl Admitted {
+    /// Returns until when the machine, once idle, may stay without adding to its bill, or
+    /// `None` when holding it gains nothing
+    ///
+    /// The provider's billing starts within the run's boot grace of the lease's creation: a
+    /// lease whose machine has not renewed by then is deleted, and a machine renews only once
+    /// its server runs.
+    #[must_use]
+    pub fn idle_hold_until(&self, run: &RunRecord, now: UnixMillis) -> Option<UnixMillis> {
+        run.provider.paid_time()?.idle_hold_until(
+            self.created_at,
+            run.heartbeat.boot_grace(),
+            self.hard_deadline_at,
+            now,
+        )
+    }
+
     /// Reports whether the machine's gate permit is due back to the gate
     ///
     /// A stock refusal is the provider's answer that nothing was created, so its permit is due

@@ -229,6 +229,9 @@ pub struct RenewView {
     pub heartbeat_deadline_at: Timestamp,
     /// The lease ends at this time whatever happens
     pub hard_deadline_at: Timestamp,
+    /// An idle machine may stay until this time without adding to its bill, as the rest of
+    /// a provider hour already paid for; `null` when holding it gains nothing
+    pub idle_hold_until: Option<Timestamp>,
 }
 
 /// A stable error code, with its status and whether a retry may succeed

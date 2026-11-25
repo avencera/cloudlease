@@ -178,6 +178,11 @@ describe("cloudlease machines in miniflare", () => {
     expect(due).toBeLessThanOrEqual(Date.now() + 3 * MINUTE);
     expect(view.hard_deadline_at).toBe(first.hard_deadline_at);
 
+    // a droplet bills by the second, so an idle one is never held, however far into an hour
+    await backdateMachine(first, 30 * MINUTE);
+    const later = await call("POST", `/v1/leases/${first.lease_id}/renew`, token, {});
+    expect(((await later.json()) as { idle_hold_until: string | null }).idle_hold_until).toBeNull();
+
     // the machine may read its own lease
     expect((await readLease(first.lease_id, token)).state).toBe("running");
 
