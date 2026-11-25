@@ -25,19 +25,20 @@
     // every resource this Worker creates or sweeps carries tags with this prefix; no other
     // cloudlease app may use it
     "CLOUDLEASE_TAG_PREFIX": "clm",
-    // the most the machines not yet confirmed gone may cost per hour, in US cents: 125 lets
-    // one m4.metal.medium run for the Latitude.sh test; after it, 41 fits one
-    // s2.c2.large with its IP block
-    "HOURLY_SPEND_CAP_CENTS": "125",
+    // the most the machines not yet confirmed gone may cost per hour, in US cents: 48 fits
+    // one aws-c8a-4xl or one s2.c2.large with its IP block, but not lat-m4-medium
+    "HOURLY_SPEND_CAP_CENTS": "48",
+    // the regions the AWS classes launch in and the sweep lists; infra/aws-machines covers
+    // only us-east-1
+    "AWS_REGIONS": "us-east-1",
     "MACHINES_CONFIG": {
       // where machines renew: the deployed Worker on the Avencera account
       "api_base": "https://cloudlease-machines.avencera.workers.dev",
-      // limits of the live provider tests: one machine per run, and $1.25 is one hour of
-      // Latitude.sh m4.metal.medium (after it, 0.41 fits one hour of pnap-s2-large); raise
-      // them for a real pool
+      // limits of the live provider tests: one machine per run, and $0.48 is one hour of
+      // aws-c8a-4xl or of pnap-s2-large; raise them for a real pool
       "max_run_hours": 1,
       "max_machines_per_run": 1,
-      "run_spend_cap_usd": "1.25",
+      "run_spend_cap_usd": "0.48",
       // a machine renews every 30 seconds; a run keeps the windows it was created with
       "heartbeat_ttl_secs": 180,
       // the boot grace of DigitalOcean classes; a phoenixNAP class waits 20 minutes, a
@@ -93,9 +94,34 @@
           "operating_system": "ubuntu_24_04_x64_lts",
           "price_per_hour_usd": "1.25",
           "max_hours": 1
+        },
+        // an AWS class needs AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and its region in
+        // AWS_REGIONS; the network, security group and AMI come from infra/aws-machines
+        // (`terraform output -json class_fields`). Spot in us-east-1 on 2026-11-24:
+        // c8a.4xlarge $0.29 in 1f, $0.37 in 1b, $0.40 in 1d; c7a.4xlarge $0.27 to $0.40
+        "aws-c8a-4xl": {
+          "provider": "aws",
+          "region": "us-east-1",
+          "instance_types": ["c8a.4xlarge", "c7a.4xlarge"],
+          "zones": [
+            { "zone": "us-east-1f", "subnet_id": "subnet-014c36450d3136b24" },
+            { "zone": "us-east-1b", "subnet_id": "subnet-02b6fa6fd5f8cd1f8" },
+            { "zone": "us-east-1d", "subnet_id": "subnet-0b26c15634470738c" }
+          ],
+          // Canonical's Ubuntu 24.04 amd64 gp3 image, pinned in infra/aws-machines
+          "image_id": "ami-0a951420c495183dc",
+          "root_device_name": "/dev/sda1",
+          "root_volume_gib": 50,
+          "security_group_id": "sg-0eee604228baa1674",
+          // above the Spot prices; EC2 never charges more than this for the instance
+          "spot_max_price_usd": "0.45",
+          // the max price plus about $0.01 for the 50 GiB gp3 root volume and the public IPv4
+          // address, rounded up
+          "price_per_hour_usd": "0.48",
+          "max_hours": 1
         }
       },
-      "apps": { "homebased": { "classes": ["do-s1-1g", "pnap-s2-large", "pnap-s2-small", "lat-m4-medium"] } }
+      "apps": { "homebased": { "classes": ["do-s1-1g", "pnap-s2-large", "pnap-s2-small", "lat-m4-medium", "aws-c8a-4xl"] } }
     }
   }
 }
