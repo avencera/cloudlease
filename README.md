@@ -137,9 +137,9 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
 - EC2's eventual consistency in the seconds after a launch. If a lease ends within those
   seconds, the instance's describe can answer `InvalidInstanceID.NotFound`, which cleanup
   reads as already gone: it releases the holding and its permit without terminating. The
-  next hourly sweep finds and deletes the instance, without an orphan alert, so it can run
-  for up to an hour. A fresh lease ending that fast needs a release within seconds of the
-  create's answer
+  next sweep, within five minutes, deletes the instance as unclaimed and sends an orphan
+  alert. A fresh lease ending that fast needs a release within seconds of the create's
+  answer
 - A tag search after a lost create discards a resource whose tags are not exactly the
   scheme's, such as a droplet someone tagged by hand in the minutes before cleanup. Cleanup
   then proves the resource absent and returns its permit; the sweep leaves it running but
