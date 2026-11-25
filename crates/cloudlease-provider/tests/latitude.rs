@@ -645,7 +645,7 @@ fn an_expired_holding_deletes_its_server_before_the_record_that_names_it() {
     let reaped = block_on(reap(
         &harness.provider,
         &releasing,
-        at(120_000),
+        || at(120_000),
         &Backoff::default(),
     ))
     .unwrap();
@@ -699,7 +699,7 @@ fn a_server_listed_only_after_its_cleanup_gave_up_is_swept_as_an_orphan_once_set
     let reaped = block_on(reap(
         &harness.provider,
         &releasing,
-        at(after_settle),
+        || at(after_settle),
         &Backoff::default(),
     ))
     .unwrap();

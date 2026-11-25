@@ -727,7 +727,13 @@ fn an_expired_holding_finds_a_lost_server_by_its_tags_and_confirms_it_gone() {
 
     // the server is still listed as deleting right after the deprovision, so the pass
     // schedules a retry
-    let first = block_on(reap(&harness.provider, &releasing, at(120_000), &backoff)).unwrap();
+    let first = block_on(reap(
+        &harness.provider,
+        &releasing,
+        || at(120_000),
+        &backoff,
+    ))
+    .unwrap();
     assert!(first.errors.is_empty(), "{:?}", first.errors);
     assert!(matches!(
         first.holding.state(),
@@ -737,7 +743,7 @@ fn an_expired_holding_finds_a_lost_server_by_its_tags_and_confirms_it_gone() {
     let second = block_on(reap(
         &harness.provider,
         &first.holding,
-        at(121_000),
+        || at(121_000),
         &backoff,
     ))
     .unwrap();

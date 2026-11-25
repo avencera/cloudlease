@@ -141,11 +141,9 @@ where
             continue;
         }
 
-        // provider calls for earlier holdings take time, and a released holding records
-        // this as when its resources were confirmed gone
-        let at = crate::runtime::now().max(now);
-        let reaped = reap(provider, holding, at, backoff).await?;
-        store.put(&reaped.holding, at)?;
+        let clock = || crate::runtime::now().max(now);
+        let reaped = reap(provider, holding, clock, backoff).await?;
+        store.put(&reaped.holding, clock())?;
         errors.extend(reaped.errors);
         if reaped.holding.is_released() {
             released.push(reaped.holding.clone());

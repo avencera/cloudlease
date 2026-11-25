@@ -521,6 +521,53 @@ fn inventory_reports_wrong_shapes_and_ignores_foreign_resources() {
 }
 
 #[test]
+fn a_released_holding_records_the_time_after_the_provider_confirmed_its_droplet_gone() {
+    let harness = harness();
+    let owner = owner_tags("job_1", 1);
+    let droplet = block_on(harness.provider.create(&owner, &droplet_spec("job-1-a"))).unwrap();
+    harness
+        .api
+        .borrow_mut()
+        .droplets
+        .get_mut(&droplet.as_str().parse().unwrap())
+        .unwrap()
+        .reads_until_gone = Some(0);
+
+    let policy = LeasePolicy::new(Duration::from_secs(120), Duration::from_secs(3_600)).unwrap();
+    let lease = Lease::start(LeaseId::parse("lease_1").unwrap(), &policy, at(0), None).unwrap();
+    let releasing = Holding::leased(owner.owner.clone(), owner.generation, lease)
+        .request(DoKind::Droplet, at(0))
+        .unwrap()
+        .record_created(DoKind::Droplet, droplet, at(0))
+        .unwrap()
+        .expire(at(120_000))
+        .unwrap();
+
+    // each provider request takes a second, so the time read after the delete and the
+    // confirming read is two seconds past the time before them
+    let requests_before = harness.api.borrow().log.len();
+    let clock = || {
+        let requests = harness.api.borrow().log.len() - requests_before;
+        at(120_000 + 1_000 * u64::try_from(requests).unwrap())
+    };
+    let reaped = block_on(reap(
+        &harness.provider,
+        &releasing,
+        clock,
+        &Backoff::default(),
+    ))
+    .unwrap();
+
+    assert_eq!(
+        reaped.holding.state(),
+        &HoldingState::Released {
+            reason: ReleaseReason::HeartbeatMissed,
+            at: at(122_000),
+        }
+    );
+}
+
+#[test]
 fn an_expired_holding_deletes_its_droplet_before_finding_and_deleting_a_lost_volume() {
     let harness = harness();
     let owner = owner_tags("job_1", 1);
@@ -543,7 +590,13 @@ fn an_expired_holding_deletes_its_droplet_before_finding_and_deleting_a_lost_vol
     let backoff = Backoff::default();
 
     // the droplet is still visible right after the delete, so the pass schedules a retry
-    let first = block_on(reap(&harness.provider, &releasing, at(120_000), &backoff)).unwrap();
+    let first = block_on(reap(
+        &harness.provider,
+        &releasing,
+        || at(120_000),
+        &backoff,
+    ))
+    .unwrap();
     assert!(first.errors.is_empty());
     assert!(matches!(
         first.holding.state(),
@@ -557,7 +610,7 @@ fn an_expired_holding_deletes_its_droplet_before_finding_and_deleting_a_lost_vol
     let second = block_on(reap(
         &harness.provider,
         &first.holding,
-        at(121_000),
+        || at(121_000),
         &backoff,
     ))
     .unwrap();
@@ -600,7 +653,7 @@ fn a_failing_provider_turns_into_a_retry_without_losing_targets() {
         .revoke(at(1_000));
 
     let backoff = Backoff::default();
-    let failed = block_on(reap(&harness.provider, &releasing, at(1_000), &backoff)).unwrap();
+    let failed = block_on(reap(&harness.provider, &releasing, || at(1_000), &backoff)).unwrap();
     assert_eq!(failed.errors.len(), 1);
     assert_eq!(failed.errors[0].code, ProviderErrorCode::ServerError);
     // the client retried the delete with backoff before giving up
@@ -610,7 +663,7 @@ fn a_failing_provider_turns_into_a_retry_without_losing_targets() {
     let denied = block_on(reap(
         &harness.provider,
         &failed.holding,
-        at(5_000),
+        || at(5_000),
         &backoff,
     ))
     .unwrap();
