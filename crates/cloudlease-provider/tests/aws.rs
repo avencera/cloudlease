@@ -918,19 +918,25 @@ fn a_running_instance_marked_for_termination_counts_as_an_interruption_now() {
 }
 
 #[test]
-fn a_failed_spot_request_read_fails_the_history() {
+fn a_failed_spot_request_read_keeps_the_terminated_history() {
     let ec2 = FakeEc2::default();
     let aws = Aws::new(ec2, scheme());
     let id = block_on(aws.create(&owner("prj_1", 1), &spec(&["c7a.2xlarge"]))).unwrap();
+    let interrupted = block_on(aws.create(&owner("prj_1", 2), &spec(&["m7a.2xlarge"]))).unwrap();
+    aws.ec2()
+        .retire(interrupted.as_str(), SPOT_INSTANCE_TERMINATION, Some(1_000));
     aws.ec2()
         .0
         .borrow_mut()
         .spot_requests
         .remove(&format!("sir-{id}"));
 
-    let error = block_on(aws.spot_interruptions(&OwnerId::parse("prj_1").unwrap())).unwrap_err();
+    let interruptions =
+        block_on(aws.spot_interruptions(&OwnerId::parse("prj_1").unwrap())).unwrap();
 
-    assert_eq!(error.code, ProviderErrorCode::NotFound);
+    // EC2 refuses the whole read for a request it no longer lists
+    assert_eq!(interruptions.len(), 1);
+    assert_eq!(interruptions[0].instance_type.as_str(), "m7a.2xlarge");
 }
 
 #[test]

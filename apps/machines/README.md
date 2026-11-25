@@ -185,8 +185,9 @@ whose state reason is `Server.SpotInstanceTermination`. A machine EC2 has given 
 interruption notice still runs, and homebased asks for its replacement within that time, so
 one `DescribeSpotInstanceRequests` call over the Spot requests of the run's other live
 instances also leaves out the pool of each one whose request is `marked-for-termination`. The
-run logs the pools it left out. If that leaves no pool, the launch offers them all. If either
-read fails, the launch offers every pool.
+run logs the pools it left out. If that leaves no pool, the launch offers them all. If the
+instance list fails, the launch offers every pool; if only the Spot request read fails, such as
+for a request EC2 no longer lists, the terminated instances still count.
 
 The fleet reports the pool it launched in by its override, and an instant fleet also reports
 the instance's zone and subnet beside it; the launch reads either, so a launched instance is

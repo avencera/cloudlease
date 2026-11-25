@@ -361,7 +361,8 @@ impl<C: Ec2> Aws<C> {
     /// a live instance whose Spot request is [marked for termination](MARKED_FOR_TERMINATION):
     /// EC2 has given it the two-minute notice, and its replacement is asked for within that
     /// time, while it still runs. One `DescribeSpotInstanceRequests` call covers every such
-    /// instance, and is skipped when there is none.
+    /// instance, and is skipped when there is none; if it fails, the terminated instances
+    /// still count.
     pub async fn spot_interruptions(
         &self,
         owner: &OwnerId,
@@ -392,13 +393,18 @@ impl<C: Ec2> Aws<C> {
             return Ok(interruptions);
         }
 
-        let requests = self
+        // the terminated instances above are history enough on their own, so a failed
+        // read, such as a request EC2 no longer lists, must not discard them
+        let Ok(requests) = self
             .ec2
             .describe_spot_instance_requests_with_status(
                 by_request.keys().map(|id| (*id).to_owned()).collect(),
                 MARKED_FOR_TERMINATION,
             )
-            .await?;
+            .await
+        else {
+            return Ok(interruptions);
+        };
         interruptions.extend(
             requests
                 .iter()
