@@ -14,7 +14,7 @@
 //! - **`Monitor`** Durable Object: consecutive sweep failures, so a failing owner alerts on
 //!   its third sweep in a row rather than on every one.
 //! - A cron sweep every 5 minutes that deletes every resource with the app's tag prefix that
-//!   no live lease claims, droplets, volumes, phoenixNAP servers, Latitude.sh servers and
+//!   no live lease claims, droplets, phoenixNAP servers, Latitude.sh servers and
 //!   their user data, and EC2 instances in every region of `AWS_REGIONS` alike, and alerts
 //!   on orphans.
 //!

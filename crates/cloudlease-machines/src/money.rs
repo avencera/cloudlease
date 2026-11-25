@@ -4,8 +4,7 @@
 //! life: every started increment is billed in full, with a minimum.
 //!
 //! - DigitalOcean bills droplets per second with a minimum of 60 seconds or $0.01, whichever
-//!   is higher, and volumes hourly (docs.digitalocean.com droplet and volume pricing pages,
-//!   checked 2026-11-24).
+//!   is higher (docs.digitalocean.com droplet pricing page, checked 2026-11-24).
 //! - phoenixNAP bills every started hour in full, with a minimum of one hour, from deploy until
 //!   the server is deleted (phoenixNAP billing knowledge base, checked 2026-11-24).
 //! - Latitude.sh documents an hourly price but not how it rounds a partial hour, so it is

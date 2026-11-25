@@ -48,7 +48,7 @@ pub const MAX_LOCATIONS: usize = 3;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderName {
-    /// DigitalOcean droplets, with an optional volume
+    /// DigitalOcean droplets
     DigitalOcean,
     /// phoenixNAP Bare Metal Cloud servers
     PhoenixNap,
