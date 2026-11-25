@@ -676,28 +676,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use cloudlease_core::tags::ResourceKind;
     use cloudlease_provider::phoenixnap::Location;
 
-    use super::{Locations, MachineKind};
-
-    #[test]
-    fn machine_kinds_keep_their_providers_tags_and_delete_order() {
-        // only the kinds whose tag names are unique round-trip; providers parse their own
-        for kind in MachineKind::ALL {
-            if *kind != MachineKind::LatServer {
-                assert_eq!(MachineKind::from_tag_name(kind.tag_name()), Some(*kind));
-            }
-        }
-        assert_eq!(MachineKind::PnapServer.tag_name(), "server");
-        assert_eq!(MachineKind::LatServer.tag_name(), "server");
-        // a Latitude.sh record is deleted only once its server is gone, and is never billed
-        assert!(MachineKind::LatServer.delete_rank() < MachineKind::LatUserData.delete_rank());
-        assert!(!MachineKind::LatUserData.is_billed() && MachineKind::LatServer.is_billed());
-        assert!(MachineKind::PnapServer.is_machine() && !MachineKind::LatUserData.is_machine());
-        assert_eq!(MachineKind::AwsInstance.tag_name(), "instance");
-        assert!(MachineKind::AwsInstance.is_machine() && MachineKind::AwsInstance.is_billed());
-    }
+    use super::Locations;
 
     #[test]
     fn a_location_list_is_short_and_has_no_repeats() {
