@@ -8,3 +8,6 @@ ami_id = "ami-0123456789abcdef0"
 
 allowed_instance_type_patterns = ["c7a.*", "c8a.*", "m7a.*", "c7i.*"]
 max_root_volume_gib            = 200
+
+# terraform -chdir=../aws-operator output -json boundary_arns
+permissions_boundary_arn = "arn:aws:iam::123456789012:policy/boundaries/cloudlease-machines"

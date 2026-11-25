@@ -128,3 +128,13 @@ variable "vpc_cidr" {
     error_message = "vpc_cidr must be an IPv4 CIDR of /16 or larger"
   }
 }
+
+variable "permissions_boundary_arn" {
+  description = "The user's permissions boundary, the cloudlease-machines entry of infra/aws-operator's boundary_arns output"
+  type        = string
+
+  validation {
+    condition     = can(regex("^arn:aws(-[a-z]+)*:iam::[0-9]{12}:policy/.+$", var.permissions_boundary_arn))
+    error_message = "permissions_boundary_arn must be an IAM policy ARN"
+  }
+}

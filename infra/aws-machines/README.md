@@ -92,6 +92,14 @@ manage only rembuild's IAM user. `infra/aws-operator` now grants `local-automati
 IAM writes this configuration and the access key need, so it applies the whole configuration
 and rotates the key on its own.
 
+The user carries the permissions boundary `policy/boundaries/cloudlease-machines` from
+`infra/aws-operator`, passed in as `permissions_boundary_arn`. It caps the user at the EC2
+calls above, in this region, on `clm-managed=true` resources, whatever its policies say. The
+operator may change the user and attach policies only while that boundary is attached, and may
+not remove it, so a plan without `permissions_boundary_arn` fails rather than dropping it. A
+policy change that needs more than the boundary allows (another service, another region) needs
+the boundary widened in `infra/aws-operator` first, with administrator credentials.
+
 Applied on 2026-11-24 in us-east-1, with zones `us-east-1f`, `us-east-1b` and `us-east-1d` and
 AMI `ami-0a951420c495183dc`: 18 resources. The state and `terraform.tfvars` live on the Mac mini
 in `~/code/cloudlease/infra/aws-machines`, and git ignores both. The state holds no access key.

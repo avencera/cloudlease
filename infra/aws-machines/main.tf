@@ -98,10 +98,13 @@ resource "aws_security_group" "machines" {
   tags = merge(local.common_tags, { Name = "cloudlease-machines" })
 }
 
+# the boundary comes from infra/aws-operator; the operator may change this user only while it is
+# attached, so a plan that would drop it fails with AccessDenied
 resource "aws_iam_user" "worker" {
-  name          = var.iam_user_name
-  path          = var.iam_path
-  force_destroy = false
+  name                 = var.iam_user_name
+  path                 = var.iam_path
+  permissions_boundary = var.permissions_boundary_arn
+  force_destroy        = false
 
   tags = local.common_tags
 }
