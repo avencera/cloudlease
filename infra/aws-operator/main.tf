@@ -101,6 +101,26 @@ data "aws_iam_policy_document" "operator" {
     resources = [each.value.policy_arns]
   }
 
+  # repeats the allow conditions as a deny, so a grant added later by mistake still cannot give
+  # the user another boundary, or a policy while it has none (a missing key also matches)
+  statement {
+    sid    = "OnlyItsOwnBoundary"
+    effect = "Deny"
+    actions = [
+      "iam:AttachUserPolicy",
+      "iam:CreateUser",
+      "iam:PutUserPermissionsBoundary",
+      "iam:PutUserPolicy",
+    ]
+    resources = [each.value.user_arn]
+
+    condition {
+      test     = "StringNotEquals"
+      variable = "iam:PermissionsBoundary"
+      values   = [each.value.boundary_arn]
+    }
+  }
+
   # the access key stays out of Terraform state, so it is created and rotated with the CLI
   statement {
     sid = "RotateAccessKey"
@@ -158,6 +178,31 @@ data "aws_iam_policy_document" "guardrails" {
     effect      = "Deny"
     not_actions = ["iam:Get*", "iam:List*", "iam:Simulate*"]
     resources   = [data.aws_iam_user.operator.arn]
+  }
+
+  # PowerUserAccess allows sts:AssumeRole on any role, and the CDK bootstrap's deploy role
+  # trusts the whole account and may pass cfn-exec-role (AdministratorAccess) to CloudFormation
+  statement {
+    sid       = "NoCdkBootstrapRoles"
+    effect    = "Deny"
+    actions   = ["sts:AssumeRole"]
+    resources = ["${local.iam_arn_prefix}:role/cdk-*"]
+  }
+
+  # CloudFormation runs a stack's later operations with the service role it already has, and
+  # the caller needs no iam:PassRole for that, so these stacks would act as administrator
+  statement {
+    sid    = "NoWritesToAdminRoleStacks"
+    effect = "Deny"
+    not_actions = [
+      "cloudformation:Describe*",
+      "cloudformation:Detect*",
+      "cloudformation:Get*",
+      "cloudformation:List*",
+    ]
+    resources = [
+      for stack in var.admin_role_stack_names : "arn:${local.partition}:cloudformation:*:${var.aws_account_id}:stack/${stack}/*"
+    ]
   }
 }
 

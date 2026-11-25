@@ -134,3 +134,14 @@ variable "operator_policy_path" {
     error_message = "operator_policy_path must be a slash-delimited path that neither contains nor lies inside service_account_path"
   }
 }
+
+variable "admin_role_stack_names" {
+  description = "CloudFormation stacks whose service role is an administrator; the operator may only read them"
+  type        = list(string)
+  default     = ["InfraopsCdkInfraStack"]
+
+  validation {
+    condition     = alltrue([for stack in var.admin_role_stack_names : can(regex("^[A-Za-z][A-Za-z0-9-]{0,127}$", stack))])
+    error_message = "admin_role_stack_names must hold CloudFormation stack names"
+  }
+}

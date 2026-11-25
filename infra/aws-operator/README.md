@@ -58,7 +58,19 @@ Three managed policies under `policy/operators/`, attached to the operator:
 - **`iam-operator-guardrails`:** account-wide IAM reads (`Get*`, `List*`) and the policy
   simulator, plus explicit denies, so a grant added later by mistake still cannot lift them:
   no deleting any permissions boundary; no new versions, deletion or tagging of policies under
-  `policy/boundaries/` or `policy/operators/`; nothing but reads on the operator user itself
+  `policy/boundaries/` or `policy/operators/`; nothing but reads on the operator user itself.
+  Each per-user grant also denies attaching a policy, creating the user or setting its
+  boundary unless the request carries that user's own boundary
+
+The guardrails also close two routes to administrator that `PowerUserAccess` leaves open and
+that have nothing to do with the service users:
+
+- `sts:AssumeRole` on `role/cdk-*`: the 2023 CDK bootstrap's deploy role trusts the whole
+  account and may pass `cdk-hnb659fds-cfn-exec-role-*` (`AdministratorAccess`) to
+  CloudFormation. It was last used on 2023-04-20, so CDK deploys from the operator are off
+- every write to the stacks in `admin_role_stack_names` (`InfraopsCdkInfraStack`, last updated
+  2023-04-20): CloudFormation runs later updates of a stack with the service role it already
+  has, here `cfn-exec-role`, and the caller needs no `iam:PassRole` for that. Reads stay allowed
 
 The grants hold no `iam:PutUserPolicy`, so the operator cannot give either user an inline
 policy. It can still write a broad statement into one of a user's own managed policies, and
@@ -95,6 +107,10 @@ terraform output -json boundary_arns
 
 Then check, as the operator, that `infra/aws-machines` and rembuild's `infra/aws-spot-iam` plan
 with no changes and no access errors.
+
+On a new account, create the boundaries first (`-target=aws_iam_policy.boundary`), then the
+service users with `permissions_boundary_arn` set, then the rest. The grants refuse every write
+to a user without its boundary, so the users' configurations cannot apply before that.
 
 To check a grant or boundary change before applying it, run `aws iam simulate-custom-policy`
 with the planned documents (`terraform show -json` of the plan). The operator may run the

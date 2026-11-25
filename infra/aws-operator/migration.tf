@@ -1,6 +1,7 @@
-# Temporary: the two inline grants the managed policies replace. The first apply imports
-# rembuild-iam-operator, made by hand before any Terraform managed it, and keeps both inline
-# grants while the boundaries are attached; the second apply drops this file and deletes them
+# Temporary, for one targeted apply: imports rembuild-iam-operator, the inline grant made by
+# hand before any Terraform managed it, alongside the boundaries. Both service users then get
+# their boundaries, and the next apply, without this file, attaches the managed grants and
+# deletes both inline ones, so the new grants never apply to a user without its boundary
 
 import {
   to = aws_iam_user_policy.rembuild_operator_inline
