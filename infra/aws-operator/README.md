@@ -124,3 +124,21 @@ to a user without its boundary, so the users' configurations cannot apply before
 To check a grant or boundary change before applying it, run `aws iam simulate-custom-policy`
 with the planned documents (`terraform show -json` of the plan). The operator may run the
 simulator itself.
+
+## Applied
+
+On 2026-11-24, from the Mac mini's `~/code/cloudlease/infra/aws-operator` (state and
+`terraform.tfvars` there, ignored by git), in three steps so that the new grants never applied to
+a user without its boundary:
+
+1. 8:42 PM CT, targeted at the boundaries: both boundaries created, and `rembuild-iam-operator`,
+   the inline grant made by hand before any Terraform managed it, imported
+2. the administrator attached both boundaries
+3. 8:43 PM CT, the whole configuration: the three managed grants created and attached, and both
+   inline grants (`cloudlease-iam-operator`, `rembuild-iam-operator`) deleted
+
+The first boundaries denied KMS outright, which stopped rembuild builders at launch; the
+boundary came off `rembuild-worker` within a minute, and the KMS-through-EC2 statements went in
+at 8:52 PM CT before it went back on. Afterwards the operator planned `infra/aws-machines` and
+rembuild's `infra/aws-spot-iam` with no changes, and every escalation attempt above was refused
+with `AccessDenied`.
