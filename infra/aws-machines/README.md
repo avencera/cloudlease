@@ -95,9 +95,11 @@ So the fleet policy pins what EC2 checks and cannot express the rest. Each guara
 - **Spot only:** the adapter, which sends `DefaultTargetCapacityType=spot` with a total
   capacity of 1 and no On-Demand capacity; the launch template sets no market options. A
   caller with this key could launch an On-Demand instance through a fleet.
-- **IMDSv2:** the launch template, which requires it, and each override, which sends
-  `HttpTokens=required` again.
-- **Default tenancy:** the adapter, which never sets one, and the template, which names none.
+- **IMDSv2:** the adapter, whose every override sends `HttpTokens=required`. The launch
+  template requires IMDSv2 too, but a fleet's override can change that, so for a caller with
+  this key it is only a default.
+- **Default tenancy:** the adapter, which never sets one; the template names none. A fleet's
+  override can set a tenancy.
 - **Root volume size:** the class's `root_volume_gib`. `max_root_volume_gib` caps only
   `RunInstances`.
 - **Public IPv4 and the security group:** the template, which has no network interface block
@@ -106,7 +108,9 @@ So the fleet policy pins what EC2 checks and cannot express the rest. Each guara
 - **Tags:** IAM refuses a wrong or missing managed tag on the fleet, and a wrong one on the
   instance or volume. A request that leaves out the instance's or the volume's tag
   specification entirely is not refused (as with rembuild's Spot request below), so that the
-  instance carries its tags rests on the adapter, which always sends all three.
+  instance carries its tags rests on the adapter, which always sends all three. An untagged
+  instance would be invisible to the sweep, and the cleanup policy would refuse to terminate
+  it; only an operator could find and end it.
 
 An instant fleet needs no `AWSServiceRoleForEC2Fleet` (EC2 Fleet prerequisites guide), and the
 account has none.

@@ -113,8 +113,8 @@ resource "aws_launch_template" "machines" {
   instance_initiated_shutdown_behavior = "terminate"
   vpc_security_group_ids               = [aws_security_group.machines.id]
 
-  # each launch asks for IMDSv2 too; IAM has no IMDS condition key for CreateFleet, so the
-  # template holds it as well
+  # each launch asks for IMDSv2 too; a fleet's override can change this default and IAM has no
+  # IMDS condition key for CreateFleet, so for fleets it rests on the adapter's request
   metadata_options {
     http_endpoint = "enabled"
     http_tokens   = "required"
@@ -382,8 +382,9 @@ data "aws_iam_policy_document" "launch" {
 # ec2:Tenancy and the volume check no ec2:VolumeSize, although the Service Authorization
 # Reference lists them, so a condition on any of them can never match. The security group,
 # network interface, snapshot and Spot request are not checked at all. The zone rests on the
-# pinned subnets, IMDSv2 and the security group on the launch template, and Spot, the instance
-# type and the root volume size on the request the adapter sends. The RunInstances statements
+# pinned subnets, the security group on the launch template, and Spot, IMDSv2, tenancy, the
+# instance type, the root volume size and the instance's tags on the request the adapter
+# sends. The RunInstances statements
 # above stay in case a fleet's launch is also authorized against the caller
 data "aws_iam_policy_document" "fleet" {
   statement {
