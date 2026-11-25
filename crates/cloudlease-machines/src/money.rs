@@ -254,12 +254,11 @@ impl Billing {
 
 /// How long before its paid time ends an idle machine asks for its release
 ///
-/// The provider must stop billing before the next increment starts. phoenixNAP took about 2 to
-/// 2.5 minutes to deprovision a server in the live test of 2026-11-24; whether its billing
-/// stops at the delete request or once the server is gone is unconfirmed, as it is for
-/// Latitude.sh, so this covers the whole deletion, the machine's renew round and a retried
-/// release.
-pub const IDLE_RELEASE_MARGIN: Duration = Duration::from_secs(5 * 60);
+/// The run's spend counts a machine until its resources are confirmed gone, so the margin
+/// covers the whole release, not just the request: phoenixNAP's docs say billing stops at
+/// deprovision, but the live test of 2026-11-24 took 4m16s from release to `gone_at`. It also
+/// covers the machine's 30 second renew round and a release retried the next round.
+pub const IDLE_RELEASE_MARGIN: Duration = Duration::from_secs(10 * 60);
 
 /// A provider's own billing increment, which an idle machine can use up for free
 ///
@@ -284,8 +283,9 @@ impl PaidTime {
     /// the provider create, and no later than `billing_starts_by` after it. Increments are
     /// counted from `created` here, so the hold ends no later than the provider's real
     /// increment and never starts a counted one, which keeps the run's spend where it was.
-    /// When the provider's increment may have turned less than `billing_starts_by` ago, the
-    /// next one could start at any moment, so there is no hold. A hold that would pass
+    /// In the first increment the provider's cannot end before the counted one. Later, when the
+    /// provider's increment may have turned less than `billing_starts_by` ago, the next one
+    /// could start at any moment, so there is no hold. A hold that would pass
     /// `hard_deadline` is dropped, and the machine releases as it would without one.
     #[must_use]
     pub fn idle_hold_until(
@@ -298,7 +298,7 @@ impl PaidTime {
         let increment = u64::try_from(self.increment.as_millis()).ok()?;
         let starts_by = u64::try_from(billing_starts_by.as_millis()).ok()?;
         let elapsed = now.as_millis().checked_sub(created.as_millis())?;
-        if elapsed % increment < starts_by {
+        if elapsed >= increment && elapsed % increment < starts_by {
             return None;
         }
 
@@ -639,15 +639,16 @@ mod tests {
         let far = at(10 * HOUR);
         let hold = |now| PaidTime::HOURLY.idle_hold_until(at(0), grace, far, at(now));
 
-        // billing may start up to the boot grace after the lease, so the provider's hour
-        // may turn that long after the counted one, and there is no hold until it surely has
-        assert_eq!(hold(19 * MINUTE), None);
-        assert_eq!(hold(20 * MINUTE), Some(at(55 * MINUTE)));
-        assert_eq!(hold(54 * MINUTE), Some(at(55 * MINUTE)));
+        // the provider's first hour cannot end before the counted one, however late it began
+        assert_eq!(hold(MINUTE), Some(at(50 * MINUTE)));
+        assert_eq!(hold(49 * MINUTE), Some(at(50 * MINUTE)));
         // inside the margin the machine releases at once
-        assert_eq!(hold(55 * MINUTE), None);
+        assert_eq!(hold(50 * MINUTE), None);
+        // billing may start up to the boot grace after the lease, so a later provider hour
+        // may turn that long after the counted one, and there is no hold until it surely has
         assert_eq!(hold(HOUR + 19 * MINUTE), None);
-        assert_eq!(hold(HOUR + 30 * MINUTE), Some(at(HOUR + 55 * MINUTE)));
+        assert_eq!(hold(HOUR + 20 * MINUTE), Some(at(HOUR + 50 * MINUTE)));
+        assert_eq!(hold(HOUR + 30 * MINUTE), Some(at(HOUR + 50 * MINUTE)));
 
         // the hold never ends in a counted hour the run has not paid for, so the spend stays
         let held = hold(HOUR + 30 * MINUTE).unwrap();
@@ -667,7 +668,7 @@ mod tests {
             PaidTime::HOURLY.idle_hold_until(at(0), grace, at(deadline), at(30 * MINUTE))
         };
 
-        assert_eq!(hold(55 * MINUTE), Some(at(55 * MINUTE)));
-        assert_eq!(hold(54 * MINUTE), None);
+        assert_eq!(hold(50 * MINUTE), Some(at(50 * MINUTE)));
+        assert_eq!(hold(49 * MINUTE), None);
     }
 }

@@ -210,31 +210,32 @@ describe("phoenixNAP machines in miniflare", () => {
       return view.idle_hold_until === null ? null : new Date(view.idle_hold_until).getTime();
     };
 
-    // inside the 20 minute boot grace the provider's hour may have only just started
-    expect(await holdUntil()).toBeNull();
-
-    // half an hour in, the machine may stay until five minutes before the hour ends
-    await backdateMachine(lease, 30 * MINUTE);
-    expect(await holdUntil()).toBe(created - 30 * MINUTE + 55 * MINUTE);
+    // the provider's first hour cannot end before the counted one, so the hold starts at once
+    expect(await holdUntil()).toBe(created + 50 * MINUTE);
 
     // inside the release margin it goes at once
-    await backdateMachine(lease, 26 * MINUTE);
+    await backdateMachine(lease, 55 * MINUTE);
     expect(await holdUntil()).toBeNull();
 
-    // in the next hour it is held again
-    await backdateMachine(lease, 34 * MINUTE);
-    expect(await holdUntil()).toBe(created - 90 * MINUTE + 115 * MINUTE);
+    // within the 20 minute boot grace after the hour, the provider's own hour may have only
+    // just started
+    await backdateMachine(lease, 10 * MINUTE);
+    expect(await holdUntil()).toBeNull();
+
+    // past it, the machine may stay until ten minutes before the second hour ends
+    await backdateMachine(lease, 25 * MINUTE);
+    expect(await holdUntil()).toBe(created - 90 * MINUTE + 110 * MINUTE);
   });
 
   it("holds no idle machine past its run's deadline", async () => {
     const run = await metalRun({
       name: "pool-metal-short",
-      deadline_at: new Date(Date.now() + 20 * MINUTE).toISOString(),
+      deadline_at: new Date(Date.now() + 15 * MINUTE).toISOString(),
     });
     const lease = await createMachine(run, "hb-metal-short");
     const token = leaseToken("hb-metal-short");
 
-    // half an hour in, the paid hour runs 25 more minutes, past the deadline in 20
+    // half an hour in, the hold runs 20 more minutes, past the deadline in 15
     await backdateMachine(lease, 30 * MINUTE);
     const renewed = await call("POST", `/v1/leases/${lease.lease_id}/renew`, token, {});
     expect(renewed.status).toBe(200);

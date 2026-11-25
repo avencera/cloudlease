@@ -219,19 +219,21 @@ phoenixNAP and Latitude.sh bill every started hour, so an idle machine there can
 the rest of its paid hour for free and take a job that arrives meanwhile. Each renew answer
 names until when, as `idle_hold_until`, and homebased keeps an idle machine until then
 instead of releasing it at its idle limit. It is the end of the hour counted from the lease's
-creation, less a 5 minute release margin for the release to stop the billing (phoenixNAP
-took 2 to 2.5 minutes to deprovision in the live test; when billing stops within that is
-unconfirmed).
+creation, less a 10 minute release margin. The run's spend counts a machine until it is
+confirmed gone, and phoenixNAP took 4m16s from release to `gone_at` in the live test, so the
+margin covers that, the machine's 30 second renew round and one retried release.
 
 The provider's billing starts at a moment cloudlease is not told, such as phoenixNAP's
 `provisionedOn`, but between the lease's creation, which is saved before the provider create,
-and the end of the run's boot grace, since a machine renews only once its server runs. So
-there is no hold within the boot grace after an hour turns, when the provider's hour may have
-only just started; outside it the hold never reaches a new provider hour, nor a new counted
-hour, so it adds nothing to the run's spend and cannot trip a spend cap. A hold that would
-pass the lease's hard deadline, and so the run's deadline, is `null`, as it always is on
-DigitalOcean and AWS, which bill by the second. With phoenixNAP's 20 minute boot grace an
-idle machine is held when its idle limit ends 20 to 55 minutes into an hour.
+and the end of the run's boot grace, since a machine renews only once its server runs. In the
+first hour the provider's hour cannot end before the counted one, so the hold applies at once.
+After that there is no hold within the boot grace after each counted hour turns, when the
+provider's hour may have only just started. Either way the hold never reaches a new provider
+hour, nor a new counted hour, so it adds nothing to the run's spend and cannot trip a spend
+cap. A hold that would pass the lease's hard deadline, and so the run's deadline, is `null`,
+as it always is on DigitalOcean and AWS, which bill by the second. With phoenixNAP's 20
+minute boot grace an idle machine is held when its idle limit ends in the first 50 minutes,
+or 20 to 50 minutes into a later hour.
 
 ## Spend caps
 
@@ -363,8 +365,9 @@ release, heartbeat lapse and hard deadline each deleting the server and confirmi
 gone, the sweep deleting unclaimed servers and keeping a claimed one, the sweep still
 deleting a DigitalOcean orphan while phoenixNAP fails to list, and hourly billing:
 a 5 minute server costs an hour, and the second hour takes a run past its cap, and the
-idle hold: none inside the boot grace or the release margin, five minutes before the hour
-ends otherwise, and none past the run's deadline (a droplet's renew names none). The
+idle hold: ten minutes before the hour ends, at once in the first hour, none inside the release
+margin or the boot grace after a later hour turns, and none past the run's deadline (a
+droplet's renew names none). The
 Latitude.sh suite covers the user data record and then the hourly server booting from it,
 a site out of stock falling through and the last one failing the create with its permit
 back at once, release and heartbeat lapse each deleting the server, then its record, and
