@@ -43,6 +43,7 @@ use crate::{
     error::{CloudleaseError, CloudleaseResult},
     http::{HttpError, call_json, json_response, read_json},
     runtime::now,
+    store::add_missing_column,
 };
 
 /// Takes a permit: `POST` an [`AcquireRequest`]
@@ -302,6 +303,13 @@ impl TryFrom<PermitRow> for Permit {
 pub fn ensure_schema(sql: &SqlStorage) -> CloudleaseResult<()> {
     sql.exec(CREATE_PERMITS, None)?;
     sql.exec(CREATE_SETTINGS, None)?;
+    // gates created before permits had units weighed every permit as one
+    add_missing_column(
+        sql,
+        "cloudlease_permits",
+        "units",
+        "INTEGER NOT NULL DEFAULT 1 CHECK (units > 0)",
+    )?;
 
     Ok(())
 }

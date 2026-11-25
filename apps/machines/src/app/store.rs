@@ -5,7 +5,10 @@ use cloudlease_machines::{
     ids::RequestId,
     run::{MachineRecord, RunRecord},
 };
-use cloudlease_worker::error::{CloudleaseError, CloudleaseResult};
+use cloudlease_worker::{
+    error::{CloudleaseError, CloudleaseResult},
+    store::add_missing_column,
+};
 use serde::{Deserialize, de::DeserializeOwned};
 use worker::{SqlStorage, SqlStorageValue};
 
@@ -38,6 +41,20 @@ impl RunStore {
     pub fn open(sql: SqlStorage) -> CloudleaseResult<Self> {
         sql.exec(CREATE_RUN, None)?;
         sql.exec(CREATE_REQUESTS, None)?;
+        // a run stored before the counter took its next generation after the highest
+        // recorded one, so the counter starts there
+        if add_missing_column(
+            &sql,
+            "machines_run",
+            "last_generation",
+            "INTEGER NOT NULL DEFAULT 0",
+        )? {
+            sql.exec(
+                "UPDATE machines_run SET last_generation = \
+                 (SELECT COALESCE(MAX(generation), 0) FROM machines_requests)",
+                None,
+            )?;
+        }
 
         Ok(Self(sql))
     }
