@@ -404,15 +404,6 @@ impl Heartbeat {
     }
 }
 
-impl Heartbeat {
-    /// The fixed windows every lease had before runs stored their own: a 10 minute heartbeat
-    /// window and a 15 minute boot grace
-    pub const BEFORE_CONFIG: Self = Self {
-        ttl_secs: 10 * 60,
-        boot_grace_secs: 15 * 60,
-    };
-}
-
 impl Default for Heartbeat {
     fn default() -> Self {
         Self {

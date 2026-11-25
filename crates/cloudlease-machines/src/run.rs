@@ -80,20 +80,13 @@ pub struct RunRecord {
     /// The class's weight in the hourly spend gate when the run was created
     pub gate_units: PermitUnits,
     /// The class's provider when the run was created
-    ///
-    /// Runs stored before classes named a provider were all DigitalOcean.
-    #[serde(default = "older_runs::provider")]
     pub provider: ProviderName,
     /// How the class's provider billed when the run was created
-    #[serde(default = "older_runs::billing")]
     pub billing: Billing,
     /// What the run may spend, fixed at create
     pub spend_cap: MicroUsd,
     /// The heartbeat window and boot grace of the run's leases, from the config and the
     /// class at create
-    ///
-    /// Runs stored before the windows were configurable kept the fixed ones of that time.
-    #[serde(default = "older_runs::heartbeat")]
     pub heartbeat: Heartbeat,
     /// The cap the client asked for, if any, which a retried create must repeat
     #[serde(default)]
@@ -104,23 +97,6 @@ pub struct RunRecord {
     /// asking does not flood the topic
     #[serde(default)]
     pub create_failure_alerted: bool,
-}
-
-// defaults for fields that runs stored by earlier versions lack
-mod older_runs {
-    use crate::{config::Heartbeat, money::Billing, provider::ProviderName};
-
-    pub(super) const fn provider() -> ProviderName {
-        ProviderName::DigitalOcean
-    }
-
-    pub(super) const fn billing() -> Billing {
-        Billing::DIGITALOCEAN
-    }
-
-    pub(super) const fn heartbeat() -> Heartbeat {
-        Heartbeat::BEFORE_CONFIG
-    }
 }
 
 impl RunRecord {
@@ -1087,28 +1063,6 @@ mod tests {
         assert_eq!(view(&releasing).state, LeaseState::Releasing);
         // ended outside end_lease, the view still names a reason
         assert_eq!(view(&releasing).release.unwrap().by, ReleasedBy::Cloudlease);
-    }
-
-    #[test]
-    fn a_run_stored_before_classes_named_a_provider_loads_as_digitalocean() {
-        let mut stored = serde_json::to_value(run()).unwrap();
-        let fields = stored.as_object_mut().unwrap();
-        fields.remove("provider");
-        fields.remove("billing");
-
-        let loaded: RunRecord = serde_json::from_value(stored).unwrap();
-        assert_eq!(loaded.provider, ProviderName::DigitalOcean);
-        assert_eq!(loaded.billing, Billing::DIGITALOCEAN);
-    }
-
-    #[test]
-    fn a_run_stored_before_heartbeat_windows_were_configurable_keeps_the_old_windows() {
-        let mut stored = serde_json::to_value(run()).unwrap();
-        stored.as_object_mut().unwrap().remove("heartbeat");
-
-        let loaded: RunRecord = serde_json::from_value(stored).unwrap();
-        assert_eq!(loaded.heartbeat.ttl(), Duration::from_secs(600));
-        assert_eq!(loaded.heartbeat.boot_grace(), Duration::from_secs(900));
     }
 
     #[test]

@@ -108,41 +108,6 @@ impl HoldingStore {
     }
 }
 
-/// Adds a column to a table created before the column existed, and reports whether it did
-///
-/// `CREATE TABLE IF NOT EXISTS` leaves an older table as it was, so a column added to a
-/// table's definition later must also be added to the tables already stored. `definition` is
-/// the column's type and constraints, such as `INTEGER NOT NULL DEFAULT 0`; SQLite fills it
-/// in for every existing row.
-pub fn add_missing_column(
-    sql: &SqlStorage,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> CloudleaseResult<bool> {
-    #[derive(Deserialize)]
-    struct Count {
-        present: i64,
-    }
-
-    let count = sql
-        .exec(
-            "SELECT COUNT(*) AS present FROM pragma_table_info(?) WHERE name = ?",
-            vec![SqlStorageValue::from(table), SqlStorageValue::from(column)],
-        )?
-        .one::<Count>()?;
-    if count.present > 0 {
-        return Ok(false);
-    }
-
-    sql.exec(
-        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
-        None,
-    )?;
-
-    Ok(true)
-}
-
 fn decode<K>(row: &HoldingRow) -> CloudleaseResult<Holding<K>>
 where
     K: ResourceKind + DeserializeOwned,

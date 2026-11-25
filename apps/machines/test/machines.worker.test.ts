@@ -614,50 +614,6 @@ describe("cloudlease machines in miniflare", () => {
     await scheduled();
     expect(ntfy.titles()).toHaveLength(1);
   });
-  it("serves a run stored before its generation counter and heartbeat windows", async () => {
-    const run = await createRun();
-    const first = await createMachine(run, "hb-old-run-1");
-    // an earlier Worker stored the run without the counter column and without heartbeat
-    // windows, which every lease then had fixed at 10 and 15 minutes
-    await runInDurableObject(runStub(run.run_id), (_instance, state) => {
-      const row = state.storage.sql.exec("SELECT record FROM machines_run").one();
-      const record = JSON.parse(row.record as string);
-      delete record.heartbeat;
-      state.storage.sql.exec("DROP TABLE machines_run");
-      state.storage.sql.exec(
-        "CREATE TABLE machines_run (id INTEGER PRIMARY KEY CHECK (id = 1), record TEXT NOT NULL)",
-      );
-      state.storage.sql.exec("INSERT INTO machines_run (id, record) VALUES (1, ?)", JSON.stringify(record));
-    });
-
-    expect((await readRun(run.run_id)).state).toBe("open");
-    const second = await createMachine(run, "hb-old-run-2");
-    expect(generationOf(second.lease_id)).toBe(generationOf(first.lease_id) + 1);
-    expect(Date.parse(second.heartbeat_deadline_at) - Date.parse(second.created_at)).toBe(15 * MINUTE);
-  });
-
-  it("weighs a permit stored before permits had units as one", async () => {
-    await runInDurableObject(gateStub(), (_instance, state) => {
-      state.storage.sql.exec("DROP TABLE cloudlease_permits");
-      state.storage.sql.exec(`CREATE TABLE cloudlease_permits (
-        permit_id TEXT PRIMARY KEY,
-        owner_id TEXT NOT NULL,
-        generation INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('active', 'suspect')),
-        UNIQUE(owner_id, generation)
-      )`);
-      state.storage.sql.exec(
-        "INSERT INTO cloudlease_permits VALUES ('cap_old', 'run_old', 1, ?, 'active')",
-        Date.now() + HOUR,
-      );
-    });
-
-    expect(await permits()).toMatchObject([{ permitId: "cap_old", units: 1 }]);
-    const run = await createRun();
-    await createMachine(run, "hb-old-gate");
-    expect(await permits()).toHaveLength(2);
-  });
   it("keeps the spend check due while another machine's create is in flight", async () => {
     const run = await createRun();
     const first = await createMachine(run, "hb-spend-wake-1");
