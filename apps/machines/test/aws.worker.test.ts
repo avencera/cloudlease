@@ -104,7 +104,9 @@ describe("AWS Spot machines in miniflare", () => {
       maxPrice: "0.025",
     });
     const until = Math.floor(Date.parse(lease.hard_deadline_at) / 1000);
-    expect(instance.tags).toEqual([...instanceTags(run.run_id, 1, until), { key: "Name", value: "hb-spot-1" }]);
+    // EC2 adds its own launch template and fleet tags after the ones the Worker sent
+    expect(instance.tags.filter((tag) => !tag.key.startsWith("aws:"))).toEqual([...instanceTags(run.run_id, 1, until), { key: "Name", value: "hb-spot-1" }]);
+    expect(instance.tags.map((tag) => tag.key)).toContain("aws:ec2:fleet-id");
     // a fleet cannot tag the Spot request it opens
     expect(ec2.spotRequests.get(instance.spotRequestId ?? "")?.tags).toEqual([]);
     expect(instance.userData).toMatch(/^#!\/bin\/sh\n/);

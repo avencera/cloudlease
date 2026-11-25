@@ -10,7 +10,7 @@ use std::{
 
 use cloudlease_core::{
     ids::{Generation, OwnerId, ResourceId, TagPrefix},
-    tags::{OwnerTags, TagScheme, UnrecognizedReason},
+    tags::{OwnerTags, TagMatch, TagScheme, UnrecognizedReason},
     time::UnixMillis,
 };
 use cloudlease_provider::{
@@ -418,14 +418,24 @@ impl Ec2 for FakeEc2 {
             details.availability_zone = pool.availability_zone.as_str().to_owned();
             details.subnet_id = pool.subnet_id.as_str().to_owned();
             let request_id = format!("sir-{id}");
-            let instance = AwsInstance::present(
-                id.clone(),
-                AwsInstanceState::Pending,
-                details,
-                request.tags.clone(),
-            )
-            .unwrap()
-            .with_spot_instance_request_id(request_id.clone());
+            // EC2 adds its own launch template and fleet tags to a fleet's instance
+            let fleet_id = response.fleet_id.clone().unwrap_or_default();
+            let mut tags = request.tags.clone();
+            tags.extend([
+                tag(
+                    "aws:ec2launchtemplate:id",
+                    request.launch_template.id.as_str(),
+                ),
+                tag(
+                    "aws:ec2launchtemplate:version",
+                    &request.launch_template.version.to_string(),
+                ),
+                tag("aws:ec2:fleet-id", &fleet_id),
+            ]);
+            let instance =
+                AwsInstance::present(id.clone(), AwsInstanceState::Pending, details, tags)
+                    .unwrap()
+                    .with_spot_instance_request_id(request_id.clone());
             // a fleet's one-time Spot request carries no tags
             fake.spot_requests.insert(
                 request_id,
@@ -618,7 +628,18 @@ fn create_offers_every_pool_in_one_fleet_and_repeats_idempotently() {
         tag("Name", "rb-builder-prj_1-1"),
     ];
     let instance = aws.ec2().0.borrow().instances[first.as_str()].clone();
-    assert_eq!(instance.tags(), expected_tags);
+    assert_eq!(aws.ec2().0.borrow().fleet_requests[0].tags, expected_tags);
+    // EC2's own tags on top of them still read as this owner's instance
+    assert!(
+        instance
+            .tags()
+            .iter()
+            .any(|tag| tag.key == "aws:ec2:fleet-id")
+    );
+    assert_eq!(
+        aws.classify(instance.tags()),
+        TagMatch::Managed(owner.with_kind(AwsKind::Instance))
+    );
 
     let fake = aws.ec2().0.borrow();
     let request = &fake.fleet_requests[0];

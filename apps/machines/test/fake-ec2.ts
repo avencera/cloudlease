@@ -277,7 +277,13 @@ export class FakeEc2 {
         spotRequestId,
         stateReason: null,
         terminatedAt: null,
-        tags: taggedAs(params, "instance"),
+        // EC2 adds its own launch template and fleet tags to a fleet's instance
+        tags: [
+          ...taggedAs(params, "instance"),
+          { key: "aws:ec2launchtemplate:id", value: params.get(`${template}.LaunchTemplateId`) ?? "" },
+          { key: "aws:ec2launchtemplate:version", value: params.get(`${template}.Version`) ?? "" },
+          { key: "aws:ec2:fleet-id", value: `fleet-${spotRequestId}` },
+        ],
       };
       this.instances.set(id, instance);
       // a fleet cannot tag its Spot request

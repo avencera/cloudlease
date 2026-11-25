@@ -60,6 +60,9 @@ use signing::hex_lower;
 /// it is refused before it reaches EC2.
 pub const MAX_LAUNCH_POOLS: usize = 300;
 
+// AWS reserves tag keys with this prefix for itself
+const AWS_RESERVED_TAG_PREFIX: &str = "aws:";
+
 /// An AWS resource kind cloudlease manages
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -276,12 +279,16 @@ impl<C: Ec2> Aws<C> {
             .collect()
     }
 
-    /// Classifies a resource's tags, leaving out `Name`
+    /// Classifies a resource's tags, leaving out `Name` and AWS's own `aws:` tags
+    ///
+    /// EC2 adds `aws:ec2launchtemplate:id`, `aws:ec2launchtemplate:version` and
+    /// `aws:ec2:fleet-id` to every instance a fleet launches. No caller can set or remove an
+    /// `aws:` key, so leaving them out cannot make another app's resource look managed.
     #[must_use]
     pub fn classify(&self, tags: &[AwsTag]) -> TagMatch<AwsKind> {
         let pairs: Vec<_> = tags
             .iter()
-            .filter(|tag| tag.key != NAME_TAG_KEY)
+            .filter(|tag| tag.key != NAME_TAG_KEY && !tag.key.starts_with(AWS_RESERVED_TAG_PREFIX))
             .map(|tag| (tag.key.clone(), tag.value.clone()))
             .collect();
 

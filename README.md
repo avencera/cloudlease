@@ -70,9 +70,13 @@ AWS Spot instance, its root volume and the instant fleet that launched it carry 
 cl-managed=true  cl-owner=<owner>  cl-gen=<n>  cl-kind=instance  [cl-until=<unix secs>]  Name=<name>
 ```
 
-The AWS adapter leaves `Name` out when it classifies tags, so the name is free text. A
-fleet cannot tag the Spot request it opens, so cleanup accepts an untagged one-time request as
-its instance's own; a request with any managed tag must carry exactly the instance's.
+The AWS adapter leaves `Name` out when it classifies tags, so the name is free text, and
+AWS's own `aws:` tags too: EC2 adds `aws:ec2launchtemplate:id`,
+`aws:ec2launchtemplate:version` and `aws:ec2:fleet-id` to every instance a fleet launches,
+and no caller can set or remove an `aws:` key. A fleet cannot tag the Spot request it opens
+(both live fleets' requests on 2026-11-25 had no tags), so cleanup accepts an untagged
+one-time request as its instance's own; a request with any managed tag must carry exactly the
+instance's.
 
 A resource with the managed tag but any other tag shape is reported as unrecognized and
 left alone. The exception is a malformed `until` tag on an otherwise exact set: the sweep
@@ -123,17 +127,22 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
 
 - Some live paths. Each provider ran one live machine through the machines Worker on
   2026-11-24 (create, join, idle release, confirmed gone; see the deploy runbook), but
-  heartbeat-lapse and hard-deadline deletes ran live only on DigitalOcean, out-of-stock
-  fall-through only on Latitude.sh, and a real AWS Spot interruption (rather than an
-  out-of-band terminate) has not run. The AWS `CreateFleet` launch has run only against the
-  fake EC2: the launch template was applied and deployed on 2026-11-25, and the first live
-  `CreateFleet` that day was refused with `UnauthorizedOperation` before any launch, because
-  the fleet policy required the zone and instance type, which EC2 does not send on a fleet's
-  instance check, and the launch policy, which a fleet's own `RunInstances` must pass, could
-  not tag the root volume (`infra/aws-machines/README.md`, "What EC2 checks on
-  `CreateFleet`"; both fixed the same day). Whether the fleet's Spot request carries tags and
-  how long EC2 keeps a `ClientToken` are unconfirmed. Leaving out the pool of a machine
-  whose Spot request is `marked-for-termination` has also run only against the fake EC2
+  heartbeat-lapse and hard-deadline deletes ran live only on DigitalOcean, and out-of-stock
+  fall-through only on Latitude.sh. The AWS `CreateFleet` launch and a real Spot interruption
+  (AWS FIS) ran live on 2026-11-25 against Worker `026b0c31` after two IAM fixes:
+  - the first `CreateFleet` was refused at the fleet policy, which required the zone and
+    instance type that EC2 does not send on a fleet's instance check;
+  - the next passed that check, but every launch failed when the fleet's own `RunInstances`,
+    made as the Worker's user, tried to tag the root volume, which the launch policy did
+    not allow (`infra/aws-machines/README.md`, "What EC2 checks on `CreateFleet`").
+
+  With both fixed, a fleet launched, the interrupted job reran on a second machine and
+  succeeded. That run also found that the Worker read every fleet-launched instance as
+  unrecognized, because EC2 adds `aws:` tags to it, so its cleanup refused to terminate the
+  instance and its interruption read did not leave out the interrupted pool. The fix
+  (`Aws::classify` leaves `aws:` tags out) is not deployed yet, so on the live Worker every
+  AWS instance must be terminated by hand, and leaving out an interrupted pool has run only
+  against the fake EC2. How long EC2 keeps a `ClientToken` is unconfirmed
 - Firewalls on DigitalOcean, phoenixNAP and Latitude.sh. `firewall::IngressPolicy` has only
   the AWS shared security group implementation
 - Batch-job records and exit status. These belong to the app, which builds on holdings
