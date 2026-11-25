@@ -159,8 +159,8 @@ An AWS class names a `region`, up to 4 `instance_types`, up to 3 `zones` each wi
 `infra/aws-machines`), an optional `root_device_name` (`/dev/sda1`, as on Canonical's images,
 when absent), a `root_volume_gib` of at least 8, a `launch_template_id` and its
 `launch_template_version` (a number, never `$Latest` or `$Default`, so a template edit
-changes nothing until the class names the new version), and a `spot_max_price_usd` no higher
-than its `price_per_hour_usd`.
+changes nothing until the class names the new version), and a `spot_max_price_usd` from
+0.001 (EC2's minimum) to its `price_per_hour_usd`.
 
 Each machine is one Spot instance launched by one instant EC2 Fleet (`CreateFleet`) of one
 instance. Every instance type in every zone of the class is one Spot pool, and the fleet

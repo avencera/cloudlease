@@ -567,18 +567,23 @@ validated!(
 validated!(
     /// The most an instance may cost per hour on the Spot market, in US dollars, such as
     /// `0.4`
+    ///
+    /// EC2 refuses a fleet whose max price is below $0.001.
     SpotMaxPrice,
-    "a Spot max price is a positive dollar amount with at most 6 decimals, such as 0.4",
+    "a Spot max price is a dollar amount from 0.001 with at most 6 decimals, such as 0.4",
     |value| {
         let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
         let digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+        // a price under a whole dollar needs a nonzero digit within its first 3 decimals
+        let at_least_a_tenth_cent = whole.bytes().any(|byte| byte != b'0')
+            || fraction.bytes().take(3).any(|byte| byte != b'0');
         !whole.is_empty()
             && whole.len() <= 6
             && digits(whole)
             && fraction.len() <= 6
             && digits(fraction)
             && !value.ends_with('.')
-            && value.bytes().any(|byte| matches!(byte, b'1'..=b'9'))
+            && at_least_a_tenth_cent
     }
 );
 
@@ -1479,11 +1484,15 @@ mod tests {
     }
 
     #[test]
-    fn a_spot_max_price_is_a_positive_dollar_amount() {
-        for valid in ["0.45", "1", "0.000001", "12.5"] {
+    fn a_spot_max_price_is_a_dollar_amount_ec2_accepts() {
+        for valid in ["0.45", "1", "0.001", "0.001000", "12.5", "10"] {
             assert!(SpotMaxPrice::parse(valid).is_ok(), "{valid}");
         }
-        for invalid in ["0", "0.0", "", ".5", "1.", "-1", "1e3", "0.0000001", "$1"] {
+        let below_ec2_minimum = ["0.000999", "0.0009", "0.000001"];
+        for invalid in ["0", "0.0", "", ".5", "1.", "-1", "1e3", "0.0000001", "$1"]
+            .into_iter()
+            .chain(below_ec2_minimum)
+        {
             assert!(SpotMaxPrice::parse(invalid).is_err(), "{invalid}");
         }
     }
