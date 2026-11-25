@@ -375,12 +375,16 @@ data "aws_iam_policy_document" "launch" {
   }
 }
 
-# CreateFleet has fewer condition keys than RunInstances: on the instance only the region, zone,
-# instance type and request tags. It has no ec2:InstanceMarketType, ec2:MetadataHttpTokens or
-# ec2:Tenancy, so those guarantees rest on the request the adapter sends (spot capacity, IMDSv2
-# per override) and on the launch template (IMDSv2, default tenancy); see the README. The
-# RunInstances statements above stay, in case CreateFleet also authorizes RunInstances
-# against the caller
+# What EC2 checks on an instant CreateFleet, probed as the Worker on 2026-11-25 with DryRun and
+# Deny-if-absent statements (see the README): the instance, the fleet and the root volume with
+# ec2:Region and the request tags; the launch template, the image and each subnet with their
+# usual keys. The instance check carries no ec2:AvailabilityZone, ec2:InstanceType or
+# ec2:Tenancy and the volume check no ec2:VolumeSize, although the Service Authorization
+# Reference lists them, so a condition on any of them can never match. The security group,
+# network interface, snapshot and Spot request are not checked at all. The zone rests on the
+# pinned subnets, IMDSv2 and the security group on the launch template, and Spot, the instance
+# type and the root volume size on the request the adapter sends. The RunInstances statements
+# above stay in case a fleet's launch is also authorized against the caller
 data "aws_iam_policy_document" "fleet" {
   statement {
     sid       = "CreateFleetOfTaggedInstance"
@@ -392,18 +396,6 @@ data "aws_iam_policy_document" "fleet" {
       test     = "StringEquals"
       variable = "ec2:Region"
       values   = [var.aws_region]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "ec2:AvailabilityZone"
-      values   = var.availability_zones
-    }
-
-    condition {
-      test     = "StringLike"
-      variable = "ec2:InstanceType"
-      values   = sort(tolist(var.allowed_instance_type_patterns))
     }
 
     condition {
@@ -449,11 +441,12 @@ data "aws_iam_policy_document" "fleet" {
     }
   }
 
+  # the fleet and the root volume carry the instance's tags
   statement {
-    sid       = "CreateTaggedFleet"
+    sid       = "CreateTaggedFleetAndRootVolume"
     effect    = "Allow"
     actions   = ["ec2:CreateFleet"]
-    resources = [local.fleet_arn]
+    resources = [local.fleet_arn, local.volume_arn]
 
     condition {
       test     = "StringEquals"
@@ -480,37 +473,13 @@ data "aws_iam_policy_document" "fleet" {
     }
   }
 
+  # each subnet sits in one allowed zone of this VPC, and the template's security group keeps a
+  # launch inside this VPC
   statement {
-    sid    = "FleetFromPinnedTemplateImageAndSubnets"
-    effect = "Allow"
-    actions = [
-      "ec2:CreateFleet",
-    ]
-    resources = concat(
-      [
-        aws_launch_template.machines.arn,
-        aws_security_group.machines.arn,
-        local.image_arn,
-        local.snapshot_arn,
-      ],
-      local.subnet_arns,
-    )
-
-    condition {
-      test     = "StringEquals"
-      variable = "ec2:Region"
-      values   = [var.aws_region]
-    }
-  }
-
-  # the interface is created in one of the subnets above and the volume from the pinned
-  # image; whether CreateFleet evaluates ec2:VolumeSize is unconfirmed, so the root volume's
-  # size is not capped here
-  statement {
-    sid       = "FleetNetworkInterfaceAndRootVolume"
+    sid       = "FleetFromPinnedTemplateImageAndSubnets"
     effect    = "Allow"
     actions   = ["ec2:CreateFleet"]
-    resources = [local.network_interface_arn, local.volume_arn]
+    resources = concat([aws_launch_template.machines.arn, local.image_arn], local.subnet_arns)
 
     condition {
       test     = "StringEquals"

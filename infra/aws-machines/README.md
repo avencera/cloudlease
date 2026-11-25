@@ -41,11 +41,10 @@ and version.
   launch the Worker also reads which of a run's live Spot requests are
   `marked-for-termination`, to leave out the pools taking a machine back.
 - **fleet:** `CreateFleet`, which the Worker launches with
-  - of instances in the listed zones and of the allowed instance-type patterns
-  - from this configuration's launch template, security group, pinned AMI (and its root
-    snapshot) and subnets, with a network interface and a root volume in the region
+  - from this configuration's launch template, pinned AMI and subnets, in the region
   - with the exact managed tag keys, `clm-managed=true` and `clm-kind=instance` on the
-    instance and the fleet; `CreateTags` of the fleet, instance and volume only as part of
+    instance, its root volume and the fleet, and `clm-owner`, `clm-gen`, `clm-until` and
+    `Name` on the instance; `CreateTags` of the fleet, instance and volume only as part of
     that `CreateFleet`
 - **launch:** `RunInstances` only, kept because whether `CreateFleet` also authorizes
   `RunInstances` against the caller is unconfirmed
@@ -65,26 +64,52 @@ IAM has no condition keys for the Spot request type, interruption behavior or ma
 adapter always sends a one-time request that terminates on interruption, with the class's max
 price, and the Worker's tests check the request it sends.
 
-### What the fleet policy cannot enforce
+### What EC2 checks on `CreateFleet`
 
-On `CreateFleet` the instance's condition keys are only the region, `ec2:AvailabilityZone`,
-`ec2:InstanceType` and the request tags (Service Authorization Reference). So, unlike the
-`RunInstances` statements, the fleet policy cannot require:
+The Service Authorization Reference lists more `CreateFleet` condition keys than EC2 sends.
+On 2026-11-25 the Worker's own user sent the adapter's request with `DryRun`, while the fleet
+policy held temporary statements that denied the call if a given key was absent. EC2 checked:
 
-- **Spot only.** `ec2:InstanceMarketType` is not a `CreateFleet` key. The adapter always sends
-  `DefaultTargetCapacityType=spot` with a total capacity of 1 and no On-Demand capacity, and
-  the launch template sets no market options. A caller with this key could launch an
-  On-Demand instance through a fleet.
-- **IMDSv2.** `ec2:MetadataHttpTokens` is not a `CreateFleet` key. Every override sends
-  `HttpTokens=required`, and the launch template requires IMDSv2 as well, so a fleet that
-  omitted the override still gets it.
-- **Default tenancy.** `ec2:Tenancy` is not a `CreateFleet` key. The adapter never sets a
-  tenancy and the template names none, so instances get the VPC's default tenancy.
-- **Root volume size.** Whether `CreateFleet` evaluates `ec2:VolumeSize` is unconfirmed, so
-  `max_root_volume_gib` caps only `RunInstances`. The class's `root_volume_gib` sets the size.
-- **Public IPv4 on the interface.** The interface statement names no subnet or
-  `ec2:AssociatePublicIpAddress` condition, since their `CreateFleet` keys are unconfirmed;
-  the subnet statement still pins the subnets, which assign a public IPv4 on launch.
+| Resource | Keys present | Keys absent |
+| --- | --- | --- |
+| `instance/*` | `ec2:Region`, `ec2:InstanceID` (`*`), `aws:RequestTag/*`, `aws:TagKeys` | `ec2:AvailabilityZone`, `ec2:InstanceType`, `ec2:Tenancy`, `ec2:RootDeviceType`, `ec2:EbsOptimized`, `ec2:PlacementGroup` |
+| `fleet/*` | `ec2:Region`, `aws:RequestTag/*`, `aws:TagKeys` | `ec2:FleetID` |
+| `volume/*` | `ec2:Region`, `ec2:VolumeID`, `aws:RequestTag/*`, `aws:TagKeys` | `ec2:VolumeSize`, `ec2:VolumeType`, `ec2:Encrypted`, `ec2:AvailabilityZone`, `ec2:ParentSnapshot`, `ec2:KmsKeyId` |
+| each subnet | `ec2:Region`, `ec2:Vpc`, `ec2:AvailabilityZone`, `ec2:SubnetID` | |
+| the image | `ec2:Region`, `ec2:ImageID`, `ec2:Owner`, `ec2:Public`, `ec2:RootDeviceType` | |
+| the launch template | `ec2:Region`, `ec2:ResourceTag/*` | |
+
+The security group, network interface, snapshot and Spot request are not checked at all. The
+first fleet policy required `ec2:AvailabilityZone` and `ec2:InstanceType` on the instance, so
+no request could match it and every launch failed with `UnauthorizedOperation`. A failure's
+encoded message names only the first resource refused, and its decoded context leaves out
+`ec2:Region` and the request tags even when EC2 sends them, so read it with that in mind; the
+Worker logs it (never in the ntfy alert) for `aws sts decode-authorization-message`.
+
+So the fleet policy pins what EC2 checks and cannot express the rest. Each guarantee rests on:
+
+- **Zone:** the subnets. The policy names only this configuration's subnets, one per listed
+  zone, and the template's security group belongs to this VPC, so a launch cannot leave it.
+- **Instance type:** the adapter, which sends only the class's types from `MACHINES_CONFIG`,
+  and the Worker's spend caps. IAM cannot cap the type of a fleet's instance.
+- **Spot only:** the adapter, which sends `DefaultTargetCapacityType=spot` with a total
+  capacity of 1 and no On-Demand capacity; the launch template sets no market options. A
+  caller with this key could launch an On-Demand instance through a fleet.
+- **IMDSv2:** the launch template, which requires it, and each override, which sends
+  `HttpTokens=required` again.
+- **Default tenancy:** the adapter, which never sets one, and the template, which names none.
+- **Root volume size:** the class's `root_volume_gib`. `max_root_volume_gib` caps only
+  `RunInstances`.
+- **Public IPv4 and the security group:** the template, which has no network interface block
+  and names the outbound-only group; a fleet cannot override the group, and the subnets assign
+  a public IPv4 on launch.
+- **Tags:** IAM refuses a wrong or missing managed tag on the fleet, and a wrong one on the
+  instance or volume. A request that leaves out the instance's or the volume's tag
+  specification entirely is not refused (as with rembuild's Spot request below), so that the
+  instance carries its tags rests on the adapter, which always sends all three.
+
+An instant fleet needs no `AWSServiceRoleForEC2Fleet` (EC2 Fleet prerequisites guide), and the
+account has none.
 
 A fleet cannot tag the Spot request it opens. Whether that request carries any tags is
 unconfirmed, so the adapter accepts an untagged one-time request as its instance's own and
@@ -92,7 +117,7 @@ never cancels it (the cleanup policy would refuse a cancel of an untagged reques
 with its instance. `CreateFleet` keeps a `ClientToken` for an unconfirmed time; the adapter
 never replays a launch whose answer was lost, and finds its instance by tags instead.
 
-An instant fleet needs no `AWSServiceRoleForEC2Fleet`, has no fleet-count quota, and is deleted
+An instant fleet has no fleet-count quota, and is deleted
 by EC2 some time after its instance terminates, so nothing here or in the Worker cleans fleets
 up.
 
