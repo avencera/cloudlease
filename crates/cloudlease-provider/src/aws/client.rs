@@ -205,8 +205,14 @@ impl<T: HttpTransport, R: Runtime> Ec2Client<T, R> {
             self.options.retry.max_retry_after,
         );
 
+        let authorization_message = xml
+            .as_ref()
+            .and_then(|fields| fields.message.as_deref())
+            .and_then(encoded_authorization_message);
+
         ProviderError::new(code, retryable, error_message(action, code, provider_code))
             .with_response(response.status, retry_after, request_id)
+            .with_authorization_message(authorization_message)
     }
 }
 
@@ -265,6 +271,25 @@ fn error_message(action: &str, code: ProviderErrorCode, provider_code: Option<&s
         || format!("AWS EC2 {action} request failed ({code:?})"),
         |value| format!("AWS EC2 {action} request failed with error code {value}"),
     )
+}
+
+/// The encoded part of an `UnauthorizedOperation` message, for the operator to decode with
+/// `aws sts decode-authorization-message`
+///
+/// Kept only when it looks like EC2's encoding (letters, digits, `-` and `_`) and is of a sane
+/// length, since it goes into logs as-is
+fn encoded_authorization_message(message: &str) -> Option<String> {
+    const MARKER: &str = "Encoded authorization failure message: ";
+    const MAX_LEN: usize = 16 * 1024;
+
+    let (_, rest) = message.split_once(MARKER)?;
+    let encoded = rest.split_whitespace().next()?;
+    let well_formed = encoded.len() <= MAX_LEN
+        && encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+
+    well_formed.then(|| encoded.to_owned())
 }
 
 /// Classifies an EC2 error code and HTTP status
@@ -339,6 +364,7 @@ pub(crate) fn classify_error(
 #[derive(Default)]
 struct ErrorFields {
     code: Option<String>,
+    message: Option<String>,
     request_id: Option<String>,
 }
 
@@ -353,6 +379,8 @@ fn parse_error_fields(body: &[u8]) -> Result<ErrorFields, ()> {
                 let name = start.local_name();
                 if name.as_ref() == b"Code" && fields.code.is_none() {
                     fields.code = Some(read_text(&mut reader, &start)?);
+                } else if name.as_ref() == b"Message" && fields.message.is_none() {
+                    fields.message = Some(read_text(&mut reader, &start)?);
                 } else if matches!(name.as_ref(), b"RequestId" | b"RequestID" | b"requestId")
                     && fields.request_id.is_none()
                 {
@@ -604,6 +632,46 @@ pub(super) mod tests {
 
         assert_eq!(error.code, ProviderErrorCode::PermissionDenied);
         assert!(error.message().contains("CreateSecurityGroup"));
+    }
+
+    #[test]
+    fn keeps_the_encoded_authorization_message_out_of_the_error_message() {
+        let transport = FakeTransport::with([status(
+            403,
+            b"<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>You are not \
+              authorized to perform this operation. User: arn:aws:iam::123456789012:user/w is \
+              not authorized to perform: ec2:CreateFleet on resource: \
+              arn:aws:ec2:us-east-1:123456789012:instance/* because no identity-based policy \
+              allows the ec2:CreateFleet action. Encoded authorization failure message: \
+              AbC-12_xyz</Message></Error></Errors></Response>",
+        )]);
+        let client = client(transport);
+
+        let error = block_on(client.call("CreateFleet", Vec::new(), AwsRequestSafety::ReadOnly))
+            .unwrap_err();
+
+        assert_eq!(error.authorization_message.as_deref(), Some("AbC-12_xyz"));
+        assert!(
+            !error.message().contains("AbC-12_xyz"),
+            "{}",
+            error.message()
+        );
+        assert!(!error.to_string().contains("AbC-12_xyz"), "{error}");
+    }
+
+    #[test]
+    fn drops_an_authorization_message_that_is_not_ec2_encoding() {
+        let transport = FakeTransport::with([status(
+            403,
+            b"<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>Encoded \
+              authorization failure message: a&lt;b</Message></Error></Errors></Response>",
+        )]);
+        let client = client(transport);
+
+        let error = block_on(client.call("CreateFleet", Vec::new(), AwsRequestSafety::ReadOnly))
+            .unwrap_err();
+
+        assert_eq!(error.authorization_message, None);
     }
 
     #[test]

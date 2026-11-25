@@ -52,6 +52,13 @@ pub struct ProviderError {
     pub retry_after: Option<Duration>,
     /// The provider request ID, when it sent one
     pub request_id: Option<String>,
+    /// The provider's encoded explanation of a refused authorization, such as EC2's "Encoded
+    /// authorization failure message"
+    ///
+    /// Opaque: only `sts:DecodeAuthorizationMessage` in the provider account reads it. It names
+    /// the policy context of the refusal, so it belongs in operator logs and never in the
+    /// message, alerts or answers to clients
+    pub authorization_message: Option<String>,
     message: String,
 }
 
@@ -65,6 +72,7 @@ impl ProviderError {
             status: None,
             retry_after: None,
             request_id: None,
+            authorization_message: None,
             message: message.into(),
         }
     }
@@ -80,6 +88,13 @@ impl ProviderError {
         self.status = Some(status);
         self.retry_after = retry_after;
         self.request_id = request_id;
+        self
+    }
+
+    /// Adds the provider's encoded authorization failure message
+    #[must_use]
+    pub fn with_authorization_message(mut self, encoded: Option<String>) -> Self {
+        self.authorization_message = encoded;
         self
     }
 

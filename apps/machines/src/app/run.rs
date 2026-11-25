@@ -626,6 +626,16 @@ impl Run {
             );
             return Ok(());
         }
+        // decoded with `aws sts decode-authorization-message`; it names the refused resource and
+        // its condition keys, so it goes to the Worker's log only, never to the ntfy alert
+        if let CloudleaseError::Provider(provider) = &error
+            && let Some(encoded) = &provider.authorization_message
+        {
+            worker::console_error!(
+                "create of {} was refused; authorization message: {encoded}",
+                record.hostname
+            );
+        }
 
         let now = runtime::now();
         let loaded = stores
