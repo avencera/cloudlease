@@ -86,9 +86,11 @@ Account-wide prerequisites this does not manage:
   need 256, which was us-east-1's quota on 2026-11-24, with no headroom
 
 The apply needs an identity that may create IAM users, policies and access keys under
-`/service-accounts/`. On 2026-11-24 the Mac mini's default `local-automation` user could create
-the network but was refused the IAM resources (its IAM writes reach only rembuild's user), so
-the IAM half and the access key were made with the account's admin profile.
+`/service-accounts/`. The first apply, on 2026-11-24, made the IAM half and the access key with
+the account's admin profile, because the Mac mini's default `local-automation` user could then
+manage only rembuild's IAM user. `infra/aws-operator` now grants `local-automation` exactly the
+IAM writes this configuration and the access key need, so it applies the whole configuration
+and rotates the key on its own.
 
 Applied on 2026-11-24 in us-east-1, with zones `us-east-1f`, `us-east-1b` and `us-east-1d` and
 AMI `ami-0a951420c495183dc`: 18 resources. The state and `terraform.tfvars` live on the Mac mini
