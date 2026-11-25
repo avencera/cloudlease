@@ -347,40 +347,7 @@ and `heartbeat_ttl_secs`) with mode `0600`, writes the client's files under a `0
 
 ## Tests
 
-`just test-worker` builds this Worker and runs `test/machines.worker.test.ts`,
-`test/phoenixnap.worker.test.ts`, `test/latitude.worker.test.ts` and `test/aws.worker.test.ts`
-in miniflare against the fake DigitalOcean API in `tests/worker/test`, fake phoenixNAP,
-Latitude.sh and EC2 Query APIs and a fake ntfy topic, then
-`test/optional-providers.bare.test.ts` against the same Worker without phoenixNAP,
-Latitude.sh or AWS credentials. It covers
-run and machine create idempotency, renew by lease token and refusal on another lease, a
-lapsed heartbeat, an immediate release, the hard deadline, `released` only after the droplet
-is gone, `max_machines`, both spend caps and a client's lower run cap, a failed
-create, a create whose pending record expired while it waited on the gate, a stalled run
-object whose droplet is past its hard deadline, and the sweep's orphan and failure alerts.
-The phoenixNAP suite covers a server's create with its location, tags and boot data, a
-location out of stock falling through to the next and the last failing the create with no
-spend counted, the permit of a create refused for stock coming back at once while one
-refused with a 503 stays held until cleanup, renew,
-release, heartbeat lapse and hard deadline each deleting the server and confirming it
-gone, the sweep deleting unclaimed servers and keeping a claimed one, the sweep still
-deleting a DigitalOcean orphan while phoenixNAP fails to list, and hourly billing:
-a 5 minute server costs an hour, and the second hour takes a run past its cap, and the
-idle hold: ten minutes before the hour ends, at once in the first hour, none inside the release
-margin or the boot grace after a later hour turns, and none past the run's deadline (a
-droplet's renew names none). The
-Latitude.sh suite covers the user data record and then the hourly server booting from it,
-a site out of stock falling through and the last one failing the create with its permit
-back at once, release and heartbeat lapse each deleting the server, then its record, and
-confirming both gone, the sweep deleting an unclaimed record and server past their ceiling,
-and a server listed only after its lease's cleanup gave up, swept as an orphan once 10
-minutes old. The AWS suite covers a one-time Spot launch with its type, zone, max price,
-tags and boot data, capacity errors moving through every zone of a type before the next
-type and the last failing the create with its permit back at once, release, heartbeat lapse
-and hard deadline each terminating the instance and confirming it gone, an interrupted
-instance ending its lease as `interrupted` once past the 2 minute grace and returning its
-permit, a present instance's lease kept with its
-next check a minute away, the sweep
-terminating an unclaimed instance past its ceiling and keeping a claimed one and another
-app's, per-second billing, and boot data over EC2's 16 KiB refused. The bare suite covers
-phoenixNAP, Latitude.sh and AWS classes refused without credentials.
+`just test-worker` builds this Worker and runs the suites in `test/` in miniflare against fake
+DigitalOcean, phoenixNAP, Latitude.sh and EC2 APIs and a fake ntfy topic; each test's name
+says what it covers. `test/optional-providers.bare.test.ts` runs the same Worker without
+phoenixNAP, Latitude.sh or AWS credentials.

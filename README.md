@@ -112,35 +112,14 @@ just test-worker  # builds tests/worker and apps/machines and runs their minifla
 just check        # all of the above
 ```
 
-The miniflare suite runs the test Worker against a fake DigitalOcean API, installed over
-`fetch`, and needs no account or token. It covers:
-
-- orphan droplets whose owner never existed, swept while another owner is mid-create
-- resources past their hard deadline or ceiling
-- live resources that must be kept
-- failing and stalled owners, unrecognized tags and malformed ceilings
-- capacity permit release
-- the owner alarm's delete-and-confirm loop, and a create that returns after its lease lapsed
-- the cron trigger
+The miniflare suites run against fake provider APIs, installed over `fetch`, and need no
+account or token; `tests/worker/test` and `apps/machines/test` hold them.
 
 ## Not covered yet
 
-- Some live paths. Each provider ran one live machine through the machines Worker on
-  2026-11-24 (create, join, idle release, confirmed gone; see the deploy runbook), but
+- Some live paths. Each provider has run a live machine through the machines Worker, but
   heartbeat-lapse and hard-deadline deletes ran live only on DigitalOcean, and out-of-stock
-  fall-through only on Latitude.sh. The AWS `CreateFleet` launch and a real Spot interruption
-  (AWS FIS) ran live on 2026-11-25 against Worker `026b0c31` after two IAM fixes:
-  - the first `CreateFleet` was refused at the fleet policy, which required the zone and
-    instance type that EC2 does not send on a fleet's instance check;
-  - the next passed that check, but every launch failed when the fleet's own `RunInstances`,
-    made as the Worker's user, tried to tag the root volume, which the launch policy did
-    not allow (`infra/aws-machines/README.md`, "What EC2 checks on `CreateFleet`").
-
-  With both fixed, a fleet launched, the interrupted job reran on a second machine and
-  succeeded. That run also found that the Worker read every fleet-launched instance as
-  unrecognized, because EC2 adds `aws:` tags to it, so its cleanup refused to terminate the
-  instance. The fix (`Aws::classify` leaves `aws:` tags out) is not deployed yet, so on the
-  live Worker every AWS instance must be terminated by hand. How long EC2 keeps a `ClientToken` is unconfirmed
+  fall-through only on Latitude.sh. How long EC2 keeps a `ClientToken` is unconfirmed
 - Firewalls on DigitalOcean, phoenixNAP and Latitude.sh. `firewall::IngressPolicy` has only
   the AWS shared security group implementation
 - Batch-job records and exit status. These belong to the app, which builds on holdings
