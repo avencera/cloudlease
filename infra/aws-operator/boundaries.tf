@@ -31,7 +31,66 @@ locals {
   }
 }
 
+# Shared by both boundaries. A launch from an encrypted snapshot, such as rembuild's AMI under
+# the account's aws/ebs key, has EC2 call KMS as the user; the key policy grants that only
+# through EC2, and so does this. Same-account resource policies that name the user can grant
+# past a boundary's implicit deny, so everything else outside EC2 is denied outright
+data "aws_iam_policy_document" "boundary_common" {
+  for_each = {
+    machines = var.machines_regions
+    rembuild = var.rembuild_regions
+  }
+
+  statement {
+    sid = "EbsKeysThroughEc2"
+    actions = [
+      "kms:CreateGrant",
+      "kms:Decrypt",
+      "kms:DescribeKey",
+      "kms:Encrypt",
+      "kms:GenerateDataKey*",
+      "kms:ReEncrypt*",
+    ]
+    resources = [for region in each.value : "arn:${local.partition}:kms:${region}:${var.aws_account_id}:key/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = [for region in each.value : "ec2.${region}.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:CallerAccount"
+      values   = [var.aws_account_id]
+    }
+  }
+
+  statement {
+    sid         = "NothingButEc2AndEbsKeys"
+    effect      = "Deny"
+    not_actions = ["ec2:*", "kms:*"]
+    resources   = ["*"]
+  }
+
+  # a missing kms:ViaService (a direct call) matches too
+  statement {
+    sid       = "KmsOnlyThroughEc2"
+    effect    = "Deny"
+    actions   = ["kms:*"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringNotEquals"
+      variable = "kms:ViaService"
+      values   = [for region in each.value : "ec2.${region}.amazonaws.com"]
+    }
+  }
+}
+
 data "aws_iam_policy_document" "machines_boundary" {
+  source_policy_documents = [data.aws_iam_policy_document.boundary_common["machines"].json]
+
   statement {
     sid       = "Inventory"
     actions   = ["ec2:DescribeInstances", "ec2:DescribeSpotInstanceRequests"]
@@ -113,18 +172,11 @@ data "aws_iam_policy_document" "machines_boundary" {
       values   = ["true"]
     }
   }
-
-  # same-account resource policies that name the user can grant past an implicit deny in a
-  # boundary, so everything outside EC2 is denied outright
-  statement {
-    sid         = "NothingButEc2"
-    effect      = "Deny"
-    not_actions = ["ec2:*"]
-    resources   = ["*"]
-  }
 }
 
 data "aws_iam_policy_document" "rembuild_boundary" {
+  source_policy_documents = [data.aws_iam_policy_document.boundary_common["rembuild"].json]
+
   statement {
     sid = "Inventory"
     actions = [
@@ -249,15 +301,6 @@ data "aws_iam_policy_document" "rembuild_boundary" {
       variable = "ec2:ResourceTag/rb-managed"
       values   = local.rembuild_managed_values
     }
-  }
-
-  # same-account resource policies that name the user can grant past an implicit deny in a
-  # boundary, so everything outside EC2 is denied outright
-  statement {
-    sid         = "NothingButEc2"
-    effect      = "Deny"
-    not_actions = ["ec2:*"]
-    resources   = ["*"]
   }
 }
 

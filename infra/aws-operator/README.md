@@ -33,9 +33,16 @@ volume size and exact tag sets). The boundaries leave those out on purpose, so m
 AMI or subnet stays an operator change and does not need an administrator.
 
 Neither boundary allows IAM, STS, S3 or any service besides EC2, another region, or the other
-app's instances. Each also denies everything outside EC2 outright, because a same-account
-resource policy (an S3 bucket policy, say) that names the user would otherwise grant past a
-boundary's implicit deny. Changing what a service user may do beyond that means changing its boundary
+app's instances. Each also denies everything outside EC2 and KMS outright, because a
+same-account resource policy (an S3 bucket policy, say) that names the user would otherwise grant
+past a boundary's implicit deny.
+
+KMS is allowed only through EC2 (`kms:ViaService` of `ec2.<region>.amazonaws.com`), on this
+account's keys in the user's regions, and every other KMS call is denied. A launch from an
+encrypted snapshot has EC2 call KMS as the user: rembuild's AMI snapshot is encrypted with the
+account's `aws/ebs` key, whose key policy grants exactly that. Without it the instance ends at
+once with `Client.InvalidKMSKey.InvalidState`, which is how the first rollout of these
+boundaries broke rembuild builds for three minutes on 2026-11-24. Changing what a service user may do beyond that means changing its boundary
 here, with administrator credentials.
 
 When rembuild drops its legacy tag shape, remove `rembuild` from `rembuild_managed_values` in
