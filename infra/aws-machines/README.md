@@ -42,9 +42,8 @@ instance, and an AWS FIS interruption of it ran end to end.
 ## What the policies allow
 
 - **inventory:** `DescribeInstances` and `DescribeSpotInstanceRequests` in the region. The
-  sweep lists by the `clm-managed` tag key; describes cannot be scoped by tag. Before each
-  launch the Worker also reads which of a run's live Spot requests are
-  `marked-for-termination`, to leave out the pools taking a machine back.
+  sweep lists by the `clm-managed` tag key; describes cannot be scoped by tag. Cleanup reads
+  an instance's Spot request before it terminates the instance.
 - **fleet:** `CreateFleet`, which the Worker launches with
   - from this configuration's launch template, pinned AMI and subnets, in the region
   - with the exact managed tag keys, `clm-managed=true` and `clm-kind=instance` on the

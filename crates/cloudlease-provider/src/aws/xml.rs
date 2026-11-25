@@ -1,7 +1,5 @@
 //! Typed decoding of EC2 Query API responses
 
-use chrono::NaiveDateTime;
-use cloudlease_core::time::UnixMillis;
 use quick_xml::de::from_reader;
 use serde::{Deserialize, de::DeserializeOwned};
 
@@ -9,8 +7,7 @@ use super::ec2::{
     AwsImage, AwsInstance, AwsInstanceDetails, AwsInstanceState, AwsInstanceType,
     AwsInstanceVolume, AwsSecurityGroup, AwsSecurityGroupIngress, AwsSpotInstanceRequest,
     AwsSpotInstanceRequestState, AwsSpotInstanceRequestType, AwsSpotInterruptionBehavior,
-    AwsStateReason, AwsSubnet, AwsTag, CreateFleetResponse, FleetError, FleetInstances,
-    FleetOverrides, RetiredPlacement,
+    AwsSubnet, AwsTag, CreateFleetResponse, FleetError, FleetInstances, FleetOverrides,
 };
 use crate::error::{ProviderError, ProviderErrorCode, ProviderResult};
 
@@ -508,14 +505,8 @@ struct SpotInstanceRequestResponse {
     request_type: Option<String>,
     #[serde(rename = "instanceInterruptionBehavior")]
     interruption_behavior: Option<String>,
-    status: Option<SpotRequestStatusResponse>,
     #[serde(rename = "tagSet", default)]
     tags: ItemSet<TagResponse>,
-}
-
-#[derive(Deserialize)]
-struct SpotRequestStatusResponse {
-    code: Option<String>,
 }
 
 impl TryFrom<SpotInstanceRequestResponse> for AwsSpotInstanceRequest {
@@ -530,7 +521,6 @@ impl TryFrom<SpotInstanceRequestResponse> for AwsSpotInstanceRequest {
             interruption_behavior: parse_spot_interruption_behavior(
                 non_empty(value.interruption_behavior).as_deref(),
             ),
-            status_code: non_empty(value.status.and_then(|status| status.code)),
             tags: value
                 .tags
                 .items
@@ -566,10 +556,6 @@ struct InstanceResponse {
     spot_instance_request_id: Option<String>,
     #[serde(rename = "metadataOptions")]
     metadata_options: Option<MetadataOptionsResponse>,
-    #[serde(rename = "stateReason")]
-    state_reason: Option<StateReasonResponse>,
-    #[serde(rename = "reason")]
-    transition_reason: Option<String>,
     #[serde(rename = "tagSet", default)]
     tags: ItemSet<TagResponse>,
 }
@@ -587,29 +573,9 @@ impl TryFrom<InstanceResponse> for AwsInstance {
             .map(TryInto::try_into)
             .collect::<ProviderResult<_>>()?;
         let spot_instance_request_id = non_empty(value.spot_instance_request_id);
-        let state_reason = value
-            .state_reason
-            .and_then(|reason| non_empty(reason.code))
-            .map(|code| AwsStateReason {
-                code,
-                at: value
-                    .transition_reason
-                    .as_deref()
-                    .and_then(parse_transition_time),
-            });
         if state.is_retiring() {
-            let placement = RetiredPlacement {
-                instance_type: non_empty(value.instance_type),
-                availability_zone: value
-                    .placement
-                    .and_then(|placement| non_empty(placement.availability_zone)),
-            };
-            let instance = Self::retiring(id, state, placement, tags)?;
-            return Ok(with_extras(
-                instance,
-                spot_instance_request_id,
-                state_reason,
-            ));
+            let instance = Self::retiring(id, state, tags)?;
+            return Ok(with_request_id(instance, spot_instance_request_id));
         }
 
         let volumes = value
@@ -651,42 +617,15 @@ impl TryFrom<InstanceResponse> for AwsInstance {
             tags,
         )?;
 
-        Ok(with_extras(
-            instance,
-            spot_instance_request_id,
-            state_reason,
-        ))
+        Ok(with_request_id(instance, spot_instance_request_id))
     }
 }
 
-fn with_extras(
-    instance: AwsInstance,
-    spot_instance_request_id: Option<String>,
-    state_reason: Option<AwsStateReason>,
-) -> AwsInstance {
-    let instance = match spot_instance_request_id {
+fn with_request_id(instance: AwsInstance, spot_instance_request_id: Option<String>) -> AwsInstance {
+    match spot_instance_request_id {
         Some(id) => instance.with_spot_instance_request_id(id),
         None => instance,
-    };
-    match state_reason {
-        Some(reason) => instance.with_state_reason(reason),
-        None => instance,
     }
-}
-
-/// Reads the time from a transition reason such as
-/// `User initiated (2026-11-24 18:30:00 GMT)`
-///
-/// EC2 documents this form for user-initiated changes; whether a Spot interruption's reason
-/// carries a time is unconfirmed, so a reason without one yields `None`.
-fn parse_transition_time(reason: &str) -> Option<UnixMillis> {
-    let (_, rest) = reason.rsplit_once('(')?;
-    let inner = rest.strip_suffix(')')?;
-    let time = NaiveDateTime::parse_from_str(inner, "%Y-%m-%d %H:%M:%S GMT").ok()?;
-
-    u64::try_from(time.and_utc().timestamp_millis())
-        .ok()
-        .and_then(UnixMillis::new)
 }
 
 fn parse_instance_state(state: &str) -> AwsInstanceState {
@@ -778,11 +717,6 @@ struct InstanceSecurityGroupResponse {
 }
 
 #[derive(Deserialize)]
-struct StateReasonResponse {
-    code: Option<String>,
-}
-
-#[derive(Deserialize)]
 struct MetadataOptionsResponse {
     #[serde(rename = "httpTokens")]
     http_tokens: Option<String>,
@@ -795,7 +729,6 @@ mod tests {
         AwsSpotInterruptionBehavior, parse_create_fleet, parse_image, parse_instance_page,
         parse_security_group_page, parse_spot_instance_requests,
     };
-    use crate::aws::ec2::{MARKED_FOR_TERMINATION, SPOT_INSTANCE_TERMINATION};
 
     #[test]
     fn parses_spot_request_state_and_launch_policy() {
@@ -808,11 +741,6 @@ mod tests {
                         <state>active</state>
                         <type>persistent</type>
                         <instanceInterruptionBehavior>stop</instanceInterruptionBehavior>
-                        <status>
-                            <code>marked-for-termination</code>
-                            <updateTime>2026-11-24T22:00:00.000Z</updateTime>
-                            <message>Your Spot Instance has been marked for termination.</message>
-                        </status>
                         <tagSet>
                             <item><key>rb-managed</key><value>rembuild</value></item>
                         </tagSet>
@@ -831,7 +759,6 @@ mod tests {
             AwsSpotInterruptionBehavior::Stop
         );
         assert_eq!(request.instance_id.as_deref(), Some("i-0123456789abcdef0"));
-        assert_eq!(request.status_code.as_deref(), Some(MARKED_FOR_TERMINATION));
     }
 
     #[test]
@@ -964,51 +891,6 @@ mod tests {
 
         assert_eq!(instance.state(), AwsInstanceState::Terminated);
         assert!(instance.details().is_none());
-        assert!(instance.state_reason().is_none());
-    }
-
-    #[test]
-    fn keeps_the_pool_and_state_reason_of_an_interrupted_instance() {
-        let body = br#"
-            <DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
-                <reservationSet>
-                    <item>
-                        <instancesSet>
-                            <item>
-                                <instanceId>i-01234567</instanceId>
-                                <instanceState><name>terminated</name></instanceState>
-                                <instanceType>c8a.4xlarge</instanceType>
-                                <placement><availabilityZone>us-east-1a</availabilityZone></placement>
-                                <reason>Service initiated (2026-11-24 18:30:00 GMT)</reason>
-                                <stateReason>
-                                    <code>Server.SpotInstanceTermination</code>
-                                    <message>Server.SpotInstanceTermination: Spot instance termination</message>
-                                </stateReason>
-                            </item>
-                            <item>
-                                <instanceId>i-89abcdef</instanceId>
-                                <instanceState><name>terminated</name></instanceState>
-                                <reason></reason>
-                                <stateReason><code>Server.SpotInstanceTermination</code></stateReason>
-                            </item>
-                        </instancesSet>
-                    </item>
-                </reservationSet>
-            </DescribeInstancesResponse>
-        "#;
-
-        let page = parse_instance_page(body).unwrap();
-
-        let timed = &page.items[0];
-        assert_eq!(timed.instance_type(), Some("c8a.4xlarge"));
-        assert_eq!(timed.availability_zone(), Some("us-east-1a"));
-        let reason = timed.state_reason().unwrap();
-        assert_eq!(reason.code, SPOT_INSTANCE_TERMINATION);
-        assert_eq!(reason.at.unwrap().as_millis(), 1_795_545_000_000);
-        // a reason without a time still names the code
-        let untimed = &page.items[1];
-        assert_eq!(untimed.instance_type(), None);
-        assert_eq!(untimed.state_reason().unwrap().at, None);
     }
 
     #[test]

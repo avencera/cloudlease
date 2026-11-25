@@ -139,10 +139,8 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
   With both fixed, a fleet launched, the interrupted job reran on a second machine and
   succeeded. That run also found that the Worker read every fleet-launched instance as
   unrecognized, because EC2 adds `aws:` tags to it, so its cleanup refused to terminate the
-  instance and its interruption read did not leave out the interrupted pool. The fix
-  (`Aws::classify` leaves `aws:` tags out) is not deployed yet, so on the live Worker every
-  AWS instance must be terminated by hand, and leaving out an interrupted pool has run only
-  against the fake EC2. How long EC2 keeps a `ClientToken` is unconfirmed
+  instance. The fix (`Aws::classify` leaves `aws:` tags out) is not deployed yet, so on the
+  live Worker every AWS instance must be terminated by hand. How long EC2 keeps a `ClientToken` is unconfirmed
 - Firewalls on DigitalOcean, phoenixNAP and Latitude.sh. `firewall::IngressPolicy` has only
   the AWS shared security group implementation
 - Batch-job records and exit status. These belong to the app, which builds on holdings

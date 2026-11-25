@@ -11,7 +11,6 @@ use std::{
 use cloudlease_core::{
     ids::{Generation, OwnerId, ResourceId, TagPrefix},
     tags::{OwnerTags, TagMatch, TagScheme, UnrecognizedReason},
-    time::UnixMillis,
 };
 use cloudlease_provider::{
     aws::{
@@ -19,11 +18,10 @@ use cloudlease_provider::{
         AwsInstanceSpec, AwsInstanceState, AwsInstanceType, AwsKind, AwsRegion, AwsRegions,
         AwsSecurityGroup, AwsSecurityGroupIngress, AwsSpotInstanceRequest,
         AwsSpotInstanceRequestState, AwsSpotInstanceRequestType, AwsSpotInterruptionBehavior,
-        AwsStateReason, AwsSubnet, AwsTag, CreateFleetRequest, CreateFleetResponse, Ec2,
-        FleetError, FleetInstances, FleetOverrides, IdempotencyKey, InstanceFilter, InstanceName,
-        InstanceType, LaunchPools, LaunchTemplate, LaunchTemplateId, MARKED_FOR_TERMINATION,
-        RegionalSpec, RetiredPlacement, SPOT_INSTANCE_TERMINATION, SecurityGroupId,
-        SharedSecurityGroup, SpotHistory, SpotMaxPrice, SpotPool, SubnetId, TcpIngress, UserData,
+        AwsSubnet, AwsTag, CreateFleetRequest, CreateFleetResponse, Ec2, FleetError,
+        FleetInstances, FleetOverrides, IdempotencyKey, InstanceFilter, InstanceName, InstanceType,
+        LaunchPools, LaunchTemplate, LaunchTemplateId, RegionalSpec, SecurityGroupId,
+        SharedSecurityGroup, SpotMaxPrice, SpotPool, SubnetId, TcpIngress, UserData,
     },
     error::{ProviderError, ProviderErrorCode, ProviderResult},
     firewall::{IngressPolicy, SourceCidr},
@@ -37,8 +35,6 @@ const VPC: &str = "vpc-01234567";
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Call {
     Fleet { pools: Vec<String>, token: String },
-    // one DescribeSpotInstanceRequests by status code, with the request IDs it named
-    SpotStatus(Vec<String>),
     Cancel(String),
     Terminate(String),
     Authorize(String, String),
@@ -49,7 +45,6 @@ struct FakeSpot {
     instance_id: String,
     state: AwsSpotInstanceRequestState,
     request_type: AwsSpotInstanceRequestType,
-    status_code: String,
     tags: Vec<AwsTag>,
 }
 
@@ -87,13 +82,7 @@ impl FakeEc2 {
 
     fn add_instance(&self, id: &str, state: AwsInstanceState, tags: Vec<AwsTag>, spot: bool) {
         let mut instance = if state.is_retiring() {
-            AwsInstance::retiring(
-                id.to_owned(),
-                state,
-                RetiredPlacement::default(),
-                tags.clone(),
-            )
-            .unwrap()
+            AwsInstance::retiring(id.to_owned(), state, tags.clone()).unwrap()
         } else {
             AwsInstance::present(id.to_owned(), state, details("c7a.2xlarge"), tags.clone())
                 .unwrap()
@@ -108,47 +97,11 @@ impl FakeEc2 {
                     instance_id: id.to_owned(),
                     state: AwsSpotInstanceRequestState::Active,
                     request_type: AwsSpotInstanceRequestType::Persistent,
-                    status_code: "fulfilled".to_owned(),
                     tags,
                 },
             );
         }
         fake.instances.insert(id.to_owned(), instance);
-    }
-
-    // terminates an instance as EC2 does with `reason` and keeps it listed, with its type
-    // and zone, as EC2 does for about an hour
-    fn retire(&self, id: &str, reason: &str, at: Option<u64>) {
-        let mut fake = self.0.borrow_mut();
-        let instance = fake.instances[id].clone();
-        let details = instance.details().cloned().unwrap();
-        let retired = AwsInstance::retiring(
-            id.to_owned(),
-            AwsInstanceState::Terminated,
-            RetiredPlacement {
-                instance_type: Some(details.instance_type),
-                availability_zone: Some(details.availability_zone),
-            },
-            instance.tags().to_vec(),
-        )
-        .unwrap()
-        .with_state_reason(AwsStateReason {
-            code: reason.to_owned(),
-            at: at.and_then(UnixMillis::new),
-        });
-        fake.instances.insert(id.to_owned(), retired);
-    }
-
-    // gives an instance EC2's two-minute interruption notice, which marks its Spot request and
-    // leaves it running until EC2 terminates it
-    fn mark_for_termination(&self, id: &str) {
-        let mut fake = self.0.borrow_mut();
-        let request_id = fake.instances[id]
-            .spot_instance_request_id()
-            .unwrap()
-            .to_owned();
-        fake.spot_requests.get_mut(&request_id).unwrap().status_code =
-            MARKED_FOR_TERMINATION.to_owned();
     }
 
     fn ingress(&self) -> Vec<AwsSecurityGroupIngress> {
@@ -349,32 +302,6 @@ impl Ec2 for FakeEc2 {
         ready(Ok(requests))
     }
 
-    fn describe_spot_instance_requests_with_status(
-        &self,
-        spot_instance_request_ids: Vec<String>,
-        status_code: &'static str,
-    ) -> LocalFuture<'_, ProviderResult<Vec<AwsSpotInstanceRequest>>> {
-        let mut fake = self.0.borrow_mut();
-        fake.calls
-            .push(Call::SpotStatus(spot_instance_request_ids.clone()));
-        // EC2 refuses the whole call when it names a request that does not exist
-        if let Some(missing) = spot_instance_request_ids
-            .iter()
-            .find(|id| !fake.spot_requests.contains_key(*id))
-        {
-            return ready(Err(not_found(&format!("no Spot request {missing}"))));
-        }
-        let requests = spot_instance_request_ids
-            .iter()
-            .map(|id| (id, &fake.spot_requests[id]))
-            .filter(|(_, request)| request.status_code == status_code)
-            .map(|(id, request)| spot(id, request))
-            .collect();
-        ready(Ok(requests))
-    }
-
-    // launches in the first pool, by the order sent, that has capacity; EC2 would pick by
-    // price and capacity instead, which the adapter does not depend on
     fn create_fleet(
         &self,
         request: CreateFleetRequest,
@@ -443,7 +370,6 @@ impl Ec2 for FakeEc2 {
                     instance_id: id.clone(),
                     state: AwsSpotInstanceRequestState::Active,
                     request_type: AwsSpotInstanceRequestType::OneTime,
-                    status_code: "fulfilled".to_owned(),
                     tags: Vec::new(),
                 },
             );
@@ -474,7 +400,6 @@ impl Ec2 for FakeEc2 {
         let terminated = AwsInstance::retiring(
             instance_id.clone(),
             AwsInstanceState::Terminated,
-            RetiredPlacement::default(),
             instance.tags().to_vec(),
         )
         .unwrap();
@@ -493,7 +418,6 @@ fn spot(id: &str, request: &FakeSpot) -> AwsSpotInstanceRequest {
             AwsSpotInstanceRequestType::OneTime => AwsSpotInterruptionBehavior::Terminate,
             _ => AwsSpotInterruptionBehavior::Stop,
         },
-        status_code: Some(request.status_code.clone()),
         tags: request.tags.clone(),
     }
 }
@@ -840,124 +764,6 @@ fn deleting_a_fleet_instance_accepts_its_untagged_one_time_spot_request() {
         .tags = pairs(&self::owner("prj_2", 1));
     let error = block_on(aws.delete_owned(&owner, &id)).unwrap_err();
     assert_eq!(error.code, ProviderErrorCode::InvariantViolation);
-}
-
-#[test]
-fn interruptions_name_the_pools_that_took_an_owners_instances_back() {
-    let ec2 = FakeEc2::default();
-    let aws = Aws::new(ec2, scheme());
-    let mut ids = Vec::new();
-    for (generation, instance_type) in [(1, "c7a.2xlarge"), (2, "c7i.2xlarge"), (3, "m7a.2xlarge")]
-    {
-        ids.push(
-            block_on(aws.create(&owner("prj_1", generation), &spec(&[instance_type]))).unwrap(),
-        );
-    }
-    let other_owner = block_on(aws.create(&owner("prj_2", 1), &spec(&["c7a.2xlarge"]))).unwrap();
-    aws.ec2()
-        .retire(ids[0].as_str(), SPOT_INSTANCE_TERMINATION, Some(1_000));
-    aws.ec2()
-        .retire(ids[1].as_str(), "Client.UserInitiatedShutdown", None);
-    aws.ec2()
-        .retire(other_owner.as_str(), SPOT_INSTANCE_TERMINATION, None);
-    let regions = AwsRegions::new([(AwsRegion::parse("us-east-1").unwrap(), &aws)]).unwrap();
-
-    let interruptions = block_on(regions.spot_interruptions(
-        &AwsRegion::parse("us-east-1").unwrap(),
-        &OwnerId::parse("prj_1").unwrap(),
-    ))
-    .unwrap();
-
-    // every generation of the owner counts, a user's own termination does not
-    assert_eq!(interruptions.len(), 1);
-    assert_eq!(interruptions[0].instance_type.as_str(), "c7a.2xlarge");
-    assert_eq!(interruptions[0].availability_zone.as_str(), "us-east-1a");
-    assert_eq!(interruptions[0].at, UnixMillis::new(1_000));
-    assert!(
-        block_on(regions.spot_interruptions(
-            &AwsRegion::parse("us-west-2").unwrap(),
-            &OwnerId::parse("prj_1").unwrap(),
-        ))
-        .is_err()
-    );
-}
-
-#[test]
-fn a_running_instance_marked_for_termination_counts_as_an_interruption_now() {
-    let aws = Aws::new(FakeEc2::default(), scheme());
-    let noticed = block_on(aws.create(&owner("prj_1", 1), &spec(&["c7a.2xlarge"]))).unwrap();
-    let healthy = block_on(aws.create(&owner("prj_1", 2), &spec(&["c7i.2xlarge"]))).unwrap();
-    let interrupted = block_on(aws.create(&owner("prj_1", 3), &spec(&["m7a.2xlarge"]))).unwrap();
-    let other_owner = block_on(aws.create(&owner("prj_2", 1), &spec(&["c7a.2xlarge"]))).unwrap();
-    aws.ec2().mark_for_termination(noticed.as_str());
-    aws.ec2().mark_for_termination(other_owner.as_str());
-    aws.ec2()
-        .retire(interrupted.as_str(), SPOT_INSTANCE_TERMINATION, Some(1_000));
-    let calls_before = aws.ec2().calls().len();
-
-    let interruptions =
-        block_on(aws.spot_interruptions(&OwnerId::parse("prj_1").unwrap())).unwrap();
-
-    // the noticed instance's pool counts as interrupted now, beside the terminated one
-    let mut named: Vec<_> = interruptions
-        .iter()
-        .map(|interruption| {
-            (
-                interruption.instance_type.as_str(),
-                interruption.availability_zone.as_str(),
-                interruption.at,
-            )
-        })
-        .collect();
-    named.sort();
-    assert_eq!(
-        named,
-        [
-            ("c7a.2xlarge", "us-east-1a", None),
-            ("m7a.2xlarge", "us-east-1a", UnixMillis::new(1_000)),
-        ]
-    );
-    // one call names every live instance's request, not one call per instance
-    let mut expected = vec![format!("sir-{noticed}"), format!("sir-{healthy}")];
-    expected.sort();
-    assert_eq!(
-        aws.ec2().calls()[calls_before..],
-        [Call::SpotStatus(expected)]
-    );
-    assert_eq!(
-        aws.ec2().0.borrow().instances[noticed.as_str()].state(),
-        AwsInstanceState::Pending
-    );
-
-    // a history with no live instance makes no request call
-    let calls = aws.ec2().calls().len();
-    assert_eq!(
-        block_on(aws.spot_interruptions(&OwnerId::parse("prj_3").unwrap())).unwrap(),
-        []
-    );
-    assert_eq!(aws.ec2().calls().len(), calls);
-}
-
-#[test]
-fn a_failed_spot_request_read_keeps_the_terminated_history() {
-    let ec2 = FakeEc2::default();
-    let aws = Aws::new(ec2, scheme());
-    let id = block_on(aws.create(&owner("prj_1", 1), &spec(&["c7a.2xlarge"]))).unwrap();
-    let interrupted = block_on(aws.create(&owner("prj_1", 2), &spec(&["m7a.2xlarge"]))).unwrap();
-    aws.ec2()
-        .retire(interrupted.as_str(), SPOT_INSTANCE_TERMINATION, Some(1_000));
-    aws.ec2()
-        .0
-        .borrow_mut()
-        .spot_requests
-        .remove(&format!("sir-{id}"));
-
-    let interruptions =
-        block_on(aws.spot_interruptions(&OwnerId::parse("prj_1").unwrap())).unwrap();
-
-    // EC2 refuses the whole read for a request it no longer lists
-    assert_eq!(interruptions.len(), 1);
-    assert_eq!(interruptions[0].instance_type.as_str(), "m7a.2xlarge");
 }
 
 #[test]

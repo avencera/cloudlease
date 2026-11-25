@@ -178,16 +178,9 @@ key-value tags `{prefix}-managed=true`, `-owner`, `-gen`, `-kind=instance`, `-un
 untagged one-time request as the instance's own and never cancels it: it closes with the
 instance.
 
-Before each launch the run leaves out the pools that took one of its machines back in the last
-hour, or are taking one back now: it lists the run's instances by their owner tag, terminated
-ones included (EC2 lists them for about an hour), and leaves out the type and zone of each one
-whose state reason is `Server.SpotInstanceTermination`. A machine EC2 has given its two-minute
-interruption notice still runs, and homebased asks for its replacement within that time, so
-one `DescribeSpotInstanceRequests` call over the Spot requests of the run's other live
-instances also leaves out the pool of each one whose request is `marked-for-termination`. The
-run logs the pools it left out. If that leaves no pool, the launch offers them all. If the
-instance list fails, the launch offers every pool; if only the Spot request read fails, such as
-for a request EC2 no longer lists, the terminated instances still count.
+A launch offers every pool of the class each time, including one that just took a machine
+of the run back: EC2's allocation already steers away from pools short of Spot capacity, and a
+replacement interrupted again only uses one more of the job's retries.
 
 The fleet reports the pool it launched in by its override, and an instant fleet also reports
 the instance's zone and subnet beside it; the launch reads either, so a launched instance is
@@ -217,10 +210,10 @@ reports `"aws": false` on health when a class needs them. `infra/aws-machines` h
 network, security group, launch template and IAM policy as Terraform.
 
 homebased sees an interrupted machine's lease released with reason `interrupted`, which it
-reads as an unknown reason that may have lost output, as for `heartbeat_lapsed`. An AWS
-machine's `lease.json` also carries `"interruption_notice": "aws_imds"`, so the machine
-watches the EC2 instance metadata service for the Spot interruption notice EC2 posts about two
-minutes before it takes the instance back.
+reads as an unknown reason that may have lost output, as for `heartbeat_lapsed`, and reruns
+the job. The run object checks a live AWS lease's instance every minute once it is 2 minutes
+old, so an interrupted lease ends about a minute after EC2 takes the instance; the job reruns
+only after the old instance is gone.
 
 ## Paid-hour idle hold
 
@@ -354,8 +347,7 @@ Every class has `price_per_hour_usd`, `max_hours`, and optionally `boot_grace_se
 The machine's user data is a POSIX `sh` script, which DigitalOcean runs at first boot and
 phoenixNAP, Latitude.sh and EC2 pass to cloud-init. It logs to `/var/log/cloudlease-boot.log`, writes
 `/etc/cloudlease/lease.json` (`lease_id`, `token`, `api_base`, `hard_deadline_at`,
-`heartbeat_ttl_secs`, and `interruption_notice` for a provider that can take the machine back:
-`aws_imds` for AWS, absent otherwise) with mode `0600`, formats and mounts the volume when the class has
+and `heartbeat_ttl_secs`) with mode `0600`, formats and mounts the volume when the class has
 one, writes the client's files under a `077` umask, and runs its commands in order.
 
 ## Tests
@@ -392,8 +384,7 @@ tags and boot data, capacity errors moving through every zone of a type before t
 type and the last failing the create with its permit back at once, release, heartbeat lapse
 and hard deadline each terminating the instance and confirming it gone, an interrupted
 instance ending its lease as `interrupted` once past the 2 minute grace and returning its
-permit, the pool of an interrupted machine, or of one EC2 has given its interruption notice
-and still runs, left out of the run's next launch, a present instance's lease kept with its
+permit, a present instance's lease kept with its
 next check a minute away, the sweep
 terminating an unclaimed instance past its ceiling and keeping a claimed one and another
 app's, per-second billing, and boot data over EC2's 16 KiB refused. The bare suite covers

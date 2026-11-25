@@ -30,9 +30,6 @@ export interface Instance {
   allocationStrategy: string | null;
   maxPrice: string | null;
   spotRequestId: string | null;
-  // why EC2 last changed the state, such as Server.SpotInstanceTermination
-  stateReason: string | null;
-  terminatedAt: number | null;
   tags: Tag[];
 }
 
@@ -49,8 +46,6 @@ export interface SpotRequest {
   state: "active" | "closed" | "cancelled";
   type: string;
   interruptionBehavior: string;
-  // the status code of EC2's latest evaluation, such as marked-for-termination
-  statusCode: string;
   tags: Tag[];
 }
 
@@ -92,8 +87,6 @@ export class FakeEc2 {
       allocationStrategy: null,
       maxPrice: null,
       spotRequestId,
-      stateReason: null,
-      terminatedAt: null,
       tags,
     });
     this.spotRequests.set(spotRequestId, {
@@ -102,37 +95,22 @@ export class FakeEc2 {
       state: "active",
       type: "one-time",
       interruptionBehavior: "terminate",
-      statusCode: "fulfilled",
       tags,
     });
     return id;
   }
 
-  // gives an instance EC2's two-minute interruption notice: its Spot request is marked for
-  // termination and the instance keeps running until EC2 reclaims it
-  markForTermination(id: string): void {
-    const request = this.spotRequests.get(this.instances.get(id)?.spotRequestId ?? "");
-    if (request === undefined) {
-      throw new Error(`no Spot request for instance ${id}`);
-    }
-    request.statusCode = "marked-for-termination";
-  }
-
   // reclaims an instance as EC2 does when it needs the Spot capacity back: a one-time
-  // request that terminates on interruption closes, and its instance is terminated and
-  // stays listed with its type, zone and state reason
-  interrupt(id: string, at = Date.now()): void {
+  // request that terminates on interruption closes, and its instance is terminated
+  interrupt(id: string): void {
     const instance = this.instances.get(id);
     if (instance === undefined) {
       throw new Error(`no instance ${id}`);
     }
     instance.state = "terminated";
-    instance.stateReason = "Server.SpotInstanceTermination";
-    instance.terminatedAt = at;
     const request = instance.spotRequestId === null ? undefined : this.spotRequests.get(instance.spotRequestId);
     if (request !== undefined) {
       request.state = "closed";
-      request.statusCode = "instance-terminated-no-capacity";
     }
   }
 
@@ -191,11 +169,7 @@ export class FakeEc2 {
         if (instance === undefined) {
           return error(400, "InvalidInstanceID.NotFound", `The instance ID '${id}' does not exist`);
         }
-        if (instance.state !== "terminated") {
-          instance.state = "terminated";
-          instance.stateReason = "Client.UserInitiatedShutdown";
-          instance.terminatedAt = Date.now();
-        }
+        instance.state = "terminated";
         const request = instance.spotRequestId === null ? undefined : this.spotRequests.get(instance.spotRequestId);
         if (request !== undefined && request.type === "one-time") {
           request.state = "closed";
@@ -275,8 +249,6 @@ export class FakeEc2 {
         allocationStrategy: params.get("SpotOptions.AllocationStrategy"),
         maxPrice: params.get(`${override}.MaxPrice`),
         spotRequestId,
-        stateReason: null,
-        terminatedAt: null,
         // EC2 adds its own launch template and fleet tags to a fleet's instance
         tags: [
           ...taggedAs(params, "instance"),
@@ -293,8 +265,7 @@ export class FakeEc2 {
         state: "active",
         type: "one-time",
         interruptionBehavior: instance.interruptionBehavior,
-        statusCode: "fulfilled",
-        tags: [],
+          tags: [],
       });
       // an instant fleet reports the instance's zone and subnet beside the override too
       launched =
@@ -337,8 +308,7 @@ export class FakeEc2 {
     return describeResponse([...this.instances.values()].filter(matches));
   }
 
-  // EC2 refuses a call that names a request that does not exist, and leaves out the named
-  // requests a filter does not match
+  // EC2 refuses a call that names a request that does not exist
   private describeSpotRequests(params: URLSearchParams): Response {
     const ids = indexed(params, "SpotInstanceRequestId");
     this.log.push(ids.length === 0 ? "DescribeSpotInstanceRequests" : `DescribeSpotInstanceRequests ${ids.join(",")}`);
@@ -348,7 +318,6 @@ export class FakeEc2 {
     }
     const fields: Record<string, (request: SpotRequest) => string> = {
       "instance-id": (request) => request.instanceId,
-      "status-code": (request) => request.statusCode,
     };
     const filters: [(request: SpotRequest) => string, string[]][] = [];
     for (let index = 1; params.has(`Filter.${index}.Name`); index += 1) {
@@ -366,7 +335,7 @@ export class FakeEc2 {
       .map(
         (request) =>
           `<item><spotInstanceRequestId>${request.id}</spotInstanceRequestId><instanceId>${request.instanceId}</instanceId>` +
-          `<state>${request.state}</state><type>${request.type}</type><status><code>${request.statusCode}</code></status>` +
+          `<state>${request.state}</state><type>${request.type}</type>` +
           `<instanceInterruptionBehavior>${request.interruptionBehavior}</instanceInterruptionBehavior>${tagSet(request.tags)}</item>`,
       )
       .join("");
@@ -489,12 +458,6 @@ function error(status: number, code: string, message: string): Response {
   );
 }
 
-// the form EC2 documents for a user-initiated change's transition reason
-function transitionReason(at: number): string {
-  const time = new Date(at).toISOString().replace("T", " ").replace(/\.\d+Z$/, " GMT");
-  return `<reason>Service initiated (${time})</reason>`;
-}
-
 // a retiring instance keeps its type and zone but no network fields, as EC2 describes it
 function instanceXml(instance: Instance): string {
   const state = `<instanceState><name>${instance.state}</name></instanceState>`;
@@ -502,12 +465,7 @@ function instanceXml(instance: Instance): string {
   const placement =
     `<instanceType>${instance.instanceType}</instanceType>` + `<placement><availabilityZone>${instance.zone}</availabilityZone></placement>`;
   if (instance.state === "shutting-down" || instance.state === "terminated") {
-    const reason =
-      instance.stateReason === null
-        ? ""
-        : `${instance.terminatedAt === null ? "" : transitionReason(instance.terminatedAt)}` +
-          `<stateReason><code>${instance.stateReason}</code><message>${instance.stateReason}</message></stateReason>`;
-    return `<item><instanceId>${instance.id}</instanceId>${state}${placement}${reason}${spot}${tagSet(instance.tags)}</item>`;
+    return `<item><instanceId>${instance.id}</instanceId>${state}${placement}${spot}${tagSet(instance.tags)}</item>`;
   }
   return (
     `<item><instanceId>${instance.id}</instanceId><imageId>${instance.imageId}</imageId>${state}${placement}` +

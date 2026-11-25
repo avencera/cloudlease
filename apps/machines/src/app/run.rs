@@ -24,10 +24,7 @@ use cloudlease_machines::{
     },
     ids::{AppName, ClassName, RunId},
     money::MicroUsd,
-    provider::{
-        LatPlacement, LatitudeSpec, MachineKind, MachineSpec, PnapPlacement, PoolChoice,
-        choose_pools,
-    },
+    provider::{LatPlacement, LatitudeSpec, MachineKind, MachineSpec, PnapPlacement},
     run::{
         Admission, Admitted, LeaseEnd, MachineEntry, MachineRecord, RunEnd, RunRecord, admit,
         confirm, end_lease, lease_view, presence_target, presence_wake, run_spend, run_view,
@@ -40,10 +37,7 @@ use cloudlease_machines::{
     },
 };
 use cloudlease_provider::{
-    aws::{
-        AwsInstanceSpec, IdempotencyKey, InstanceName, LaunchPools, RegionalSpec, SpotPool,
-        UserData,
-    },
+    aws::{AwsInstanceSpec, IdempotencyKey, InstanceName, RegionalSpec, UserData},
     digitalocean::{BootScript, DoSpec, DropletSpec, ResourceName, VolumeSpec},
     error::ProviderErrorCode,
     latitude::{self, UserDataSpec},
@@ -582,7 +576,6 @@ impl Run {
             api_base: &config.api_base,
             hard_deadline_at: Timestamp(admitted.hard_deadline_at),
             heartbeat_ttl_secs: run.heartbeat.ttl().as_secs(),
-            interruption_notice: class.provider.name().interruption_notice(),
         };
         let provisioning = Provisioning {
             stores,
@@ -1387,16 +1380,14 @@ impl Provisioning<'_> {
         Ok(())
     }
 
-    /// Launches the Spot instance in whichever of the class's pools EC2 picks, leaving out
-    /// the pools that just took one of the run's machines back
+    /// Launches the Spot instance in whichever of the class's pools EC2 picks
     async fn aws(&self, class: &AwsClass) -> CloudleaseResult<()> {
         let user_data = self.user_data(None)?;
-        let pools = self.aws_pools(class).await?;
         let spec = MachineSpec::Aws(RegionalSpec {
             region: class.region.clone(),
             instance: AwsInstanceSpec {
                 name: InstanceName::parse(self.record.hostname.as_str())?,
-                pools,
+                pools: class.pools.clone(),
                 launch_template: class.launch_template.clone(),
                 image_id: class.image_id.clone(),
                 root_device_name: class.root_device_name.clone(),
@@ -1410,65 +1401,6 @@ impl Provisioning<'_> {
 
         Ok(())
     }
-
-    /// Returns the class's pools less those that interrupted the run in the last hour
-    ///
-    /// The history is only advice: if EC2 cannot be read, every pool is offered and the
-    /// launch's own call reports any real outage.
-    async fn aws_pools(&self, class: &AwsClass) -> CloudleaseResult<LaunchPools> {
-        let owner = self.run.run_id.owner()?;
-        let interruptions = match self
-            .provider
-            .spot_interruptions(&class.region, &owner)
-            .await
-        {
-            Ok(interruptions) => interruptions,
-            Err(error) => {
-                worker::console_warn!(
-                    "cloudlease machines: run {} offers every Spot pool, its interruptions \
-                     are unread: {error}",
-                    self.run.run_id
-                );
-                return Ok(class.pools.clone());
-            }
-        };
-
-        match choose_pools(class.pools.clone(), &interruptions, runtime::now()) {
-            PoolChoice::All(pools) => Ok(pools),
-            PoolChoice::Without { pools, left_out } => {
-                worker::console_log!(
-                    "cloudlease machines: run {} leaves out Spot pools that interrupted it in \
-                     the last hour: {}",
-                    self.run.run_id,
-                    describe_pools(&left_out)
-                );
-                Ok(pools)
-            }
-            PoolChoice::AllInterrupted(pools) => {
-                worker::console_log!(
-                    "cloudlease machines: run {} offers every Spot pool, though each interrupted \
-                     it in the last hour: {}",
-                    self.run.run_id,
-                    describe_pools(pools.as_slice())
-                );
-                Ok(pools)
-            }
-        }
-    }
-}
-
-fn describe_pools(pools: &[SpotPool]) -> String {
-    pools
-        .iter()
-        .map(|pool| {
-            format!(
-                "{} in {}",
-                pool.instance_type.as_str(),
-                pool.availability_zone.as_str()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Refuses a class whose provider this Worker has no credentials for, before anything is

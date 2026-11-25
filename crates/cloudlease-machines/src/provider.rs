@@ -15,22 +15,18 @@
 //! An AWS machine is one Spot instance whose root volume and network interface are deleted
 //! with it. It is a one-time request that terminates on interruption, so EC2 never leaves a
 //! stopped instance, a volume or an open Spot request behind for the sweep. One launch offers
-//! EC2 every pool of the class at once, less the pools that just interrupted the run; see
-//! [`choose_pools`].
+//! EC2 every pool of the class at once, and EC2's `price-capacity-optimized` allocation picks
+//! the pool least likely to be interrupted.
 
-use std::{fmt, time::Duration};
+use std::fmt;
 
 use cloudlease_core::{
     ids::{Generation, OwnerId, ResourceId},
     sweep::{Inventory, Observed, Unlisted},
     tags::{ManagedTags, OwnerTags, ResourceKind},
-    time::UnixMillis,
 };
 use cloudlease_provider::{
-    aws::{
-        AvailabilityZone, AwsKind, AwsRegion, InstanceType, LaunchPools, RegionalSpec, SpotHistory,
-        SpotInterruption, SpotPool, SubnetId,
-    },
+    aws::{AvailabilityZone, AwsKind, InstanceType, RegionalSpec, SubnetId},
     digitalocean::{DoKind, DoSpec},
     error::{ProviderError, ProviderErrorCode, ProviderResult},
     latitude::{self, LatKind, LatSpec},
@@ -39,7 +35,7 @@ use cloudlease_provider::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{boot::InterruptionNotice, money::PaidTime};
+use crate::money::PaidTime;
 
 /// The most locations a phoenixNAP class, or sites a Latitude.sh class, may try in turn
 ///
@@ -82,16 +78,6 @@ impl ProviderName {
     #[must_use]
     pub const fn reclaims_machines(self) -> bool {
         matches!(self, Self::Aws)
-    }
-
-    /// Returns how a machine of this provider learns that the provider is about to take it
-    /// back, for its `lease.json`
-    #[must_use]
-    pub const fn interruption_notice(self) -> Option<InterruptionNotice> {
-        match self {
-            Self::Aws => Some(InterruptionNotice::AwsImds),
-            Self::DigitalOcean | Self::PhoenixNap | Self::Latitude => None,
-        }
     }
 
     /// Returns the provider's billing increment when it is long enough for an idle machine to
@@ -297,14 +283,6 @@ pub enum LatitudeSpec {
 /// at most 12 pools.
 pub const MAX_INSTANCE_TYPES: usize = 4;
 
-/// How long a pool that interrupted one of a run's machines is left out of the run's next
-/// launches
-///
-/// A pool that just took an instance back is short of Spot capacity, so a machine launched
-/// into it again is likely to be interrupted again soon. An hour matches how long EC2 keeps
-/// a terminated instance listed, which is all the history the stateless check can see.
-pub const INTERRUPTION_LOOKBACK: Duration = Duration::from_secs(60 * 60);
-
 /// The instance types of an AWS class: 1 to [`MAX_INSTANCE_TYPES`], each at most once
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstanceTypes(Vec<InstanceType>);
@@ -342,84 +320,6 @@ pub struct AwsZone {
     pub zone: AvailabilityZone,
     /// A subnet in that zone, such as the default VPC's
     pub subnet_id: SubnetId,
-}
-
-/// The pools one AWS launch offers, after leaving out those that interrupted the run
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PoolChoice {
-    /// No pool interrupted the run recently, so every pool is offered
-    All(LaunchPools),
-    /// Some pools interrupted the run recently and are left out
-    Without {
-        /// The pools offered
-        pools: LaunchPools,
-        /// The pools left out
-        left_out: Vec<SpotPool>,
-    },
-    /// Every pool interrupted the run recently, so every pool is offered rather than none
-    AllInterrupted(LaunchPools),
-}
-
-impl PoolChoice {
-    /// Returns the pools to offer
-    #[must_use]
-    pub const fn pools(&self) -> &LaunchPools {
-        match self {
-            Self::All(pools) | Self::AllInterrupted(pools) | Self::Without { pools, .. } => pools,
-        }
-    }
-
-    /// Returns the pools to offer, consuming the choice
-    #[must_use]
-    pub fn into_pools(self) -> LaunchPools {
-        match self {
-            Self::All(pools) | Self::AllInterrupted(pools) | Self::Without { pools, .. } => pools,
-        }
-    }
-}
-
-/// Leaves out of `pools` every pool that interrupted the run within [`INTERRUPTION_LOOKBACK`]
-/// of `now`, unless that leaves none
-///
-/// An interruption without a time counts as recent: EC2 lists a terminated instance only for
-/// about an hour, so having seen it at all bounds its age.
-#[must_use]
-pub fn choose_pools(
-    pools: LaunchPools,
-    interruptions: &[SpotInterruption],
-    now: UnixMillis,
-) -> PoolChoice {
-    let recent = |interruption: &&SpotInterruption| {
-        interruption.at.is_none_or(|at| {
-            at.checked_add(INTERRUPTION_LOOKBACK)
-                .is_none_or(|until| until >= now)
-        })
-    };
-    let interrupted = |pool: &SpotPool| {
-        interruptions.iter().filter(recent).any(|interruption| {
-            pool.is(
-                interruption.instance_type.as_str(),
-                interruption.availability_zone.as_str(),
-            )
-        })
-    };
-    let (left_out, kept): (Vec<_>, Vec<_>) = pools
-        .as_slice()
-        .iter()
-        .cloned()
-        .partition(|pool| interrupted(pool));
-    if left_out.is_empty() {
-        return PoolChoice::All(pools);
-    }
-
-    // a non-empty subset of valid pools is valid too
-    match LaunchPools::new(kept) {
-        Ok(kept) => PoolChoice::Without {
-            pools: kept,
-            left_out,
-        },
-        Err(_) => PoolChoice::AllInterrupted(pools),
-    }
 }
 
 /// A create request for one resource of a machine
@@ -511,7 +411,7 @@ where
     D: CloudProvider<Kind = DoKind, Spec = DoSpec>,
     P: CloudProvider<Kind = PnapKind, Spec = PnapSpec>,
     L: CloudProvider<Kind = LatKind, Spec = LatSpec>,
-    A: CloudProvider<Kind = AwsKind, Spec = RegionalSpec> + SpotHistory,
+    A: CloudProvider<Kind = AwsKind, Spec = RegionalSpec>,
 {
     /// Combines the configured adapters
     pub const fn new(
@@ -544,16 +444,6 @@ where
             "AWS",
             "AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_REGIONS",
         )
-    }
-
-    /// Returns the pools in `region` that interrupted any of `owner`'s machines in about
-    /// the last hour
-    pub async fn spot_interruptions(
-        &self,
-        region: &AwsRegion,
-        owner: &OwnerId,
-    ) -> ProviderResult<Vec<SpotInterruption>> {
-        self.aws()?.spot_interruptions(region, owner).await
     }
 
     fn latitude(&self) -> ProviderResult<&L> {
@@ -711,7 +601,7 @@ where
     D: CloudProvider<Kind = DoKind, Spec = DoSpec>,
     P: CloudProvider<Kind = PnapKind, Spec = PnapSpec>,
     L: CloudProvider<Kind = LatKind, Spec = LatSpec>,
-    A: CloudProvider<Kind = AwsKind, Spec = RegionalSpec> + SpotHistory,
+    A: CloudProvider<Kind = AwsKind, Spec = RegionalSpec>,
 {
     type Kind = MachineKind;
     type Spec = MachineSpec;
@@ -793,84 +683,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use cloudlease_core::{tags::ResourceKind, time::UnixMillis};
-    use cloudlease_provider::{
-        aws::{AvailabilityZone, InstanceType, LaunchPools, SpotInterruption, SpotPool, SubnetId},
-        digitalocean::DoKind,
-        phoenixnap::Location,
-    };
+    use cloudlease_core::tags::ResourceKind;
+    use cloudlease_provider::{digitalocean::DoKind, phoenixnap::Location};
 
-    use super::{INTERRUPTION_LOOKBACK, Locations, MachineKind, PoolChoice, choose_pools};
-
-    fn pool(instance_type: &str, zone: &str) -> SpotPool {
-        SpotPool {
-            instance_type: InstanceType::parse(instance_type).unwrap(),
-            availability_zone: AvailabilityZone::parse(zone).unwrap(),
-            subnet_id: SubnetId::parse("subnet-01234567").unwrap(),
-        }
-    }
-
-    fn interruption(instance_type: &str, zone: &str, at: Option<u64>) -> SpotInterruption {
-        SpotInterruption {
-            instance_type: InstanceType::parse(instance_type).unwrap(),
-            availability_zone: AvailabilityZone::parse(zone).unwrap(),
-            at: at.and_then(UnixMillis::new),
-        }
-    }
-
-    #[test]
-    fn a_launch_leaves_out_pools_that_interrupted_the_run_within_the_hour() {
-        let pools = LaunchPools::new(vec![
-            pool("c8a.4xlarge", "us-east-1a"),
-            pool("c8a.4xlarge", "us-east-1b"),
-            pool("c7a.4xlarge", "us-east-1a"),
-        ])
-        .unwrap();
-        let hour = u64::try_from(INTERRUPTION_LOOKBACK.as_millis()).unwrap();
-        let now = UnixMillis::new(10 * hour).unwrap();
-
-        // one recent, one with no time, which counts as recent, and one past the lookback
-        let choice = choose_pools(
-            pools.clone(),
-            &[
-                interruption("c8a.4xlarge", "us-east-1a", Some(10 * hour - 60_000)),
-                interruption("c7a.4xlarge", "us-east-1a", None),
-                interruption("c8a.4xlarge", "us-east-1b", Some(10 * hour - hour - 1)),
-            ],
-            now,
-        );
-        assert_eq!(
-            choice,
-            PoolChoice::Without {
-                pools: LaunchPools::new(vec![pool("c8a.4xlarge", "us-east-1b")]).unwrap(),
-                left_out: vec![
-                    pool("c8a.4xlarge", "us-east-1a"),
-                    pool("c7a.4xlarge", "us-east-1a")
-                ],
-            }
-        );
-
-        // with no pool left, every pool is offered rather than none
-        let everywhere: Vec<_> = pools
-            .as_slice()
-            .iter()
-            .map(|pool| {
-                interruption(
-                    pool.instance_type.as_str(),
-                    pool.availability_zone.as_str(),
-                    None,
-                )
-            })
-            .collect();
-        assert_eq!(
-            choose_pools(pools.clone(), &everywhere, now),
-            PoolChoice::AllInterrupted(pools.clone())
-        );
-        assert_eq!(
-            choose_pools(pools.clone(), &[], now),
-            PoolChoice::All(pools)
-        );
-    }
+    use super::{Locations, MachineKind};
 
     #[test]
     fn machine_kinds_keep_their_providers_tags_and_delete_order() {

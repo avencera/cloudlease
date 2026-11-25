@@ -21,13 +21,12 @@ pub mod ingress;
 mod signing;
 mod xml;
 
-use std::{collections::BTreeMap, future::Future, num::NonZeroU16};
+use std::{collections::BTreeMap, num::NonZeroU16};
 
 use cloudlease_core::{
     ids::{Generation, OwnerId, ResourceId},
     sweep::{Inventory, Observed, Unrecognized},
     tags::{ManagedTags, OwnerTags, ResourceKind, TagMatch, TagScheme, UnrecognizedReason},
-    time::UnixMillis,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,11 +36,10 @@ pub use ec2::{
     AmiId, AvailabilityZone, AwsImage, AwsInstance, AwsInstanceDetails, AwsInstanceState,
     AwsInstanceType, AwsInstanceVolume, AwsSecurityGroup, AwsSecurityGroupIngress,
     AwsSpotInstanceRequest, AwsSpotInstanceRequestState, AwsSpotInstanceRequestType,
-    AwsSpotInterruptionBehavior, AwsStateReason, AwsSubnet, AwsTag, CreateFleetRequest,
-    CreateFleetResponse, Ec2, FleetError, FleetInstances, FleetOverrides, InstanceFilter,
-    InstanceName, InstanceType, LaunchTemplate, LaunchTemplateId, MARKED_FOR_TERMINATION,
-    MAX_USER_DATA_BYTES, NAME_TAG_KEY, RetiredPlacement, SPOT_INSTANCE_TERMINATION,
-    SecurityGroupId, SpotMaxPrice, SpotPool, SubnetId, TcpIngress, UserData, is_ambiguous_failure,
+    AwsSpotInterruptionBehavior, AwsSubnet, AwsTag, CreateFleetRequest, CreateFleetResponse, Ec2,
+    FleetError, FleetInstances, FleetOverrides, InstanceFilter, InstanceName, InstanceType,
+    LaunchTemplate, LaunchTemplateId, MAX_USER_DATA_BYTES, NAME_TAG_KEY, SecurityGroupId,
+    SpotMaxPrice, SpotPool, SubnetId, TcpIngress, UserData, is_ambiguous_failure,
 };
 pub use ingress::{AwsIngress, SharedSecurityGroup};
 pub use signing::{AwsCredentials, AwsRegion};
@@ -183,32 +181,6 @@ pub struct LaunchedInstance {
     pub instance: AwsInstance,
     /// The pool it launched in
     pub pool: SpotPool,
-}
-
-/// A Spot pool that took an owner's instance back
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SpotInterruption {
-    /// The instance type
-    pub instance_type: InstanceType,
-    /// The Availability Zone
-    pub availability_zone: AvailabilityZone,
-    /// When EC2 terminated the instance, when its transition reason names a time; `None` too
-    /// for an instance EC2 has given its interruption notice but not yet terminated, whose
-    /// interruption is happening now
-    pub at: Option<UnixMillis>,
-}
-
-/// Reads which Spot pools recently took an owner's instances back, or are taking one back
-///
-/// EC2 keeps a terminated instance visible for about an hour, so this sees only recent
-/// interruptions.
-pub trait SpotHistory {
-    /// Returns the pools in `region` that interrupted any generation of `owner`
-    fn spot_interruptions(
-        &self,
-        region: &AwsRegion,
-        owner: &OwnerId,
-    ) -> impl Future<Output = ProviderResult<Vec<SpotInterruption>>>;
 }
 
 /// A managed instance with its parsed tags and everything EC2 reported
@@ -358,69 +330,6 @@ impl<C: Ec2> Aws<C> {
         )?;
 
         Ok(LaunchedInstance { instance, pool })
-    }
-
-    /// Returns the pools that took any generation of `owner`'s instances back, or are taking
-    /// one back now
-    ///
-    /// Terminated instances count, since EC2 lists them for about an hour after the
-    /// interruption; an instance whose type or zone EC2 no longer reports is skipped. So does
-    /// a live instance whose Spot request is [marked for termination](MARKED_FOR_TERMINATION):
-    /// EC2 has given it the two-minute notice, and its replacement is asked for within that
-    /// time, while it still runs. One `DescribeSpotInstanceRequests` call covers every such
-    /// instance, and is skipped when there is none; if it fails, the terminated instances
-    /// still count.
-    pub async fn spot_interruptions(
-        &self,
-        owner: &OwnerId,
-    ) -> ProviderResult<Vec<SpotInterruption>> {
-        let filter = InstanceFilter::Tag(AwsTag::new(
-            format!("{}-owner", self.scheme.prefix()),
-            owner.as_str(),
-        ));
-        let instances = self.ec2.list_instances(filter).await?;
-        let owned: Vec<_> = instances
-            .iter()
-            .filter(|instance| {
-                matches!(
-                    self.classify(instance.tags()),
-                    TagMatch::Managed(tags) if tags.owner == *owner
-                )
-            })
-            .collect();
-        let mut interruptions: Vec<_> = owned.iter().copied().filter_map(interruption).collect();
-
-        let live = owned
-            .iter()
-            .filter(|instance| !instance.state().is_absent() && interruption(instance).is_none());
-        let by_request: BTreeMap<&str, &AwsInstance> = live
-            .filter_map(|instance| Some((instance.spot_instance_request_id()?, *instance)))
-            .collect();
-        if by_request.is_empty() {
-            return Ok(interruptions);
-        }
-
-        // the terminated instances above are history enough on their own, so a failed
-        // read, such as a request EC2 no longer lists, must not discard them
-        let Ok(requests) = self
-            .ec2
-            .describe_spot_instance_requests_with_status(
-                by_request.keys().map(|id| (*id).to_owned()).collect(),
-                MARKED_FOR_TERMINATION,
-            )
-            .await
-        else {
-            return Ok(interruptions);
-        };
-        interruptions.extend(
-            requests
-                .iter()
-                .filter(|request| request.status_code.as_deref() == Some(MARKED_FOR_TERMINATION))
-                .filter_map(|request| by_request.get(request.id.as_str()))
-                .filter_map(|instance| pool_of(instance, None)),
-        );
-
-        Ok(interruptions)
     }
 
     /// Returns the live instances with an exact tag set for one owner and generation
@@ -689,20 +598,6 @@ impl<'a, C: Ec2> AwsRegions<'a, C> {
     }
 }
 
-impl<C: Ec2> SpotHistory for AwsRegions<'_, C> {
-    async fn spot_interruptions(
-        &self,
-        region: &AwsRegion,
-        owner: &OwnerId,
-    ) -> ProviderResult<Vec<SpotInterruption>> {
-        let aws = self.region(region).ok_or_else(|| {
-            ProviderError::validation(format!("AWS region {region} is not configured"))
-        })?;
-
-        aws.spot_interruptions(owner).await
-    }
-}
-
 impl<C: Ec2> CloudProvider for AwsRegions<'_, C> {
     type Kind = AwsKind;
     type Spec = RegionalSpec;
@@ -899,23 +794,6 @@ fn launched_pool(pools: &LaunchPools, launched: &FleetInstances) -> ProviderResu
                 "EC2 CreateFleet launched in a pool the request did not offer",
             )
         })
-}
-
-fn interruption(instance: &AwsInstance) -> Option<SpotInterruption> {
-    let reason = instance.state_reason()?;
-    if reason.code != SPOT_INSTANCE_TERMINATION {
-        return None;
-    }
-
-    pool_of(instance, reason.at)
-}
-
-fn pool_of(instance: &AwsInstance, at: Option<UnixMillis>) -> Option<SpotInterruption> {
-    Some(SpotInterruption {
-        instance_type: InstanceType::parse(instance.instance_type()?).ok()?,
-        availability_zone: AvailabilityZone::parse(instance.availability_zone()?).ok()?,
-        at,
-    })
 }
 
 // EC2 codes and messages are echoed into errors that reach alerts, so keep them printable

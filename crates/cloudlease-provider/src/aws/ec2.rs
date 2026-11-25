@@ -9,7 +9,6 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use cloudlease_core::time::UnixMillis;
 
 use super::{
     client::{AwsRequestSafety, Ec2Client},
@@ -28,13 +27,6 @@ use crate::{
 const MAX_INVENTORY_PAGES: usize = 100;
 /// The largest user data EC2 accepts, before base64 encoding
 pub const MAX_USER_DATA_BYTES: usize = 16 * 1024;
-
-/// The state reason code EC2 gives an instance it terminated to take its Spot capacity back
-pub const SPOT_INSTANCE_TERMINATION: &str = "Server.SpotInstanceTermination";
-
-/// The Spot request status code EC2 sets when it has given its instance the two-minute
-/// interruption notice
-pub const MARKED_FOR_TERMINATION: &str = "marked-for-termination";
 
 /// One EC2 tag
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -203,27 +195,6 @@ pub struct AwsInstanceDetails {
     pub imds_v2_required: bool,
 }
 
-/// Why EC2 last changed an instance's state
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AwsStateReason {
-    /// The code, such as [`SPOT_INSTANCE_TERMINATION`]
-    pub code: String,
-    /// When the change happened, when EC2's transition reason names a time
-    pub at: Option<UnixMillis>,
-}
-
-/// The type and zone EC2 still reports for a retiring instance
-///
-/// A terminated instance keeps them while EC2 lists it, for about an hour, though it loses
-/// its network fields.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct RetiredPlacement {
-    /// The instance type
-    pub instance_type: Option<String>,
-    /// The Availability Zone
-    pub availability_zone: Option<String>,
-}
-
 /// One instance
 ///
 /// A retiring instance (shutting down or terminated) may lack its network and placement
@@ -234,7 +205,6 @@ pub struct AwsInstance {
     lifecycle: Lifecycle,
     tags: Vec<AwsTag>,
     spot_instance_request_id: Option<String>,
-    state_reason: Option<AwsStateReason>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -245,7 +215,6 @@ enum Lifecycle {
     },
     Retiring {
         state: AwsInstanceState,
-        placement: RetiredPlacement,
     },
 }
 
@@ -268,7 +237,6 @@ impl AwsInstance {
             lifecycle: Lifecycle::Present { state, details },
             tags,
             spot_instance_request_id: None,
-            state_reason: None,
         })
     }
 
@@ -276,7 +244,6 @@ impl AwsInstance {
     pub fn retiring(
         id: String,
         state: AwsInstanceState,
-        placement: RetiredPlacement,
         tags: Vec<AwsTag>,
     ) -> ProviderResult<Self> {
         if !state.is_retiring() {
@@ -287,10 +254,9 @@ impl AwsInstance {
 
         Ok(Self {
             id,
-            lifecycle: Lifecycle::Retiring { state, placement },
+            lifecycle: Lifecycle::Retiring { state },
             tags,
             spot_instance_request_id: None,
-            state_reason: None,
         })
     }
 
@@ -298,13 +264,6 @@ impl AwsInstance {
     #[must_use]
     pub fn with_spot_instance_request_id(mut self, id: String) -> Self {
         self.spot_instance_request_id = Some(id);
-        self
-    }
-
-    /// Records why EC2 last changed the instance's state
-    #[must_use]
-    pub fn with_state_reason(mut self, reason: AwsStateReason) -> Self {
-        self.state_reason = Some(reason);
         self
     }
 
@@ -318,32 +277,8 @@ impl AwsInstance {
     #[must_use]
     pub const fn state(&self) -> AwsInstanceState {
         match self.lifecycle {
-            Lifecycle::Present { state, .. } | Lifecycle::Retiring { state, .. } => state,
+            Lifecycle::Present { state, .. } | Lifecycle::Retiring { state } => state,
         }
-    }
-
-    /// Returns the instance type, which EC2 reports even for a terminated instance
-    #[must_use]
-    pub fn instance_type(&self) -> Option<&str> {
-        match &self.lifecycle {
-            Lifecycle::Present { details, .. } => Some(&details.instance_type),
-            Lifecycle::Retiring { placement, .. } => placement.instance_type.as_deref(),
-        }
-    }
-
-    /// Returns the Availability Zone, which EC2 reports even for a terminated instance
-    #[must_use]
-    pub fn availability_zone(&self) -> Option<&str> {
-        match &self.lifecycle {
-            Lifecycle::Present { details, .. } => Some(&details.availability_zone),
-            Lifecycle::Retiring { placement, .. } => placement.availability_zone.as_deref(),
-        }
-    }
-
-    /// Returns why EC2 last changed the instance's state, when it said
-    #[must_use]
-    pub const fn state_reason(&self) -> Option<&AwsStateReason> {
-        self.state_reason.as_ref()
     }
 
     /// Returns the details of an instance that is not retiring
@@ -490,8 +425,6 @@ pub struct AwsSpotInstanceRequest {
     pub request_type: AwsSpotInstanceRequestType,
     /// The interruption behavior
     pub interruption_behavior: AwsSpotInterruptionBehavior,
-    /// The status code of EC2's latest evaluation, such as [`MARKED_FOR_TERMINATION`]
-    pub status_code: Option<String>,
     /// The tags
     pub tags: Vec<AwsTag>,
 }
@@ -807,14 +740,6 @@ pub trait Ec2 {
         instance_id: String,
     ) -> LocalFuture<'_, ProviderResult<Vec<AwsSpotInstanceRequest>>>;
 
-    /// Describes the Spot requests among `spot_instance_request_ids` whose status code is
-    /// `status_code`, in one call
-    fn describe_spot_instance_requests_with_status(
-        &self,
-        spot_instance_request_ids: Vec<String>,
-        status_code: &'static str,
-    ) -> LocalFuture<'_, ProviderResult<Vec<AwsSpotInstanceRequest>>>;
-
     /// Launches at most one Spot instance with an instant fleet
     fn create_fleet(
         &self,
@@ -1079,35 +1004,6 @@ impl<T: HttpTransport, R: Runtime> Ec2 for Ec2Client<T, R> {
                         query("Filter.1.Name", "instance-id"),
                         query("Filter.1.Value.1", &instance_id),
                     ],
-                    AwsRequestSafety::ReadOnly,
-                )
-                .await?;
-            parse_spot_instance_requests(&response.body, None)
-        })
-    }
-
-    fn describe_spot_instance_requests_with_status(
-        &self,
-        spot_instance_request_ids: Vec<String>,
-        status_code: &'static str,
-    ) -> LocalFuture<'_, ProviderResult<Vec<AwsSpotInstanceRequest>>> {
-        Box::pin(async move {
-            // a filter leaves out the named requests it does not match instead of failing, and
-            // EC2 pages a describe only when it is sent MaxResults, which this call never is
-            let mut parameters = vec![
-                query("Filter.1.Name", "status-code"),
-                query("Filter.1.Value.1", status_code),
-            ];
-            parameters.extend(
-                spot_instance_request_ids
-                    .iter()
-                    .enumerate()
-                    .map(|(index, id)| query(&format!("SpotInstanceRequestId.{}", index + 1), id)),
-            );
-            let response = self
-                .call(
-                    "DescribeSpotInstanceRequests",
-                    parameters,
                     AwsRequestSafety::ReadOnly,
                 )
                 .await?;
