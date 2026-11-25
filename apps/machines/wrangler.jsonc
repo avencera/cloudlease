@@ -25,20 +25,20 @@
     // every resource this Worker creates or sweeps carries tags with this prefix; no other
     // cloudlease app may use it
     "CLOUDLEASE_TAG_PREFIX": "clm",
-    // the most the machines not yet confirmed gone may cost per hour, in US cents: 48 fits
-    // one aws-c8a-4xl or one s2.c2.large with its IP block, but not lat-m4-medium
-    "HOURLY_SPEND_CAP_CENTS": "48",
+    // the most the machines not yet confirmed gone may cost per hour, in US cents: 96 fits
+    // two aws-c8a-4xl or two s2.c2.large with their IP blocks, but not lat-m4-medium
+    "HOURLY_SPEND_CAP_CENTS": "96",
     // the regions the AWS classes launch in and the sweep lists; infra/aws-machines covers
     // only us-east-1
     "AWS_REGIONS": "us-east-1",
     "MACHINES_CONFIG": {
       // where machines renew: the deployed Worker on the Avencera account
       "api_base": "https://cloudlease-machines.avencera.workers.dev",
-      // limits of the live provider tests: one machine per run, and $0.48 is one hour of
-      // aws-c8a-4xl or of pnap-s2-large; raise them for a real pool
-      "max_run_hours": 1,
-      "max_machines_per_run": 1,
-      "run_spend_cap_usd": "0.48",
+      // limits of the 2026-11-25 live checks: two machines per run, two hours, and $1, two
+      // hours of pnap-s2-small or an hour of two aws-c8a-4xl; raise them for a real pool
+      "max_run_hours": 2,
+      "max_machines_per_run": 2,
+      "run_spend_cap_usd": "1.00",
       // a machine renews every 30 seconds; a run keeps the windows it was created with
       "heartbeat_ttl_secs": 180,
       // the boot grace of DigitalOcean classes; a phoenixNAP class waits 20 minutes, a
@@ -114,10 +114,7 @@
           "image_id": "ami-0a951420c495183dc",
           "root_device_name": "/dev/sda1",
           "root_volume_gib": 50,
-          // NOT APPLIED YET: replace with `launch_template_id` and `launch_template_version`
-          // from `terraform output -json class_fields` before deploying; this placeholder
-          // passes validation but every launch fails
-          "launch_template_id": "lt-00000000000000000",
+          "launch_template_id": "lt-010f6147c2e816163",
           "launch_template_version": 1,
           // above the Spot prices; EC2 never charges more than this for the instance
           "spot_max_price_usd": "0.45",
@@ -127,9 +124,7 @@
           "max_hours": 1
         }
       },
-      // aws-c8a-4xl stays off until its launch template is applied and set above, so a deploy
-      // before then refuses the class instead of failing every launch
-      "apps": { "homebased": { "classes": ["do-s1-1g", "pnap-s2-large", "pnap-s2-small", "lat-m4-medium"] } }
+      "apps": { "homebased": { "classes": ["do-s1-1g", "pnap-s2-large", "pnap-s2-small", "lat-m4-medium", "aws-c8a-4xl"] } }
     }
   }
 }

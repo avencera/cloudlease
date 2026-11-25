@@ -29,12 +29,10 @@ and zones with their subnet IDs that an AWS class in `MACHINES_CONFIG` names. A 
 template version as a number, so a template change takes effect only once the classes name its
 new `latest_version`.
 
-**Not applied yet.** The launch template and the `fleet` policy were added on 2026-11-24 and
-have not been applied: the applied state predates them. Apply this configuration, apply
-`infra/aws-operator` first for the widened boundary (an administrator change), then put
-`launch_template_id` and `launch_template_version` from `class_fields` in the AWS classes of
-`MACHINES_CONFIG` before deploying a Worker that launches with `CreateFleet`. Whether the
-operator user may create launch templates was not checked.
+**Applied 2026-11-25** with the default profile, after `infra/aws-operator` widened the boundary:
+the launch template (`lt-010f6147c2e816163`, version 1), the `fleet` policy and its attachment,
+and the launch policy's template grant. The AWS classes of `MACHINES_CONFIG` name that template
+and version.
 
 ## What the policies allow
 

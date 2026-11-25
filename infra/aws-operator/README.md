@@ -24,7 +24,7 @@ policies, the user can do only what the boundary also allows. Both boundaries li
   volumes a launch touches; `CreateTags` of fleets, instances, volumes and Spot requests only
   as part of a `CreateFleet` or `RunInstances`; `TerminateInstances` and
   `CancelSpotInstanceRequests` only on `clm-managed=true` resources. The `CreateFleet` grants
-  were added on 2026-11-24 and are not applied yet
+  were applied on 2026-11-25
 - **`boundaries/rembuild-worker`:** the seven describes rembuild uses in `rembuild_regions`;
   ingress changes only on the security group tagged `rb-managed=rembuild` and `rb-kind=firewall`;
   `RunInstances` and `CreateTags` on launch with `rb-managed` set to `rembuild` (legacy shape) or
