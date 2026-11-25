@@ -304,7 +304,10 @@ the Worker log either way:
   (priority 3)
 - a run object failing to answer the sweep (priority 3), a provider the sweep cannot list
   (priority 4), or the sweep failing outright for another reason (priority 4), on the third
-  sweep in a row and then hourly (the `Monitor` object counts the streaks)
+  sweep in a row and then hourly (the `Monitor` object counts the streaks). An optional
+  provider whose settings are broken, such as one secret set without the other, counts as
+  one the sweep cannot list, since it may still have machines; its classes are refused with
+  `400 unknown_class`, and the sweep returns no permit while it lasts
 
 No alert uses priority 5: the topic may be one a Superalert Mac app follows, which sounds its
 alarm for every priority 5 message.

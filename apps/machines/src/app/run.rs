@@ -1465,16 +1465,27 @@ fn describe_pools(pools: &[SpotPool]) -> String {
 /// stored or created
 fn require_provider(env: &Env, name: &ClassName, class: &MachineClass) -> Result<(), ApiError> {
     let configured = match &class.provider {
-        ProviderClass::DigitalOcean(_) => true,
-        ProviderClass::PhoenixNap(_) => phoenixnap(env).map_err(internal)?.is_some(),
-        ProviderClass::Latitude(_) => latitude(env).map_err(internal)?.is_some(),
+        ProviderClass::DigitalOcean(_) => Ok(true),
+        ProviderClass::PhoenixNap(_) => phoenixnap(env).map(|built| built.is_some()),
+        ProviderClass::Latitude(_) => latitude(env).map(|built| built.is_some()),
         // a region the Worker does not list would escape the sweep
-        ProviderClass::Aws(instance) => aws(env)
-            .map_err(internal)?
-            .is_some_and(|aws| aws.has_region(&instance.region)),
+        ProviderClass::Aws(instance) => {
+            aws(env).map(|built| built.is_some_and(|aws| aws.has_region(&instance.region)))
+        }
     };
-    if configured {
-        return Ok(());
+    match configured {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        // a retry cannot mend the settings, so this is no internal error
+        Err(error) => {
+            return Err(ApiError::new(
+                ErrorCode::UnknownClass,
+                format!(
+                    "class {name} uses {}, whose settings on this Worker are broken: {error}",
+                    class.provider.name()
+                ),
+            ));
+        }
     }
 
     let settings = match &class.provider {

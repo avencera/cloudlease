@@ -4,7 +4,7 @@ use std::fmt::Display;
 
 use cloudlease_machines::{
     config::MachinesConfig,
-    provider::Providers,
+    provider::{Optional, Providers},
     token::ClientTokens,
     wire::{ApiError, ErrorCode},
 };
@@ -85,29 +85,23 @@ pub fn aws(env: &Env) -> CloudleaseResult<Option<WorkersAws>> {
 /// when configured
 ///
 /// Broken optional settings, such as one secret set without the other, leave that provider
-/// out rather than failing, so they never stop the other providers' deletes; health reports
-/// them.
+/// unusable rather than failing, so they never stop the other providers' deletes; the sweep
+/// reports it as unlisted, and health reports it too.
 pub fn provider(env: &Env) -> CloudleaseResult<MachineProviders> {
-    let phoenixnap = phoenixnap(env).unwrap_or_else(|error| {
-        worker::console_error!("cloudlease machines: phoenixNAP left out: {error}");
-        None
-    });
-    let latitude = latitude(env).unwrap_or_else(|error| {
-        worker::console_error!("cloudlease machines: Latitude.sh left out: {error}");
-        None
-    });
-
-    let aws = aws(env).unwrap_or_else(|error| {
-        worker::console_error!("cloudlease machines: AWS left out: {error}");
-        None
-    });
-
     Ok(Providers::new(
         digitalocean(env)?,
-        phoenixnap,
-        latitude,
-        aws,
+        optional("phoenixNAP", phoenixnap(env)),
+        optional("Latitude.sh", latitude(env)),
+        optional("AWS", aws(env)),
     ))
+}
+
+fn optional<P>(name: &str, settings: CloudleaseResult<Option<P>>) -> Optional<P> {
+    if let Err(error) = &settings {
+        worker::console_error!("cloudlease machines: {name} settings are broken: {error}");
+    }
+
+    Optional::from_settings(settings)
 }
 
 /// Answers with a JSON body

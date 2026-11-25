@@ -449,16 +449,61 @@ impl CreateSpec for MachineSpec {
     }
 }
 
+/// An optional provider's adapter, or why the Worker has none
+#[derive(Clone, Debug)]
+pub enum Optional<P> {
+    /// Its settings are complete
+    Configured(P),
+    /// None of its settings are set, so this deployment never used it
+    Unset,
+    /// Some of its settings are set but they do not build an adapter, such as one secret
+    /// without the other; it may still have machines, which nothing can then see
+    Broken(String),
+}
+
+impl<P> Optional<P> {
+    /// Sorts the result of reading a provider's settings: an adapter, no settings, or an
+    /// error
+    pub fn from_settings<E: fmt::Display>(settings: Result<Option<P>, E>) -> Self {
+        match settings {
+            Ok(Some(adapter)) => Self::Configured(adapter),
+            Ok(None) => Self::Unset,
+            Err(error) => Self::Broken(error.to_string()),
+        }
+    }
+
+    fn get(&self, name: &str, settings: &str) -> ProviderResult<&P> {
+        match self {
+            Self::Configured(adapter) => Ok(adapter),
+            Self::Unset => Err(ProviderError::new(
+                ProviderErrorCode::Validation,
+                false,
+                format!("{name} is not configured: set {settings}"),
+            )),
+            Self::Broken(error) => Err(broken(name, error)),
+        }
+    }
+}
+
+fn broken(name: &str, error: &str) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorCode::Validation,
+        false,
+        format!("{name} settings are broken: {error}"),
+    )
+}
+
 /// Every provider the machines app can use, as one [`CloudProvider`]
 ///
 /// DigitalOcean is always configured. phoenixNAP, Latitude.sh and AWS are optional: without
-/// one, its creates, deletes, reads and tag searches fail with a validation error, and the
-/// inventory holds the other providers' resources only.
+/// one, its creates, deletes, reads and tag searches fail with a validation error. The
+/// inventory leaves an unset provider out, and lists a broken one as unlisted, since it may
+/// still have machines.
 pub struct Providers<D, P, L, A> {
     digitalocean: D,
-    phoenixnap: Option<P>,
-    latitude: Option<L>,
-    aws: Option<A>,
+    phoenixnap: Optional<P>,
+    latitude: Optional<L>,
+    aws: Optional<A>,
 }
 
 impl<D, P, L, A> Providers<D, P, L, A>
@@ -471,9 +516,9 @@ where
     /// Combines the configured adapters
     pub const fn new(
         digitalocean: D,
-        phoenixnap: Option<P>,
-        latitude: Option<L>,
-        aws: Option<A>,
+        phoenixnap: Optional<P>,
+        latitude: Optional<L>,
+        aws: Optional<A>,
     ) -> Self {
         Self {
             digitalocean,
@@ -488,21 +533,17 @@ where
     pub const fn has(&self, provider: ProviderName) -> bool {
         match provider {
             ProviderName::DigitalOcean => true,
-            ProviderName::PhoenixNap => self.phoenixnap.is_some(),
-            ProviderName::Latitude => self.latitude.is_some(),
-            ProviderName::Aws => self.aws.is_some(),
+            ProviderName::PhoenixNap => matches!(self.phoenixnap, Optional::Configured(_)),
+            ProviderName::Latitude => matches!(self.latitude, Optional::Configured(_)),
+            ProviderName::Aws => matches!(self.aws, Optional::Configured(_)),
         }
     }
 
     fn aws(&self) -> ProviderResult<&A> {
-        self.aws.as_ref().ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorCode::Validation,
-                false,
-                "AWS is not configured: set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and \
-                 AWS_REGIONS",
-            )
-        })
+        self.aws.get(
+            "AWS",
+            "AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_REGIONS",
+        )
     }
 
     /// Returns the pools in `region` that interrupted any of `owner`'s machines in about
@@ -516,13 +557,8 @@ where
     }
 
     fn latitude(&self) -> ProviderResult<&L> {
-        self.latitude.as_ref().ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorCode::Validation,
-                false,
-                "Latitude.sh is not configured: set LATITUDE_API_KEY and LATITUDE_PROJECT",
-            )
-        })
+        self.latitude
+            .get("Latitude.sh", "LATITUDE_API_KEY and LATITUDE_PROJECT")
     }
 
     /// Creates the server in each site in turn until one has stock
@@ -561,13 +597,8 @@ where
     }
 
     fn phoenixnap(&self) -> ProviderResult<&P> {
-        self.phoenixnap.as_ref().ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorCode::Validation,
-                false,
-                "phoenixNAP is not configured: set PNAP_CLIENT_ID and PNAP_CLIENT_SECRET",
-            )
-        })
+        self.phoenixnap
+            .get("phoenixNAP", "PNAP_CLIENT_ID and PNAP_CLIENT_SECRET")
     }
 
     /// Creates the server in each location in turn until one has stock
@@ -628,6 +659,23 @@ impl From<MachineKind> for ProviderKind {
 }
 
 /// Adds one provider's list to the inventory, or names the provider if its list failed
+async fn add_optional<C>(
+    into: &mut Inventory<MachineKind>,
+    provider: ProviderName,
+    adapter: &Optional<C>,
+) where
+    C: CloudProvider,
+    C::Kind: Into<MachineKind>,
+{
+    let listed = match adapter {
+        Optional::Configured(adapter) => adapter.inventory().await,
+        Optional::Unset => return,
+        Optional::Broken(error) => Err(broken(provider.as_str(), error)),
+    };
+
+    add(into, provider, listed);
+}
+
 fn add<K: Into<MachineKind>>(
     into: &mut Inventory<MachineKind>,
     provider: ProviderName,
@@ -735,23 +783,9 @@ where
         };
         let digitalocean = self.digitalocean.inventory().await;
         add(&mut inventory, ProviderName::DigitalOcean, digitalocean);
-        if let Some(phoenixnap) = &self.phoenixnap {
-            add(
-                &mut inventory,
-                ProviderName::PhoenixNap,
-                phoenixnap.inventory().await,
-            );
-        }
-        if let Some(latitude) = &self.latitude {
-            add(
-                &mut inventory,
-                ProviderName::Latitude,
-                latitude.inventory().await,
-            );
-        }
-        if let Some(aws) = &self.aws {
-            add(&mut inventory, ProviderName::Aws, aws.inventory().await);
-        }
+        add_optional(&mut inventory, ProviderName::PhoenixNap, &self.phoenixnap).await;
+        add_optional(&mut inventory, ProviderName::Latitude, &self.latitude).await;
+        add_optional(&mut inventory, ProviderName::Aws, &self.aws).await;
 
         Ok(inventory)
     }
