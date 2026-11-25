@@ -270,9 +270,13 @@ fn error_message(action: &str, code: ProviderErrorCode, provider_code: Option<&s
 /// Classifies an EC2 error code and HTTP status
 ///
 /// Order matters: throttling and missing resources are recognized before the broad
-/// `invalid` match, and Spot capacity before account limits, so a caller can try another
-/// instance type on [`ProviderErrorCode::NoCapacity`] but not on a quota.
-fn classify_error(status: u16, provider_code: Option<&str>) -> (ProviderErrorCode, bool) {
+/// `invalid` match, and Spot capacity before account limits, so a fleet pool refused for
+/// capacity reads as [`ProviderErrorCode::NoCapacity`] but a quota does not. The adapter also
+/// classifies each error of a fleet's HTTP 200 answer here.
+pub(crate) fn classify_error(
+    status: u16,
+    provider_code: Option<&str>,
+) -> (ProviderErrorCode, bool) {
     let code = provider_code.unwrap_or_default().to_ascii_lowercase();
     if status == 429 || code.contains("throttl") || code == "requestlimitexceeded" {
         return (ProviderErrorCode::RateLimited, true);

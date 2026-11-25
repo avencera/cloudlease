@@ -10,7 +10,7 @@ use cloudlease_core::{
 use cloudlease_provider::{
     aws::{
         Aws, AwsCredentials, AwsKind, AwsRegion, AwsRegions, Ec2Client, Ec2ClientOptions,
-        RegionalSpec,
+        RegionalSpec, SpotHistory, SpotInterruption,
     },
     error::ProviderResult,
     provider::{CloudProvider, Presence},
@@ -94,6 +94,16 @@ impl CloudProvider for WorkersAws {
 
     async fn inventory(&self) -> ProviderResult<Inventory<AwsKind>> {
         self.regions()?.inventory().await
+    }
+}
+
+impl SpotHistory for WorkersAws {
+    async fn spot_interruptions(
+        &self,
+        region: &AwsRegion,
+        owner: &OwnerId,
+    ) -> ProviderResult<Vec<SpotInterruption>> {
+        self.regions()?.spot_interruptions(region, owner).await
     }
 }
 

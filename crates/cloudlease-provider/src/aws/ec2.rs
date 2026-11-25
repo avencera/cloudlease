@@ -3,14 +3,18 @@
 //! [`Ec2`] keeps signing and XML out of lifecycle code, and lets tests drive the adapter
 //! with a stateful fake instead of canned HTTP responses.
 
-use std::{collections::HashSet, num::NonZeroU16};
+use std::{
+    collections::HashSet,
+    num::{NonZeroU16, NonZeroU32},
+};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use cloudlease_core::time::UnixMillis;
 
 use super::{
     client::{AwsRequestSafety, Ec2Client},
     xml::{
-        parse_image, parse_instance_page, parse_instance_type, parse_run_instances,
+        parse_create_fleet, parse_image, parse_instance_page, parse_instance_type,
         parse_security_group_page, parse_spot_instance_requests, parse_subnet,
     },
 };
@@ -24,6 +28,9 @@ use crate::{
 const MAX_INVENTORY_PAGES: usize = 100;
 /// The largest user data EC2 accepts, before base64 encoding
 pub const MAX_USER_DATA_BYTES: usize = 16 * 1024;
+
+/// The state reason code EC2 gives an instance it terminated to take its Spot capacity back
+pub const SPOT_INSTANCE_TERMINATION: &str = "Server.SpotInstanceTermination";
 
 /// One EC2 tag
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -192,6 +199,27 @@ pub struct AwsInstanceDetails {
     pub imds_v2_required: bool,
 }
 
+/// Why EC2 last changed an instance's state
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AwsStateReason {
+    /// The code, such as [`SPOT_INSTANCE_TERMINATION`]
+    pub code: String,
+    /// When the change happened, when EC2's transition reason names a time
+    pub at: Option<UnixMillis>,
+}
+
+/// The type and zone EC2 still reports for a retiring instance
+///
+/// A terminated instance keeps them while EC2 lists it, for about an hour, though it loses
+/// its network fields.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RetiredPlacement {
+    /// The instance type
+    pub instance_type: Option<String>,
+    /// The Availability Zone
+    pub availability_zone: Option<String>,
+}
+
 /// One instance
 ///
 /// A retiring instance (shutting down or terminated) may lack its network and placement
@@ -202,6 +230,7 @@ pub struct AwsInstance {
     lifecycle: Lifecycle,
     tags: Vec<AwsTag>,
     spot_instance_request_id: Option<String>,
+    state_reason: Option<AwsStateReason>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,6 +241,7 @@ enum Lifecycle {
     },
     Retiring {
         state: AwsInstanceState,
+        placement: RetiredPlacement,
     },
 }
 
@@ -234,6 +264,7 @@ impl AwsInstance {
             lifecycle: Lifecycle::Present { state, details },
             tags,
             spot_instance_request_id: None,
+            state_reason: None,
         })
     }
 
@@ -241,6 +272,7 @@ impl AwsInstance {
     pub fn retiring(
         id: String,
         state: AwsInstanceState,
+        placement: RetiredPlacement,
         tags: Vec<AwsTag>,
     ) -> ProviderResult<Self> {
         if !state.is_retiring() {
@@ -251,9 +283,10 @@ impl AwsInstance {
 
         Ok(Self {
             id,
-            lifecycle: Lifecycle::Retiring { state },
+            lifecycle: Lifecycle::Retiring { state, placement },
             tags,
             spot_instance_request_id: None,
+            state_reason: None,
         })
     }
 
@@ -261,6 +294,13 @@ impl AwsInstance {
     #[must_use]
     pub fn with_spot_instance_request_id(mut self, id: String) -> Self {
         self.spot_instance_request_id = Some(id);
+        self
+    }
+
+    /// Records why EC2 last changed the instance's state
+    #[must_use]
+    pub fn with_state_reason(mut self, reason: AwsStateReason) -> Self {
+        self.state_reason = Some(reason);
         self
     }
 
@@ -274,8 +314,32 @@ impl AwsInstance {
     #[must_use]
     pub const fn state(&self) -> AwsInstanceState {
         match self.lifecycle {
-            Lifecycle::Present { state, .. } | Lifecycle::Retiring { state } => state,
+            Lifecycle::Present { state, .. } | Lifecycle::Retiring { state, .. } => state,
         }
+    }
+
+    /// Returns the instance type, which EC2 reports even for a terminated instance
+    #[must_use]
+    pub fn instance_type(&self) -> Option<&str> {
+        match &self.lifecycle {
+            Lifecycle::Present { details, .. } => Some(&details.instance_type),
+            Lifecycle::Retiring { placement, .. } => placement.instance_type.as_deref(),
+        }
+    }
+
+    /// Returns the Availability Zone, which EC2 reports even for a terminated instance
+    #[must_use]
+    pub fn availability_zone(&self) -> Option<&str> {
+        match &self.lifecycle {
+            Lifecycle::Present { details, .. } => Some(&details.availability_zone),
+            Lifecycle::Retiring { placement, .. } => placement.availability_zone.as_deref(),
+        }
+    }
+
+    /// Returns why EC2 last changed the instance's state, when it said
+    #[must_use]
+    pub const fn state_reason(&self) -> Option<&AwsStateReason> {
+        self.state_reason.as_ref()
     }
 
     /// Returns the details of an instance that is not retiring
@@ -512,65 +576,6 @@ validated!(
     }
 );
 
-/// How long a Spot request lives and what EC2 does to its instance when it reclaims the
-/// capacity
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SpotLifetime {
-    /// A persistent request that stops the instance, keeping its root volume, and starts it
-    /// again when capacity returns
-    PersistentStop,
-    /// A one-time request that terminates the instance, so an interrupted instance is gone
-    /// with its root volume and nothing relaunches it
-    OneTimeTerminate,
-}
-
-impl SpotLifetime {
-    const fn request_type(self) -> &'static str {
-        match self {
-            Self::PersistentStop => "persistent",
-            Self::OneTimeTerminate => "one-time",
-        }
-    }
-
-    const fn interruption_behavior(self) -> &'static str {
-        match self {
-            Self::PersistentStop => "stop",
-            Self::OneTimeTerminate => "terminate",
-        }
-    }
-}
-
-/// The Spot market options of a launch
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SpotMarket {
-    /// The request's lifetime and interruption behavior
-    pub lifetime: SpotLifetime,
-    /// The most the instance may cost per hour; EC2 refuses the launch when the Spot price
-    /// is higher and reclaims the instance when it rises above it. `None` caps it at the
-    /// On-Demand price
-    pub max_price: Option<SpotMaxPrice>,
-}
-
-impl SpotMarket {
-    /// A persistent request that stops on interruption, capped at the On-Demand price
-    #[must_use]
-    pub const fn persistent_stop() -> Self {
-        Self {
-            lifetime: SpotLifetime::PersistentStop,
-            max_price: None,
-        }
-    }
-
-    /// A one-time request that terminates on interruption
-    #[must_use]
-    pub const fn one_time_terminate(max_price: Option<SpotMaxPrice>) -> Self {
-        Self {
-            lifetime: SpotLifetime::OneTimeTerminate,
-            max_price,
-        }
-    }
-}
-
 fn is_resource_id(value: &str, prefix: &str) -> bool {
     value.strip_prefix(prefix).is_some_and(|suffix| {
         matches!(suffix.len(), 8 | 17)
@@ -580,34 +585,121 @@ fn is_resource_id(value: &str, prefix: &str) -> bool {
     })
 }
 
-/// A Spot `RunInstances` request
+validated!(
+    /// A launch template ID such as `lt-0123456789abcdef0`
+    LaunchTemplateId,
+    "a launch template ID is `lt-` and 8 or 17 lowercase hex digits",
+    |value| is_resource_id(value, "lt-")
+);
+
+/// One pinned version of a launch template
 ///
-/// The adapter always asks for a public IPv4 address, IMDSv2 and an encrypted gp3 root
-/// volume deleted with the instance, so none of those are options.
+/// The version is a number, never `$Latest` or `$Default`, so a template edit cannot change
+/// what a running deployment launches until its configuration names the new version.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RunInstancesRequest {
+pub struct LaunchTemplate {
+    /// The template
+    pub id: LaunchTemplateId,
+    /// The version
+    pub version: NonZeroU32,
+}
+
+/// One Spot capacity pool: an instance type in one Availability Zone, with the subnet an
+/// instance is launched into there
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpotPool {
+    /// The instance type
+    pub instance_type: InstanceType,
+    /// The Availability Zone, which must be the subnet's
+    pub availability_zone: AvailabilityZone,
+    /// The subnet
+    pub subnet_id: SubnetId,
+}
+
+impl SpotPool {
+    /// Reports whether the pool is `instance_type` in `availability_zone`
+    #[must_use]
+    pub fn is(&self, instance_type: &str, availability_zone: &str) -> bool {
+        self.instance_type.as_str() == instance_type
+            && self.availability_zone.as_str() == availability_zone
+    }
+}
+
+/// An instant `CreateFleet` request for one Spot instance
+///
+/// The adapter always asks for one instance of capacity type spot, the
+/// `price-capacity-optimized` allocation strategy, termination on interruption, IMDSv2 and
+/// an encrypted gp3 root volume deleted with the instance, so none of those are options.
+/// The security group and the public IPv4 address come from the launch template and the
+/// subnets, since a fleet cannot override them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateFleetRequest {
+    /// The launch template every pool shares
+    pub launch_template: LaunchTemplate,
+    /// The pools EC2 may choose from, one launch template override each
+    pub pools: Vec<SpotPool>,
     /// The AMI
     pub image_id: AmiId,
     /// The AMI's root device name
     pub root_device_name: String,
     /// The root volume size
     pub root_volume_gib: NonZeroU16,
-    /// The instance type
-    pub instance_type: InstanceType,
-    /// The subnet
-    pub subnet_id: SubnetId,
-    /// The Availability Zone
-    pub availability_zone: AvailabilityZone,
-    /// The security group
-    pub security_group_id: SecurityGroupId,
-    /// The tags for the instance and its Spot request
-    pub tags: Vec<AwsTag>,
+    /// The most the instance may cost per hour in every pool; `None` caps it at the
+    /// On-Demand price
+    pub max_price: Option<SpotMaxPrice>,
     /// The boot user data
     pub user_data: UserData,
-    /// The token that makes a repeated launch return the first instance
+    /// The tags for the fleet, the instance and its root volume
+    pub tags: Vec<AwsTag>,
+    /// The token that makes a repeated launch return the first result
     pub client_token: String,
-    /// The Spot request's lifetime, interruption behavior and price cap
-    pub market: SpotMarket,
+}
+
+/// The pool fields EC2 echoes from the override a fleet instance or error used
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FleetOverrides {
+    /// The instance type
+    pub instance_type: Option<String>,
+    /// The Availability Zone
+    pub availability_zone: Option<String>,
+    /// The subnet
+    pub subnet_id: Option<String>,
+}
+
+/// Instances an instant fleet launched from one override
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FleetInstances {
+    /// The instance IDs
+    pub instance_ids: Vec<String>,
+    /// The instance type
+    pub instance_type: Option<String>,
+    /// The override EC2 used
+    pub overrides: FleetOverrides,
+}
+
+/// One pool an instant fleet could not launch in, and why
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FleetError {
+    /// The EC2 error code, such as `InsufficientInstanceCapacity`
+    pub code: String,
+    /// EC2's message
+    pub message: Option<String>,
+    /// The override that failed
+    pub overrides: FleetOverrides,
+}
+
+/// What an instant fleet launched and what it could not
+///
+/// EC2 answers a fleet that launched nothing with HTTP 200, so a capacity failure is an
+/// empty instance set with errors rather than an API error.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CreateFleetResponse {
+    /// The fleet, which EC2 deletes on its own once it has no running instances
+    pub fleet_id: Option<String>,
+    /// The instances, grouped by the override that launched them
+    pub instances: Vec<FleetInstances>,
+    /// The pools that failed
+    pub errors: Vec<FleetError>,
 }
 
 /// Which instances `DescribeInstances` returns
@@ -698,11 +790,11 @@ pub trait Ec2 {
         instance_id: String,
     ) -> LocalFuture<'_, ProviderResult<Vec<AwsSpotInstanceRequest>>>;
 
-    /// Launches one persistent Spot instance
-    fn run_instances(
+    /// Launches at most one Spot instance with an instant fleet
+    fn create_fleet(
         &self,
-        request: RunInstancesRequest,
-    ) -> LocalFuture<'_, ProviderResult<AwsInstance>>;
+        request: CreateFleetRequest,
+    ) -> LocalFuture<'_, ProviderResult<CreateFleetResponse>>;
 
     /// Terminates one instance
     fn terminate_instance(&self, instance_id: String) -> LocalFuture<'_, ProviderResult<()>>;
@@ -969,37 +1061,19 @@ impl<T: HttpTransport, R: Runtime> Ec2 for Ec2Client<T, R> {
         })
     }
 
-    fn run_instances(
+    fn create_fleet(
         &self,
-        request: RunInstancesRequest,
-    ) -> LocalFuture<'_, ProviderResult<AwsInstance>> {
+        request: CreateFleetRequest,
+    ) -> LocalFuture<'_, ProviderResult<CreateFleetResponse>> {
         Box::pin(async move {
             let response = self
                 .call(
-                    "RunInstances",
-                    run_instances_parameters(&request),
+                    "CreateFleet",
+                    create_fleet_parameters(&request),
                     AwsRequestSafety::Ambiguous,
                 )
                 .await?;
-            let run = parse_run_instances(&response.body)?;
-            let instance = AwsInstance::present(
-                run.instance_id,
-                AwsInstanceState::Pending,
-                AwsInstanceDetails {
-                    instance_type: request.instance_type.as_str().to_owned(),
-                    image_id: request.image_id.as_str().to_owned(),
-                    availability_zone: request.availability_zone.as_str().to_owned(),
-                    subnet_id: request.subnet_id.as_str().to_owned(),
-                    public_ipv4: None,
-                    volumes: Vec::new(),
-                    security_group_ids: vec![request.security_group_id.as_str().to_owned()],
-                    spot: true,
-                    imds_v2_required: true,
-                },
-                request.tags,
-            )?;
-
-            Ok(instance.with_spot_instance_request_id(run.spot_instance_request_id))
+            parse_create_fleet(&response.body)
         })
     }
 
@@ -1091,68 +1165,72 @@ fn paginated_filter(filter: &InstanceFilter, next_token: Option<&str>) -> Vec<(S
     parameters
 }
 
-fn run_instances_parameters(request: &RunInstancesRequest) -> Vec<(String, String)> {
+fn create_fleet_parameters(request: &CreateFleetRequest) -> Vec<(String, String)> {
+    let template = "LaunchTemplateConfigs.1.LaunchTemplateSpecification";
     let mut parameters = vec![
-        query("ImageId", request.image_id.as_str()),
-        query("BlockDeviceMapping.1.DeviceName", &request.root_device_name),
-        query("BlockDeviceMapping.1.Ebs.VolumeType", "gp3"),
-        query("BlockDeviceMapping.1.Ebs.Encrypted", "true"),
-        query("BlockDeviceMapping.1.Ebs.DeleteOnTermination", "true"),
-        query(
-            "BlockDeviceMapping.1.Ebs.VolumeSize",
-            &request.root_volume_gib.to_string(),
-        ),
-        query("InstanceType", request.instance_type.as_str()),
-        query("MinCount", "1"),
-        query("MaxCount", "1"),
-        query(
-            "Placement.AvailabilityZone",
-            request.availability_zone.as_str(),
-        ),
-        query("NetworkInterface.1.DeviceIndex", "0"),
-        query("NetworkInterface.1.SubnetId", request.subnet_id.as_str()),
-        query("NetworkInterface.1.DeleteOnTermination", "true"),
-        query("NetworkInterface.1.AssociatePublicIpAddress", "true"),
-        query(
-            "NetworkInterface.1.SecurityGroupId.1",
-            request.security_group_id.as_str(),
-        ),
-        query("MetadataOptions.HttpTokens", "required"),
-        query("InstanceMarketOptions.MarketType", "spot"),
-        query(
-            "InstanceMarketOptions.SpotOptions.InstanceInterruptionBehavior",
-            request.market.lifetime.interruption_behavior(),
-        ),
-        query(
-            "InstanceMarketOptions.SpotOptions.SpotInstanceType",
-            request.market.lifetime.request_type(),
-        ),
+        query("Type", "instant"),
         query("ClientToken", &request.client_token),
+        query("TargetCapacitySpecification.TotalTargetCapacity", "1"),
         query(
-            "UserData",
+            "TargetCapacitySpecification.DefaultTargetCapacityType",
+            "spot",
+        ),
+        // AWS's recommended strategy: the cheapest of the pools least likely to be
+        // interrupted
+        query("SpotOptions.AllocationStrategy", "price-capacity-optimized"),
+        // a one-time request that terminates, so an interrupted machine is gone with its
+        // root volume and nothing relaunches it after its lease ends
+        query("SpotOptions.InstanceInterruptionBehavior", "terminate"),
+        query(
+            &format!("{template}.LaunchTemplateId"),
+            request.launch_template.id.as_str(),
+        ),
+        query(
+            &format!("{template}.Version"),
+            &request.launch_template.version.to_string(),
+        ),
+        query(
+            &format!("{template}.LaunchTemplateSpecificationUserData"),
             &BASE64.encode(request.user_data.as_str().as_bytes()),
         ),
     ];
-    if let Some(max_price) = &request.market.max_price {
-        parameters.push(query(
-            "InstanceMarketOptions.SpotOptions.MaxPrice",
-            max_price.as_str(),
-        ));
+    for (index, pool) in request.pools.iter().enumerate() {
+        let prefix = format!("LaunchTemplateConfigs.1.Overrides.{}", index + 1);
+        let device = format!("{prefix}.BlockDeviceMapping.1");
+        parameters.extend([
+            query(
+                &format!("{prefix}.InstanceType"),
+                pool.instance_type.as_str(),
+            ),
+            query(&format!("{prefix}.SubnetId"), pool.subnet_id.as_str()),
+            query(
+                &format!("{prefix}.AvailabilityZone"),
+                pool.availability_zone.as_str(),
+            ),
+            query(&format!("{prefix}.ImageId"), request.image_id.as_str()),
+            query(&format!("{prefix}.MetadataOptions.HttpTokens"), "required"),
+            query(&format!("{device}.DeviceName"), &request.root_device_name),
+            query(&format!("{device}.Ebs.VolumeType"), "gp3"),
+            query(&format!("{device}.Ebs.Encrypted"), "true"),
+            query(&format!("{device}.Ebs.DeleteOnTermination"), "true"),
+            query(
+                &format!("{device}.Ebs.VolumeSize"),
+                &request.root_volume_gib.to_string(),
+            ),
+        ]);
+        if let Some(max_price) = &request.max_price {
+            parameters.push(query(&format!("{prefix}.MaxPrice"), max_price.as_str()));
+        }
     }
-    // the root volume is deleted with the instance, so only the instance and its Spot
-    // request carry the tags
-    append_tags(
-        &mut parameters,
-        "TagSpecification.1",
-        "instance",
-        &request.tags,
-    );
-    append_tags(
-        &mut parameters,
-        "TagSpecification.2",
-        "spot-instances-request",
-        &request.tags,
-    );
+    // the fleet's Spot request cannot be tagged here; cleanup accepts it untagged
+    for (index, resource_type) in ["fleet", "instance", "volume"].into_iter().enumerate() {
+        append_tags(
+            &mut parameters,
+            &format!("TagSpecification.{}", index + 1),
+            resource_type,
+            &request.tags,
+        );
+    }
 
     parameters
 }
@@ -1175,12 +1253,12 @@ fn append_tags(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU16;
+    use std::num::{NonZeroU16, NonZeroU32};
 
     use super::{
-        AmiId, AvailabilityZone, AwsInstanceState, AwsSpotInstanceRequestType, AwsTag, Ec2,
-        InstanceFilter, InstanceType, RunInstancesRequest, SecurityGroupId, SpotMarket,
-        SpotMaxPrice, SubnetId, TcpIngress, UserData,
+        AmiId, AvailabilityZone, AwsSpotInstanceRequestType, AwsTag, CreateFleetRequest,
+        CreateFleetResponse, Ec2, InstanceFilter, InstanceType, LaunchTemplate, LaunchTemplateId,
+        SpotMaxPrice, SpotPool, SubnetId, TcpIngress, UserData,
     };
     use crate::{
         aws::client::tests::{FakeTransport, block_on, client, ok, status},
@@ -1220,92 +1298,135 @@ mod tests {
         assert_eq!(error.code, ProviderErrorCode::InvalidResponse);
     }
 
-    #[test]
-    fn runs_a_persistent_spot_instance_with_stop_interruption_behavior() {
-        let transport = FakeTransport::with([ok(br"
-            <RunInstancesResponse>
-                <instancesSet>
-                    <item>
-                        <instanceId>i-01234567</instanceId>
-                        <spotInstanceRequestId>sir-01234567</spotInstanceRequestId>
-                    </item>
-                </instancesSet>
-            </RunInstancesResponse>
-        ")]);
-        let client = client(transport.clone());
-        let request = RunInstancesRequest {
-            image_id: AmiId::parse("ami-01234567").unwrap(),
-            root_device_name: "/dev/sda1".to_owned(),
-            root_volume_gib: NonZeroU16::new(50).unwrap(),
-            instance_type: InstanceType::parse("c7a.2xlarge").unwrap(),
-            subnet_id: SubnetId::parse("subnet-01234567").unwrap(),
-            availability_zone: AvailabilityZone::parse("us-east-1a").unwrap(),
-            security_group_id: SecurityGroupId::parse("sg-01234567").unwrap(),
-            tags: vec![AwsTag::new("rb-managed", "true")],
-            user_data: UserData::parse("#cloud-config").unwrap(),
-            client_token: "rb-instance-token".to_owned(),
-            market: SpotMarket::persistent_stop(),
+    fn fleet_request() -> CreateFleetRequest {
+        let pool = |instance_type: &str, zone: &str, subnet: &str| SpotPool {
+            instance_type: InstanceType::parse(instance_type).unwrap(),
+            availability_zone: AvailabilityZone::parse(zone).unwrap(),
+            subnet_id: SubnetId::parse(subnet).unwrap(),
         };
-
-        let instance = block_on(client.run_instances(request)).unwrap();
-
-        assert_eq!(instance.id(), "i-01234567");
-        assert_eq!(instance.state(), AwsInstanceState::Pending);
-        assert_eq!(instance.spot_instance_request_id(), Some("sir-01234567"));
-        let body = &transport.bodies()[0];
-        for expected in [
-            "InstanceMarketOptions.SpotOptions.SpotInstanceType=persistent",
-            "InstanceMarketOptions.SpotOptions.InstanceInterruptionBehavior=stop",
-            "BlockDeviceMapping.1.Ebs.VolumeSize=50",
-            "MetadataOptions.HttpTokens=required",
-            "NetworkInterface.1.AssociatePublicIpAddress=true",
-            "ClientToken=rb-instance-token",
-            "TagSpecification.1.ResourceType=instance",
-            "TagSpecification.2.ResourceType=spot-instances-request",
-            "TagSpecification.2.Tag.1.Key=rb-managed&TagSpecification.2.Tag.1.Value=true",
-        ] {
-            assert!(body.contains(expected), "{expected} missing from {body}");
-        }
-        assert!(!body.contains("MaxPrice"), "{body}");
-    }
-
-    #[test]
-    fn runs_a_one_time_spot_instance_that_terminates_under_a_price_cap() {
-        let transport = FakeTransport::with([ok(br"
-            <RunInstancesResponse>
-                <instancesSet>
-                    <item>
-                        <instanceId>i-01234567</instanceId>
-                        <spotInstanceRequestId>sir-01234567</spotInstanceRequestId>
-                    </item>
-                </instancesSet>
-            </RunInstancesResponse>
-        ")]);
-        let client = client(transport.clone());
-        let request = RunInstancesRequest {
+        CreateFleetRequest {
+            launch_template: LaunchTemplate {
+                id: LaunchTemplateId::parse("lt-0123456789abcdef0").unwrap(),
+                version: NonZeroU32::new(3).unwrap(),
+            },
+            pools: vec![
+                pool("c8a.4xlarge", "us-east-1a", "subnet-0000000a"),
+                pool("c7a.4xlarge", "us-east-1b", "subnet-0000000b"),
+            ],
             image_id: AmiId::parse("ami-01234567").unwrap(),
             root_device_name: "/dev/sda1".to_owned(),
             root_volume_gib: NonZeroU16::new(150).unwrap(),
-            instance_type: InstanceType::parse("c8a.4xlarge").unwrap(),
-            subnet_id: SubnetId::parse("subnet-01234567").unwrap(),
-            availability_zone: AvailabilityZone::parse("us-east-1a").unwrap(),
-            security_group_id: SecurityGroupId::parse("sg-01234567").unwrap(),
-            tags: vec![AwsTag::new("clm-managed", "true")],
+            max_price: Some(SpotMaxPrice::parse("0.45").unwrap()),
             user_data: UserData::parse("#!/bin/sh").unwrap(),
+            tags: vec![AwsTag::new("clm-managed", "true")],
             client_token: "clm-instance-token".to_owned(),
-            market: SpotMarket::one_time_terminate(Some(SpotMaxPrice::parse("0.45").unwrap())),
-        };
+        }
+    }
 
-        block_on(client.run_instances(request)).unwrap();
+    #[test]
+    fn creates_an_instant_fleet_with_one_override_per_pool() {
+        let transport = FakeTransport::with([ok(br"
+            <CreateFleetResponse>
+                <fleetId>fleet-01234567</fleetId>
+                <errorSet>
+                    <item>
+                        <errorCode>InsufficientInstanceCapacity</errorCode>
+                        <errorMessage>no capacity</errorMessage>
+                        <launchTemplateAndOverrides>
+                            <overrides>
+                                <instanceType>c8a.4xlarge</instanceType>
+                                <availabilityZone>us-east-1a</availabilityZone>
+                                <subnetId>subnet-0000000a</subnetId>
+                            </overrides>
+                        </launchTemplateAndOverrides>
+                        <lifecycle>spot</lifecycle>
+                    </item>
+                </errorSet>
+                <fleetInstanceSet>
+                    <item>
+                        <instanceIds><item>i-01234567</item></instanceIds>
+                        <instanceType>c7a.4xlarge</instanceType>
+                        <launchTemplateAndOverrides>
+                            <overrides>
+                                <instanceType>c7a.4xlarge</instanceType>
+                                <availabilityZone>us-east-1b</availabilityZone>
+                                <subnetId>subnet-0000000b</subnetId>
+                            </overrides>
+                        </launchTemplateAndOverrides>
+                        <lifecycle>spot</lifecycle>
+                    </item>
+                </fleetInstanceSet>
+            </CreateFleetResponse>
+        ")]);
+        let client = client(transport.clone());
+
+        let response = block_on(client.create_fleet(fleet_request())).unwrap();
+
+        assert_eq!(response.fleet_id.as_deref(), Some("fleet-01234567"));
+        assert_eq!(response.instances[0].instance_ids, ["i-01234567"]);
+        assert_eq!(
+            response.instances[0].overrides.availability_zone.as_deref(),
+            Some("us-east-1b")
+        );
+        assert_eq!(response.errors[0].code, "InsufficientInstanceCapacity");
+        assert_eq!(
+            response.errors[0].overrides.subnet_id.as_deref(),
+            Some("subnet-0000000a")
+        );
 
         let body = &transport.bodies()[0];
+        let template = "LaunchTemplateConfigs.1.LaunchTemplateSpecification";
+        let second = "LaunchTemplateConfigs.1.Overrides.2";
         for expected in [
-            "InstanceMarketOptions.SpotOptions.SpotInstanceType=one-time",
-            "InstanceMarketOptions.SpotOptions.InstanceInterruptionBehavior=terminate",
-            "InstanceMarketOptions.SpotOptions.MaxPrice=0.45",
+            "Action=CreateFleet".to_owned(),
+            "Type=instant".to_owned(),
+            "ClientToken=clm-instance-token".to_owned(),
+            "TargetCapacitySpecification.TotalTargetCapacity=1".to_owned(),
+            "TargetCapacitySpecification.DefaultTargetCapacityType=spot".to_owned(),
+            "SpotOptions.AllocationStrategy=price-capacity-optimized".to_owned(),
+            "SpotOptions.InstanceInterruptionBehavior=terminate".to_owned(),
+            format!("{template}.LaunchTemplateId=lt-0123456789abcdef0"),
+            format!("{template}.Version=3"),
+            format!("{template}.LaunchTemplateSpecificationUserData=IyEvYmluL3No"),
+            "LaunchTemplateConfigs.1.Overrides.1.InstanceType=c8a.4xlarge".to_owned(),
+            format!("{second}.InstanceType=c7a.4xlarge"),
+            format!("{second}.SubnetId=subnet-0000000b"),
+            format!("{second}.AvailabilityZone=us-east-1b"),
+            format!("{second}.ImageId=ami-01234567"),
+            format!("{second}.MaxPrice=0.45"),
+            format!("{second}.MetadataOptions.HttpTokens=required"),
+            format!("{second}.BlockDeviceMapping.1.DeviceName=%2Fdev%2Fsda1"),
+            format!("{second}.BlockDeviceMapping.1.Ebs.Encrypted=true"),
+            format!("{second}.BlockDeviceMapping.1.Ebs.VolumeType=gp3"),
+            format!("{second}.BlockDeviceMapping.1.Ebs.VolumeSize=150"),
+            format!("{second}.BlockDeviceMapping.1.Ebs.DeleteOnTermination=true"),
+            "TagSpecification.1.ResourceType=fleet".to_owned(),
+            "TagSpecification.2.ResourceType=instance".to_owned(),
+            "TagSpecification.3.ResourceType=volume".to_owned(),
+            "TagSpecification.3.Tag.1.Key=clm-managed&TagSpecification.3.Tag.1.Value=true"
+                .to_owned(),
         ] {
-            assert!(body.contains(expected), "{expected} missing from {body}");
+            assert!(body.contains(&expected), "{expected} missing from {body}");
         }
+        // a fleet cannot override the security group or the network interface
+        assert!(!body.contains("SecurityGroup"), "{body}");
+        assert!(!body.contains("NetworkInterface"), "{body}");
+        assert!(!body.contains("spot-instances-request"), "{body}");
+    }
+
+    #[test]
+    fn a_fleet_without_a_price_cap_sends_no_max_price() {
+        let transport = FakeTransport::with([ok(b"<CreateFleetResponse/>")]);
+        let client = client(transport.clone());
+
+        let response = block_on(client.create_fleet(CreateFleetRequest {
+            max_price: None,
+            ..fleet_request()
+        }))
+        .unwrap();
+
+        assert_eq!(response, CreateFleetResponse::default());
+        assert!(!transport.bodies()[0].contains("MaxPrice"));
     }
 
     #[test]

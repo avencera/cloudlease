@@ -22,8 +22,8 @@ use cloudlease_core::{
 };
 use cloudlease_provider::{
     aws::{
-        AmiId, AvailabilityZone, AwsRegion, InstanceType, InstanceTypeCandidates, SecurityGroupId,
-        SpotMaxPrice, SubnetId, UserData,
+        AmiId, AvailabilityZone, AwsRegion, InstanceType, LaunchPools, LaunchTemplate,
+        LaunchTemplateId, SpotMaxPrice, SpotPool, SubnetId, UserData,
     },
     digitalocean::{BootScript, DropletImage, Slug},
     latitude,
@@ -37,7 +37,7 @@ use crate::{
     boot::{BootError, MountPath},
     ids::{AppName, ClassName},
     money::{Billing, MicroUsd},
-    provider::{AwsZone, Locations, MAX_INSTANCE_TYPES, ProviderName},
+    provider::{AwsZone, InstanceTypes, Locations, ProviderName},
 };
 
 /// The heartbeat window when `MACHINES_CONFIG` sets none; machines renew every 30 seconds
@@ -183,7 +183,8 @@ struct RawAwsClass {
     #[serde(default)]
     root_device_name: Option<String>,
     root_volume_gib: u16,
-    security_group_id: String,
+    launch_template_id: String,
+    launch_template_version: u32,
     spot_max_price_usd: String,
 }
 
@@ -267,28 +268,28 @@ pub struct LatitudeClass {
 /// An AWS EC2 Spot instance, billed per second
 ///
 /// Each machine is a one-time Spot request that EC2 terminates when it needs the capacity
-/// back, with its root volume. The instance has a public IPv4 address and the class's
-/// security group, which should allow no inbound traffic: machines reach their
-/// coordinator outbound.
+/// back, with its root volume. One instant fleet offers every instance type in every zone,
+/// and EC2 picks the pool least likely to be interrupted. The instance has a public IPv4
+/// address from its subnet and the launch template's security group, which should allow no
+/// inbound traffic: machines reach their coordinator outbound.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AwsClass {
     /// The region, which the Worker's `AWS_REGIONS` must list, such as `us-east-1`
     pub region: AwsRegion,
-    /// The instance types to try, cheapest per unit of work first; each is tried in every
-    /// zone before the next
-    pub instance_types: InstanceTypeCandidates,
-    /// The zones to try for each type, each with the subnet to launch into
-    pub zones: Locations<AwsZone>,
+    /// Every instance type of the class in every zone, each with the subnet to launch into,
+    /// in the order the class names them
+    pub pools: LaunchPools,
     /// The AMI, such as Canonical's Ubuntu 24.04 from the SSM public parameter
     pub image_id: AmiId,
     /// The AMI's root device name
     pub root_device_name: String,
     /// The gp3 root volume size, deleted with the instance
     pub root_volume_gib: NonZeroU16,
-    /// The security group
-    pub security_group_id: SecurityGroupId,
-    /// The most EC2 may charge for the instance per hour; at most the class's price, so the
-    /// Worker's spend never counts less than EC2 bills for the instance
+    /// The launch template every launch uses, pinned to one version; it holds the security
+    /// group, which a fleet cannot override
+    pub launch_template: LaunchTemplate,
+    /// The most EC2 may charge for the instance per hour in any pool; at most the class's
+    /// price, so the Worker's spend never counts less than EC2 bills for the instance
     pub spot_max_price: SpotMaxPrice,
 }
 
@@ -811,19 +812,14 @@ fn aws_class(name: &ClassName, raw: RawAwsClass) -> Result<AwsClass, ConfigError
         }
     };
 
-    if raw.instance_types.len() > MAX_INSTANCE_TYPES {
-        return Err(ConfigError::invalid(
-            field("instance_types"),
-            format!("must name at most {MAX_INSTANCE_TYPES} instance types"),
-        ));
-    }
     let instance_types = raw
         .instance_types
         .into_iter()
         .map(InstanceType::parse)
         .collect::<Result<Vec<_>, _>>()
-        .and_then(InstanceTypeCandidates::new)
         .map_err(invalid("instance_types"))?;
+    let instance_types = InstanceTypes::new(instance_types)
+        .map_err(|error| ConfigError::invalid(field("instance_types"), error))?;
     let zones = raw
         .zones
         .into_iter()
@@ -834,6 +830,20 @@ fn aws_class(name: &ClassName, raw: RawAwsClass) -> Result<AwsClass, ConfigError
             })
         })
         .collect::<Result<Vec<_>, ConfigError>>()?;
+    let zones =
+        Locations::new(zones).map_err(|error| ConfigError::invalid(field("zones"), error))?;
+    let pools = instance_types
+        .as_slice()
+        .iter()
+        .flat_map(|instance_type| {
+            zones.as_slice().iter().map(|zone| SpotPool {
+                instance_type: instance_type.clone(),
+                availability_zone: zone.zone.clone(),
+                subnet_id: zone.subnet_id.clone(),
+            })
+        })
+        .collect();
+    let pools = LaunchPools::new(pools).map_err(invalid("instance_types"))?;
     let root_device_name = raw
         .root_device_name
         .unwrap_or_else(|| UBUNTU_ROOT_DEVICE.to_owned());
@@ -854,14 +864,18 @@ fn aws_class(name: &ClassName, raw: RawAwsClass) -> Result<AwsClass, ConfigError
 
     Ok(AwsClass {
         region: AwsRegion::parse(raw.region).map_err(invalid("region"))?,
-        instance_types,
-        zones: Locations::new(zones)
-            .map_err(|error| ConfigError::invalid(field("zones"), error))?,
+        pools,
         image_id: AmiId::parse(raw.image_id).map_err(invalid("image_id"))?,
         root_device_name,
         root_volume_gib,
-        security_group_id: SecurityGroupId::parse(raw.security_group_id)
-            .map_err(invalid("security_group_id"))?,
+        launch_template: LaunchTemplate {
+            id: LaunchTemplateId::parse(raw.launch_template_id)
+                .map_err(invalid("launch_template_id"))?,
+            // a number only: `$Latest` would let a template edit change running deployments
+            version: NonZeroU32::new(raw.launch_template_version).ok_or_else(|| {
+                ConfigError::invalid(field("launch_template_version"), "must be at least 1")
+            })?,
+        },
         spot_max_price: SpotMaxPrice::parse(raw.spot_max_price_usd)
             .map_err(invalid("spot_max_price_usd"))?,
     })
@@ -929,7 +943,8 @@ pub(crate) mod tests {
                     ],
                     "image_id": "ami-0123456789abcdef0",
                     "root_volume_gib": 150,
-                    "security_group_id": "sg-0123456789abcdef0",
+                    "launch_template_id": "lt-0123456789abcdef0",
+                    "launch_template_version": 2,
                     "spot_max_price_usd": "0.45",
                     "price_per_hour_usd": "0.48",
                     "max_hours": 12
@@ -1004,8 +1019,31 @@ pub(crate) mod tests {
         };
         assert_eq!(instance.root_device_name, "/dev/sda1");
         assert_eq!(instance.spot_max_price.as_str(), "0.45");
-        assert_eq!(instance.instance_types.as_slice().len(), 2);
-        assert_eq!(instance.zones.as_slice()[1].zone.as_str(), "us-east-1b");
+        // every type in every zone, cheaper type first
+        let pools: Vec<_> = instance
+            .pools
+            .as_slice()
+            .iter()
+            .map(|pool| {
+                format!(
+                    "{}@{}@{}",
+                    pool.instance_type.as_str(),
+                    pool.availability_zone.as_str(),
+                    pool.subnet_id.as_str()
+                )
+            })
+            .collect();
+        assert_eq!(
+            pools,
+            [
+                "c8a.4xlarge@us-east-1a@subnet-0123456789abcdef0",
+                "c8a.4xlarge@us-east-1b@subnet-0123456789abcdef1",
+                "c7a.4xlarge@us-east-1a@subnet-0123456789abcdef0",
+                "c7a.4xlarge@us-east-1b@subnet-0123456789abcdef1",
+            ]
+        );
+        assert_eq!(instance.launch_template.id.as_str(), "lt-0123456789abcdef0");
+        assert_eq!(instance.launch_template.version.get(), 2);
         let regions: Vec<&str> = config.aws_regions().iter().map(|r| r.as_str()).collect();
         assert_eq!(regions, ["us-east-1"]);
         assert_eq!(
@@ -1096,6 +1134,30 @@ pub(crate) mod tests {
         assert!(broken(&["classes", "aws-c8a", "image_id"], json!("ubuntu")).is_err());
         assert!(broken(&["classes", "aws-c8a", "region"], json!("US East")).is_err());
         assert!(broken(&["classes", "aws-c8a", "root_device_name"], json!("sda1")).is_err());
+        assert!(
+            broken(
+                &["classes", "aws-c8a", "launch_template_id"],
+                json!("sg-01234567")
+            )
+            .is_err()
+        );
+        // a version is a number: `$Latest` would follow every template edit
+        assert!(broken(&["classes", "aws-c8a", "launch_template_version"], json!(0)).is_err());
+        assert!(
+            broken(
+                &["classes", "aws-c8a", "launch_template_version"],
+                json!("$Latest")
+            )
+            .is_err()
+        );
+        // the security group lives in the launch template, which a fleet cannot override
+        assert!(
+            broken(
+                &["classes", "aws-c8a", "security_group_id"],
+                json!("sg-01234567")
+            )
+            .is_err()
+        );
         assert!(broken(&["heartbeat_ttl_secs"], json!(30)).is_err());
         // the boot grace may not be shorter than the window it precedes
         assert!(broken(&["heartbeat_ttl_secs"], json!(600)).is_err());

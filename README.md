@@ -64,13 +64,15 @@ cl-managed  cl-owner-<owner>  cl-gen-<n>  cl-kind-droplet  [cl-until-<unix secs>
 ```
 
 Providers whose tags are keys and values carry the same set as pairs. With prefix `cl`, an
-AWS Spot instance and its Spot request carry exactly:
+AWS Spot instance, its root volume and the instant fleet that launched it carry exactly:
 
 ```
 cl-managed=true  cl-owner=<owner>  cl-gen=<n>  cl-kind=instance  [cl-until=<unix secs>]  Name=<name>
 ```
 
-The AWS adapter leaves `Name` out when it classifies tags, so the name is free text.
+The AWS adapter leaves `Name` out when it classifies tags, so the name is free text. A
+fleet cannot tag the Spot request it opens, so cleanup accepts an untagged one-time request as
+its instance's own; a request with any managed tag must carry exactly the instance's.
 
 A resource with the managed tag but any other tag shape is reported as unrecognized and
 left alone. The exception is a malformed `until` tag on an otherwise exact set: the sweep
@@ -123,7 +125,10 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
   2026-11-24 (create, join, idle release, confirmed gone; see the deploy runbook), but
   heartbeat-lapse and hard-deadline deletes ran live only on DigitalOcean, out-of-stock
   fall-through only on Latitude.sh, and a real AWS Spot interruption (rather than an
-  out-of-band terminate) has not run
+  out-of-band terminate) has not run. The AWS `CreateFleet` launch has run only against the
+  fake EC2: the launch template is not applied yet, and whether the fleet's Spot request
+  carries tags, whether `CreateFleet` also evaluates the caller's `RunInstances` conditions,
+  and how long EC2 keeps a `ClientToken` are unconfirmed
 - Firewalls on DigitalOcean, phoenixNAP and Latitude.sh. `firewall::IngressPolicy` has only
   the AWS shared security group implementation
 - Batch-job records and exit status. These belong to the app, which builds on holdings

@@ -34,13 +34,20 @@ function instanceOf(hostname: string): Instance {
 }
 
 // the lease file reaches the instance only inside its user data
-function leaseToken(hostname: string): string {
+function leaseFile(hostname: string): Record<string, unknown> {
   const match = /cloudlease_write '\/etc\/cloudlease\/lease\.json' 0600 '([A-Za-z0-9+/=]+)'/.exec(
     instanceOf(hostname).userData,
   );
   expect(match).not.toBeNull();
-  return JSON.parse(atob(match?.[1] ?? "")).token;
+  return JSON.parse(atob(match?.[1] ?? ""));
 }
+
+function leaseToken(hostname: string): string {
+  return leaseFile(hostname).token as string;
+}
+
+// every pool of the spot class, in the order the class names them
+const ALL_POOLS = ["c8a.4xlarge@us-east-1a", "c8a.4xlarge@us-east-1b", "c7a.4xlarge@us-east-1a", "c7a.4xlarge@us-east-1b"];
 
 async function alarmAt(runId: string): Promise<number | null> {
   return runInDurableObject(runStub(runId), (_instance, state) => state.storage.getAlarm());
@@ -72,29 +79,38 @@ describe("AWS Spot machines in miniflare", () => {
     vi.unstubAllGlobals();
   });
 
-  it("launches a one-time Spot instance with the class's first type and zone, its tags and boot data", async () => {
+  it("launches a one-time Spot instance through one fleet over every pool, with its tags and boot data", async () => {
     const run = await spotRun();
     const lease = await createMachine(run, "hb-spot-1");
 
+    // one call offers every type in every zone; the fake takes the first with capacity
+    expect(ec2.fleets).toEqual([ALL_POOLS]);
     const instance = instanceOf("hb-spot-1");
     expect(instance).toMatchObject({
       instanceType: "c8a.4xlarge",
       zone: "us-east-1a",
       subnetId: "subnet-0123456789abcdef0",
       imageId: "ami-0123456789abcdef0",
-      securityGroupId: "sg-0123456789abcdef0",
+      // the security group comes from the pinned launch template version
+      launchTemplate: "lt-0123456789abcdef0:3",
       rootDevice: "/dev/sda1",
       rootVolumeGib: 150,
+      rootEncrypted: true,
+      httpTokens: "required",
       // terminated on interruption, so EC2 never relaunches a machine whose lease ended
       spotType: "one-time",
       interruptionBehavior: "terminate",
+      allocationStrategy: "price-capacity-optimized",
       maxPrice: "0.025",
     });
     const until = Math.floor(Date.parse(lease.hard_deadline_at) / 1000);
     expect(instance.tags).toEqual([...instanceTags(run.run_id, 1, until), { key: "Name", value: "hb-spot-1" }]);
-    expect(ec2.spotRequests.get(instance.spotRequestId ?? "")?.tags).toEqual(instance.tags);
+    // a fleet cannot tag the Spot request it opens
+    expect(ec2.spotRequests.get(instance.spotRequestId ?? "")?.tags).toEqual([]);
     expect(instance.userData).toMatch(/^#!\/bin\/sh\n/);
     expect(leaseToken("hb-spot-1")).toMatch(/^cll_[0-9a-f]{64}$/);
+    // the machine watches the metadata service for EC2's interruption notice
+    expect(leaseFile("hb-spot-1").interruption_notice).toBe("aws_imds");
 
     // an 8 minute boot grace, a 3 cent permit, and a wake to check the instance after 2 minutes
     expect(lease.state).toBe("running");
@@ -105,39 +121,67 @@ describe("AWS Spot machines in miniflare", () => {
     expect((wake ?? 0) - Date.parse(lease.created_at)).toBeLessThanOrEqual(2 * MINUTE + 5_000);
   });
 
-  it("tries each instance type in every zone on a capacity error, and fails the create after the last", async () => {
+  it("launches in the first pool with capacity, and fails the create when every pool refuses", async () => {
     ec2.noCapacity.add("c8a.4xlarge@us-east-1a");
+    ec2.noCapacity.add("c8a.4xlarge@us-east-1b");
     const run = await spotRun();
 
     await createMachine(run, "hb-spot-capacity-1");
-    expect(instanceOf("hb-spot-capacity-1")).toMatchObject({ instanceType: "c8a.4xlarge", zone: "us-east-1b" });
-    expect(ec2.launches()).toEqual(["RunInstances c8a.4xlarge us-east-1a", "RunInstances c8a.4xlarge us-east-1b"]);
-
-    // the dearer type is tried only once the cheaper one has no capacity in any zone
-    ec2.noCapacity.add("c8a.4xlarge");
-    ec2.noCapacity.add("us-east-1a");
-    ec2.log.length = 0;
-    await createMachine(run, "hb-spot-capacity-2");
-    expect(instanceOf("hb-spot-capacity-2")).toMatchObject({ instanceType: "c7a.4xlarge", zone: "us-east-1b" });
-    expect(ec2.launches()).toEqual([
-      "RunInstances c8a.4xlarge us-east-1a",
-      "RunInstances c8a.4xlarge us-east-1b",
-      "RunInstances c7a.4xlarge us-east-1a",
-      "RunInstances c7a.4xlarge us-east-1b",
-    ]);
+    expect(instanceOf("hb-spot-capacity-1")).toMatchObject({ instanceType: "c7a.4xlarge", zone: "us-east-1a" });
+    // one fleet, not one launch per pool
+    expect(ec2.launches()).toHaveLength(1);
 
     ec2.noCapacity.add("c7a.4xlarge");
-    const response = await call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-spot-capacity-3"));
+    const response = await call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-spot-capacity-2"));
     expect(response.status).toBe(201);
     const failed = (await response.json()) as LeaseView;
     expect(failed.release).toMatchObject({ reason: "create_failed", by: "cloudlease" });
-    expect(ec2.named("hb-spot-capacity-3")).toBeUndefined();
+    expect(ec2.named("hb-spot-capacity-2")).toBeUndefined();
+    expect(ec2.launches()).toHaveLength(2);
     expect(ntfy.titles()).toEqual(["cloudlease: machine create failed in run pool-spot"]);
-    expect(ntfy.sent[0]?.body).toContain("no Spot capacity under the price cap");
+    expect(ntfy.sent[0]?.body).toContain(
+      "no Spot capacity under the price cap for c8a.4xlarge in us-east-1a, c8a.4xlarge in us-east-1b, c7a.4xlarge in us-east-1a, c7a.4xlarge in us-east-1b",
+    );
 
     // EC2 launched nothing, so the refused create's permit is back at once
     const held = (await permits()).filter((permit) => permit.ownerId === run.run_id).map((permit) => permit.generation);
-    expect(held.sort()).toEqual([1, 2]);
+    expect(held).toEqual([1]);
+  });
+
+  it("leaves out of the run's next launch the pool that just interrupted it", async () => {
+    const run = await spotRun();
+    const lease = await createMachine(run, "hb-spot-avoid-1");
+    const first = instanceOf("hb-spot-avoid-1");
+    expect(first).toMatchObject({ instanceType: "c8a.4xlarge", zone: "us-east-1a" });
+    ec2.interrupt(first.id);
+
+    // the presence check ends the interrupted machine's lease
+    await backdateMachine(lease, 3 * MINUTE);
+    await runDurableObjectAlarm(runStub(run.run_id));
+    expect((await settle(lease)).release).toMatchObject({ reason: "interrupted", by: "cloudlease" });
+
+    await createMachine(run, "hb-spot-avoid-2");
+
+    expect(ec2.fleets[1]).toEqual(ALL_POOLS.filter((pool) => pool !== "c8a.4xlarge@us-east-1a"));
+    expect(instanceOf("hb-spot-avoid-2")).toMatchObject({ instanceType: "c8a.4xlarge", zone: "us-east-1b" });
+    // another run's interruptions do not count
+    const other = await spotRun({ name: "pool-spot-other" });
+    await createMachine(other, "hb-spot-avoid-other");
+    expect(ec2.fleets[2]).toEqual(ALL_POOLS);
+  });
+
+  it("offers every pool when each one interrupted the run recently", async () => {
+    const run = await spotRun();
+    for (const pool of ALL_POOLS) {
+      const [instanceType, zone] = pool.split("@") as [string, string];
+      const id = ec2.addInstance(instanceTags(run.run_id, 99), "running", { instanceType, zone });
+      ec2.interrupt(id);
+    }
+
+    await createMachine(run, "hb-spot-everywhere");
+
+    expect(ec2.fleets).toEqual([ALL_POOLS]);
+    expect(instanceOf("hb-spot-everywhere")).toMatchObject({ instanceType: "c8a.4xlarge", zone: "us-east-1a" });
   });
 
   it("renews, and terminates a released instance and confirms it gone", async () => {
@@ -211,6 +255,7 @@ describe("AWS Spot machines in miniflare", () => {
     expect(released.release).toMatchObject({ reason: "interrupted", by: "cloudlease" });
     expect(released.gone_at).not.toBeNull();
     // EC2 already terminated it and closed its one-time request, so nothing is sent
+    expect(ec2.instances.get(id)?.stateReason).toBe("Server.SpotInstanceTermination");
     expect(ec2.terminationsOf(id)).toEqual([]);
     expect(ec2.log.filter((entry) => entry.startsWith("CancelSpotInstanceRequests"))).toEqual([]);
     expect(await permits()).toEqual([]);

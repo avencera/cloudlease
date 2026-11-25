@@ -14,19 +14,22 @@
 //!
 //! An AWS machine is one Spot instance whose root volume and network interface are deleted
 //! with it. It is a one-time request that terminates on interruption, so EC2 never leaves a
-//! stopped instance, a volume or an open Spot request behind for the sweep.
+//! stopped instance, a volume or an open Spot request behind for the sweep. One launch offers
+//! EC2 every pool of the class at once, less the pools that just interrupted the run; see
+//! [`choose_pools`].
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use cloudlease_core::{
     ids::{Generation, OwnerId, ResourceId},
     sweep::{Inventory, Observed, Unlisted},
     tags::{ManagedTags, OwnerTags, ResourceKind},
+    time::UnixMillis,
 };
 use cloudlease_provider::{
     aws::{
-        AvailabilityZone, AwsInstanceSpec, AwsKind, AwsRegion, IdempotencyKey,
-        InstanceTypeCandidates, RegionalSpec, SubnetId,
+        AvailabilityZone, AwsKind, AwsRegion, InstanceType, LaunchPools, RegionalSpec, SpotHistory,
+        SpotInterruption, SpotPool, SubnetId,
     },
     digitalocean::{DoKind, DoSpec},
     error::{ProviderError, ProviderErrorCode, ProviderResult},
@@ -35,6 +38,8 @@ use cloudlease_provider::{
     provider::{CloudProvider, CreateSpec, Presence},
 };
 use serde::{Deserialize, Serialize};
+
+use crate::boot::InterruptionNotice;
 
 /// The most locations a phoenixNAP class, or sites a Latitude.sh class, may try in turn
 ///
@@ -77,6 +82,16 @@ impl ProviderName {
     #[must_use]
     pub const fn reclaims_machines(self) -> bool {
         matches!(self, Self::Aws)
+    }
+
+    /// Returns how a machine of this provider learns that the provider is about to take it
+    /// back, for its `lease.json`
+    #[must_use]
+    pub const fn interruption_notice(self) -> Option<InterruptionNotice> {
+        match self {
+            Self::Aws => Some(InterruptionNotice::AwsImds),
+            Self::DigitalOcean | Self::PhoenixNap | Self::Latitude => None,
+        }
     }
 }
 
@@ -263,11 +278,49 @@ pub enum LatitudeSpec {
     Server(LatPlacement),
 }
 
-/// The most instance types an AWS class may try in turn
+/// The most instance types an AWS class may name
 ///
-/// A create tries every type in every zone, so with [`MAX_LOCATIONS`] zones this bounds it
-/// at 12 launches; only quick capacity refusals move it on.
+/// Every type is offered in every zone, so with [`MAX_LOCATIONS`] zones one launch offers EC2
+/// at most 12 pools.
 pub const MAX_INSTANCE_TYPES: usize = 4;
+
+/// How long a pool that interrupted one of a run's machines is left out of the run's next
+/// launches
+///
+/// A pool that just took an instance back is short of Spot capacity, so a machine launched
+/// into it again is likely to be interrupted again soon. An hour matches how long EC2 keeps
+/// a terminated instance listed, which is all the history the stateless check can see.
+pub const INTERRUPTION_LOOKBACK: Duration = Duration::from_secs(60 * 60);
+
+/// The instance types of an AWS class: 1 to [`MAX_INSTANCE_TYPES`], each at most once
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstanceTypes(Vec<InstanceType>);
+
+/// A rejected instance type list
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("instance_types must be 1 to {MAX_INSTANCE_TYPES} distinct instance types")]
+pub struct InstanceTypesError;
+
+impl InstanceTypes {
+    /// Checks a type list: not empty, at most [`MAX_INSTANCE_TYPES`], no repeats
+    pub fn new(types: Vec<InstanceType>) -> Result<Self, InstanceTypesError> {
+        let repeated = types
+            .iter()
+            .enumerate()
+            .any(|(index, instance_type)| types[..index].contains(instance_type));
+        if types.is_empty() || types.len() > MAX_INSTANCE_TYPES || repeated {
+            return Err(InstanceTypesError);
+        }
+
+        Ok(Self(types))
+    }
+
+    /// Returns the types in the order the class names them
+    #[must_use]
+    pub fn as_slice(&self) -> &[InstanceType] {
+        &self.0
+    }
+}
 
 /// An Availability Zone and the subnet an instance is launched into there
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -278,16 +331,82 @@ pub struct AwsZone {
     pub subnet_id: SubnetId,
 }
 
-/// An AWS Spot instance and the zones and instance types it may be launched with
+/// The pools one AWS launch offers, after leaving out those that interrupted the run
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AwsPlacement {
-    /// The region
-    pub region: AwsRegion,
-    /// The instance; its types, zone, subnet and idempotency key are replaced by each
-    /// attempt's
-    pub instance: AwsInstanceSpec,
-    /// Where to try, first to last, for each instance type in turn
-    pub zones: Locations<AwsZone>,
+pub enum PoolChoice {
+    /// No pool interrupted the run recently, so every pool is offered
+    All(LaunchPools),
+    /// Some pools interrupted the run recently and are left out
+    Without {
+        /// The pools offered
+        pools: LaunchPools,
+        /// The pools left out
+        left_out: Vec<SpotPool>,
+    },
+    /// Every pool interrupted the run recently, so every pool is offered rather than none
+    AllInterrupted(LaunchPools),
+}
+
+impl PoolChoice {
+    /// Returns the pools to offer
+    #[must_use]
+    pub const fn pools(&self) -> &LaunchPools {
+        match self {
+            Self::All(pools) | Self::AllInterrupted(pools) | Self::Without { pools, .. } => pools,
+        }
+    }
+
+    /// Returns the pools to offer, consuming the choice
+    #[must_use]
+    pub fn into_pools(self) -> LaunchPools {
+        match self {
+            Self::All(pools) | Self::AllInterrupted(pools) | Self::Without { pools, .. } => pools,
+        }
+    }
+}
+
+/// Leaves out of `pools` every pool that interrupted the run within [`INTERRUPTION_LOOKBACK`]
+/// of `now`, unless that leaves none
+///
+/// An interruption without a time counts as recent: EC2 lists a terminated instance only for
+/// about an hour, so having seen it at all bounds its age.
+#[must_use]
+pub fn choose_pools(
+    pools: LaunchPools,
+    interruptions: &[SpotInterruption],
+    now: UnixMillis,
+) -> PoolChoice {
+    let recent = |interruption: &&SpotInterruption| {
+        interruption.at.is_none_or(|at| {
+            at.checked_add(INTERRUPTION_LOOKBACK)
+                .is_none_or(|until| until >= now)
+        })
+    };
+    let interrupted = |pool: &SpotPool| {
+        interruptions.iter().filter(recent).any(|interruption| {
+            pool.is(
+                interruption.instance_type.as_str(),
+                interruption.availability_zone.as_str(),
+            )
+        })
+    };
+    let (left_out, kept): (Vec<_>, Vec<_>) = pools
+        .as_slice()
+        .iter()
+        .cloned()
+        .partition(|pool| interrupted(pool));
+    if left_out.is_empty() {
+        return PoolChoice::All(pools);
+    }
+
+    // a non-empty subset of valid pools is valid too
+    match LaunchPools::new(kept) {
+        Ok(kept) => PoolChoice::Without {
+            pools: kept,
+            left_out,
+        },
+        Err(_) => PoolChoice::AllInterrupted(pools),
+    }
 }
 
 /// A create request for one resource of a machine
@@ -299,8 +418,8 @@ pub enum MachineSpec {
     PhoenixNap(PnapPlacement),
     /// A Latitude.sh user data record or server
     Latitude(LatitudeSpec),
-    /// An AWS Spot instance, tried with each instance type in each zone until one launches
-    Aws(AwsPlacement),
+    /// An AWS Spot instance, launched in whichever of its pools EC2 picks
+    Aws(RegionalSpec),
 }
 
 impl CreateSpec for MachineSpec {
@@ -334,7 +453,7 @@ where
     D: CloudProvider<Kind = DoKind, Spec = DoSpec>,
     P: CloudProvider<Kind = PnapKind, Spec = PnapSpec>,
     L: CloudProvider<Kind = LatKind, Spec = LatSpec>,
-    A: CloudProvider<Kind = AwsKind, Spec = RegionalSpec>,
+    A: CloudProvider<Kind = AwsKind, Spec = RegionalSpec> + SpotHistory,
 {
     /// Combines the configured adapters
     pub const fn new(
@@ -373,59 +492,14 @@ where
         })
     }
 
-    /// Launches the instance with each instance type in each zone in turn until one has
-    /// Spot capacity under the class's price cap
-    ///
-    /// Types are the outer loop, so a cheaper type is tried in every zone before a dearer
-    /// one. Only `NoCapacity` moves on, since EC2 launched nothing; any other failure may
-    /// have launched the instance, so it ends the create for the lease's cleanup. Each zone
-    /// gets its own idempotency key, so a type's client token never repeats with other
-    /// parameters.
-    async fn create_instance(
+    /// Returns the pools in `region` that interrupted any of `owner`'s machines in about
+    /// the last hour
+    pub async fn spot_interruptions(
         &self,
-        owner: &OwnerTags,
-        placement: &AwsPlacement,
-    ) -> ProviderResult<ResourceId> {
-        let aws = self.aws()?;
-        let mut refused = Vec::new();
-        for instance_type in placement.instance.instance_types.as_slice() {
-            for zone in placement.zones.as_slice() {
-                let key = format!(
-                    "{}-{}",
-                    placement.instance.idempotency_key.as_str(),
-                    zone.zone.as_str()
-                );
-                let spec = RegionalSpec {
-                    region: placement.region.clone(),
-                    instance: AwsInstanceSpec {
-                        instance_types: InstanceTypeCandidates::new(vec![instance_type.clone()])?,
-                        availability_zone: zone.zone.clone(),
-                        subnet_id: zone.subnet_id.clone(),
-                        idempotency_key: IdempotencyKey::parse(key)?,
-                        ..placement.instance.clone()
-                    },
-                };
-                match aws.create(owner, &spec).await {
-                    Err(error) if error.code == ProviderErrorCode::NoCapacity => {
-                        refused.push(format!(
-                            "{} in {}",
-                            instance_type.as_str(),
-                            zone.zone.as_str()
-                        ));
-                    }
-                    result => return result,
-                }
-            }
-        }
-
-        Err(ProviderError::new(
-            ProviderErrorCode::NoCapacity,
-            false,
-            format!(
-                "AWS has no Spot capacity under the price cap for {}",
-                refused.join(", ")
-            ),
-        ))
+        region: &AwsRegion,
+        owner: &OwnerId,
+    ) -> ProviderResult<Vec<SpotInterruption>> {
+        self.aws()?.spot_interruptions(region, owner).await
     }
 
     fn latitude(&self) -> ProviderResult<&L> {
@@ -576,7 +650,7 @@ where
     D: CloudProvider<Kind = DoKind, Spec = DoSpec>,
     P: CloudProvider<Kind = PnapKind, Spec = PnapSpec>,
     L: CloudProvider<Kind = LatKind, Spec = LatSpec>,
-    A: CloudProvider<Kind = AwsKind, Spec = RegionalSpec>,
+    A: CloudProvider<Kind = AwsKind, Spec = RegionalSpec> + SpotHistory,
 {
     type Kind = MachineKind;
     type Spec = MachineSpec;
@@ -593,7 +667,8 @@ where
             MachineSpec::Latitude(LatitudeSpec::Server(placement)) => {
                 self.create_latitude_server(owner, placement).await
             }
-            MachineSpec::Aws(placement) => self.create_instance(owner, placement).await,
+            // one launch offers every pool, so there is nothing to fall through to here
+            MachineSpec::Aws(spec) => self.aws()?.create(owner, spec).await,
         }
     }
 
@@ -671,10 +746,84 @@ where
 
 #[cfg(test)]
 mod tests {
-    use cloudlease_core::tags::ResourceKind;
-    use cloudlease_provider::{digitalocean::DoKind, phoenixnap::Location};
+    use cloudlease_core::{tags::ResourceKind, time::UnixMillis};
+    use cloudlease_provider::{
+        aws::{AvailabilityZone, InstanceType, LaunchPools, SpotInterruption, SpotPool, SubnetId},
+        digitalocean::DoKind,
+        phoenixnap::Location,
+    };
 
-    use super::{Locations, MachineKind};
+    use super::{INTERRUPTION_LOOKBACK, Locations, MachineKind, PoolChoice, choose_pools};
+
+    fn pool(instance_type: &str, zone: &str) -> SpotPool {
+        SpotPool {
+            instance_type: InstanceType::parse(instance_type).unwrap(),
+            availability_zone: AvailabilityZone::parse(zone).unwrap(),
+            subnet_id: SubnetId::parse("subnet-01234567").unwrap(),
+        }
+    }
+
+    fn interruption(instance_type: &str, zone: &str, at: Option<u64>) -> SpotInterruption {
+        SpotInterruption {
+            instance_type: InstanceType::parse(instance_type).unwrap(),
+            availability_zone: AvailabilityZone::parse(zone).unwrap(),
+            at: at.and_then(UnixMillis::new),
+        }
+    }
+
+    #[test]
+    fn a_launch_leaves_out_pools_that_interrupted_the_run_within_the_hour() {
+        let pools = LaunchPools::new(vec![
+            pool("c8a.4xlarge", "us-east-1a"),
+            pool("c8a.4xlarge", "us-east-1b"),
+            pool("c7a.4xlarge", "us-east-1a"),
+        ])
+        .unwrap();
+        let hour = u64::try_from(INTERRUPTION_LOOKBACK.as_millis()).unwrap();
+        let now = UnixMillis::new(10 * hour).unwrap();
+
+        // one recent, one with no time, which counts as recent, and one past the lookback
+        let choice = choose_pools(
+            pools.clone(),
+            &[
+                interruption("c8a.4xlarge", "us-east-1a", Some(10 * hour - 60_000)),
+                interruption("c7a.4xlarge", "us-east-1a", None),
+                interruption("c8a.4xlarge", "us-east-1b", Some(10 * hour - hour - 1)),
+            ],
+            now,
+        );
+        assert_eq!(
+            choice,
+            PoolChoice::Without {
+                pools: LaunchPools::new(vec![pool("c8a.4xlarge", "us-east-1b")]).unwrap(),
+                left_out: vec![
+                    pool("c8a.4xlarge", "us-east-1a"),
+                    pool("c7a.4xlarge", "us-east-1a")
+                ],
+            }
+        );
+
+        // with no pool left, every pool is offered rather than none
+        let everywhere: Vec<_> = pools
+            .as_slice()
+            .iter()
+            .map(|pool| {
+                interruption(
+                    pool.instance_type.as_str(),
+                    pool.availability_zone.as_str(),
+                    None,
+                )
+            })
+            .collect();
+        assert_eq!(
+            choose_pools(pools.clone(), &everywhere, now),
+            PoolChoice::AllInterrupted(pools.clone())
+        );
+        assert_eq!(
+            choose_pools(pools.clone(), &[], now),
+            PoolChoice::All(pools)
+        );
+    }
 
     #[test]
     fn machine_kinds_keep_their_providers_tags_and_delete_order() {

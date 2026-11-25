@@ -154,28 +154,49 @@ A Worker without `LATITUDE_API_KEY` and `LATITUDE_PROJECT` refuses a Latitude.sh
 
 ## AWS
 
-An AWS class names a `region`, up to 4 `instance_types` (cheapest per unit of work first),
-up to 3 `zones` each with the `subnet_id` to launch into, an `image_id` (Canonical's Ubuntu
-24.04, pinned; see `infra/aws-machines`), an optional `root_device_name` (`/dev/sda1`, as on
-Canonical's images, when absent), a `root_volume_gib` of at least 8, a `security_group_id`,
-and a `spot_max_price_usd` no higher than its `price_per_hour_usd`.
+An AWS class names a `region`, up to 4 `instance_types`, up to 3 `zones` each with the
+`subnet_id` to launch into, an `image_id` (Canonical's Ubuntu 24.04, pinned; see
+`infra/aws-machines`), an optional `root_device_name` (`/dev/sda1`, as on Canonical's images,
+when absent), a `root_volume_gib` of at least 8, a `launch_template_id` and its
+`launch_template_version` (a number, never `$Latest` or `$Default`, so a template edit
+changes nothing until the class names the new version), and a `spot_max_price_usd` no higher
+than its `price_per_hour_usd`.
 
-Each machine is one Spot instance launched with `RunInstances` as a one-time request that EC2
-terminates when it needs the capacity back, so an interrupted instance is simply gone: EC2
-never stops it, keeps its volume or relaunches it. It has IMDSv2, a public IPv4 address and an
-encrypted gp3 root volume and network interface deleted with it, and carries the key-value
-tags `{prefix}-managed=true`, `-owner`, `-gen`, `-kind=instance`, `-until` and `Name` (the
-hostname), as does its Spot request. A create tries the first type in each zone, then the
-next type in each zone, and moves on only when EC2 answers that it has no Spot capacity for
-that type there or that the Spot price is above the max price, which launch nothing. After
-the last, the lease ends with `create_failed`, adds nothing to the run's spend and returns its
-permit at once. A quota error, such as too few Spot vCPUs, ends the create at once. A class's
-zones must offer every one of its types, or EC2 refuses the launch outright.
+Each machine is one Spot instance launched by one instant EC2 Fleet (`CreateFleet`) of one
+instance. Every instance type in every zone of the class is one Spot pool, and the fleet
+offers them all as overrides of the launch template, with the `price-capacity-optimized`
+allocation strategy: EC2 picks the cheapest of the pools least likely to be interrupted, so
+the order of `instance_types` and `zones` is no preference. Each override sets the type,
+subnet, zone, AMI, root volume, IMDSv2 and the class's max price; the user data travels with
+the launch, so one template version serves every machine. The request is one-time and EC2
+terminates the instance when it needs the capacity back, so an interrupted instance is simply
+gone: EC2 never stops it, keeps its volume or relaunches it. It has IMDSv2, a public IPv4
+address from its subnet, the template's security group and an encrypted gp3 root volume and
+network interface deleted with it. The instance, its root volume and the fleet carry the
+key-value tags `{prefix}-managed=true`, `-owner`, `-gen`, `-kind=instance`, `-until` and
+`Name` (the hostname). A fleet cannot tag the Spot request it opens, so cleanup accepts an
+untagged one-time request as the instance's own and never cancels it: it closes with the
+instance.
 
-The class's security group should allow no inbound traffic: a machine reaches its
-coordinator outbound. The Worker never changes a security group. The sweep lists instances
-only: a one-time request closes with its instance, and the root volume and network interface
-are deleted with it, so neither can be left behind.
+Before each launch the run leaves out the pools that took one of its machines back in the last
+hour: it lists the run's instances by their owner tag, terminated ones included (EC2 lists
+them for about an hour), and leaves out the type and zone of each one whose state reason is
+`Server.SpotInstanceTermination`, logging the pools it left out. If that leaves no pool, the
+launch offers them all. If the list fails, the launch offers every pool.
+
+A fleet that launches nothing answers with an empty instance set and one error per refused
+pool. When any pool refused for Spot capacity or for a Spot price above the max price, the
+lease ends with `create_failed`, naming the refused pools; it adds nothing to the run's spend
+and returns its permit at once. When every pool failed otherwise, such as a type a zone does
+not offer, or the call itself failed, such as a quota or permission error, the create ends
+with that error. A lost answer is never replayed: the lease's cleanup finds any instance by
+its tags.
+
+The launch template's security group should allow no inbound traffic: a machine reaches its
+coordinator outbound. The Worker never changes a security group or a launch template. The
+sweep lists instances only: a one-time request closes with its instance, the root volume and
+network interface are deleted with it, and EC2 deletes an instant fleet on its own some time
+after its instance terminates, so none of them can be left behind.
 
 The Worker uses its own IAM user, never rembuild's. `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY` are optional secrets, and `AWS_REGIONS` lists every region the Worker
@@ -184,10 +205,13 @@ removing a class never takes its region out of the sweep. `infra/aws-machines` c
 region, so `AWS_REGIONS` lists only that one until the Terraform covers more. A Worker without the keys, or whose
 `AWS_REGIONS` omits a class's region, refuses that class with `400 unknown_class`, and
 reports `"aws": false` on health when a class needs them. `infra/aws-machines` holds the
-network, security group and IAM policy as Terraform.
+network, security group, launch template and IAM policy as Terraform.
 
 homebased sees an interrupted machine's lease released with reason `interrupted`, which it
-reads as an unknown reason that may have lost output, as for `heartbeat_lapsed`.
+reads as an unknown reason that may have lost output, as for `heartbeat_lapsed`. An AWS
+machine's `lease.json` also carries `"interruption_notice": "aws_imds"`, so the machine
+watches the EC2 instance metadata service for the Spot interruption notice EC2 posts about two
+minutes before it takes the instance back.
 
 ## Spend caps
 
@@ -283,8 +307,8 @@ Every class has `price_per_hour_usd`, `max_hours`, and optionally `boot_grace_se
   `m4-metal-medium`, `sites` such as `["DAL", "CHI"]` and `ssh_key_ids` the IDs of project
   SSH keys
 - `aws`: `{region, instance_types, zones: [{zone, subnet_id}], image_id, root_device_name?,
-  root_volume_gib, security_group_id, spot_max_price_usd}`, such as `instance_types:
-  ["c8a.4xlarge", "c7a.4xlarge"]`; see AWS above
+  root_volume_gib, launch_template_id, launch_template_version, spot_max_price_usd}`, such
+  as `instance_types: ["c8a.4xlarge", "c7a.4xlarge"]`; see AWS above
 
 `api_base` is the URL machines renew at, written into their `lease.json`. See
 `wrangler.jsonc` for an example.
@@ -294,7 +318,8 @@ Every class has `price_per_hour_usd`, `max_hours`, and optionally `boot_grace_se
 The machine's user data is a POSIX `sh` script, which DigitalOcean runs at first boot and
 phoenixNAP, Latitude.sh and EC2 pass to cloud-init. It logs to `/var/log/cloudlease-boot.log`, writes
 `/etc/cloudlease/lease.json` (`lease_id`, `token`, `api_base`, `hard_deadline_at`,
-`heartbeat_ttl_secs`) with mode `0600`, formats and mounts the volume when the class has
+`heartbeat_ttl_secs`, and `interruption_notice` for a provider that can take the machine back:
+`aws_imds` for AWS, absent otherwise) with mode `0600`, formats and mounts the volume when the class has
 one, writes the client's files under a `077` umask, and runs its commands in order.
 
 ## Tests

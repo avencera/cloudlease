@@ -1,8 +1,11 @@
 //! EC2 Spot instances on AWS
 //!
-//! [`Aws`] manages one kind, [`AwsKind::Instance`]: a Spot instance, either persistent and
-//! stopped when EC2 reclaims its capacity, or one-time and terminated then, by its
-//! [`SpotMarket`]. Its root volume is deleted with it, so there is no volume kind. AWS tags are keys and values, so the adapter writes the scheme's
+//! [`Aws`] manages one kind, [`AwsKind::Instance`]: a one-time Spot instance that EC2
+//! terminates when it takes the capacity back. [`Aws::launch`] makes one instant
+//! `CreateFleet` call over every candidate [`SpotPool`], so EC2's `price-capacity-optimized`
+//! strategy picks the pool least likely to be interrupted. The instance's root volume is
+//! deleted with it, and EC2 deletes the fleet object on its own, so neither is a kind. AWS
+//! tags are keys and values, so the adapter writes the scheme's
 //! [pairs](TagScheme::render_pairs) plus a `Name`, and reads them back with
 //! [`TagScheme::classify_pairs`], leaving `Name` out.
 //!
@@ -18,12 +21,13 @@ pub mod ingress;
 mod signing;
 mod xml;
 
-use std::{collections::BTreeMap, num::NonZeroU16};
+use std::{collections::BTreeMap, future::Future, num::NonZeroU16};
 
 use cloudlease_core::{
     ids::{Generation, OwnerId, ResourceId},
     sweep::{Inventory, Observed, Unrecognized},
     tags::{ManagedTags, OwnerTags, ResourceKind, TagMatch, TagScheme, UnrecognizedReason},
+    time::UnixMillis,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -33,9 +37,11 @@ pub use ec2::{
     AmiId, AvailabilityZone, AwsImage, AwsInstance, AwsInstanceDetails, AwsInstanceState,
     AwsInstanceType, AwsInstanceVolume, AwsSecurityGroup, AwsSecurityGroupIngress,
     AwsSpotInstanceRequest, AwsSpotInstanceRequestState, AwsSpotInstanceRequestType,
-    AwsSpotInterruptionBehavior, AwsSubnet, AwsTag, Ec2, InstanceFilter, InstanceName,
-    InstanceType, MAX_USER_DATA_BYTES, NAME_TAG_KEY, RunInstancesRequest, SecurityGroupId,
-    SpotLifetime, SpotMarket, SpotMaxPrice, SubnetId, TcpIngress, UserData, is_ambiguous_failure,
+    AwsSpotInterruptionBehavior, AwsStateReason, AwsSubnet, AwsTag, CreateFleetRequest,
+    CreateFleetResponse, Ec2, FleetError, FleetInstances, FleetOverrides, InstanceFilter,
+    InstanceName, InstanceType, LaunchTemplate, LaunchTemplateId, MAX_USER_DATA_BYTES,
+    NAME_TAG_KEY, RetiredPlacement, SPOT_INSTANCE_TERMINATION, SecurityGroupId, SpotMaxPrice,
+    SpotPool, SubnetId, TcpIngress, UserData, is_ambiguous_failure,
 };
 pub use ingress::{AwsIngress, SharedSecurityGroup};
 pub use signing::{AwsCredentials, AwsRegion};
@@ -47,8 +53,12 @@ use crate::{
 };
 use signing::hex_lower;
 
-/// The most instance types one launch may try
-pub const MAX_INSTANCE_TYPE_CANDIDATES: usize = 20;
+/// The most pools one launch may offer EC2
+///
+/// The EC2 API reference caps request and maintain fleets at 300 overrides across all launch
+/// templates; it names no cap for instant fleets, so this assumes the same one. A launch over
+/// it is refused before it reaches EC2.
+pub const MAX_LAUNCH_POOLS: usize = 300;
 
 /// An AWS resource kind cloudlease manages
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -74,36 +84,47 @@ impl ResourceKind for AwsKind {
     }
 }
 
-/// The instance types one launch tries, in order
+/// The Spot pools one launch offers EC2: 1 to [`MAX_LAUNCH_POOLS`], each instance type and
+/// zone at most once
 ///
-/// A launch moves to the next type only when EC2 has no Spot capacity for the current one;
-/// any other failure ends it.
+/// EC2 picks among them, so their order is no preference.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InstanceTypeCandidates(Vec<InstanceType>);
+pub struct LaunchPools(Vec<SpotPool>);
 
-impl InstanceTypeCandidates {
-    /// Checks that there are 1 to 20 distinct types
-    pub fn new(candidates: Vec<InstanceType>) -> ProviderResult<Self> {
-        if candidates.is_empty() || candidates.len() > MAX_INSTANCE_TYPE_CANDIDATES {
+impl LaunchPools {
+    /// Checks the pool count and that no instance type and zone repeats
+    pub fn new(pools: Vec<SpotPool>) -> ProviderResult<Self> {
+        if pools.is_empty() || pools.len() > MAX_LAUNCH_POOLS {
+            return Err(ProviderError::validation(format!(
+                "a launch must offer from 1 through {MAX_LAUNCH_POOLS} Spot pools"
+            )));
+        }
+        let repeated = pools.iter().enumerate().any(|(index, pool)| {
+            pools[..index].iter().any(|earlier| {
+                earlier.is(pool.instance_type.as_str(), pool.availability_zone.as_str())
+            })
+        });
+        if repeated {
             return Err(ProviderError::validation(
-                "a launch must try from 1 through 20 instance types",
+                "a launch must not offer an instance type in one zone twice",
             ));
         }
-        for (index, candidate) in candidates.iter().enumerate() {
-            if candidates[..index].contains(candidate) {
-                return Err(ProviderError::validation(
-                    "a launch must not try an instance type twice",
-                ));
-            }
-        }
 
-        Ok(Self(candidates))
+        Ok(Self(pools))
     }
 
-    /// Returns the types in launch order
+    /// Returns the pools in the order they are sent
     #[must_use]
-    pub fn as_slice(&self) -> &[InstanceType] {
+    pub fn as_slice(&self) -> &[SpotPool] {
         &self.0
+    }
+
+    /// Returns the pool that is `instance_type` in `availability_zone`
+    #[must_use]
+    pub fn find(&self, instance_type: &str, availability_zone: &str) -> Option<&SpotPool> {
+        self.0
+            .iter()
+            .find(|pool| pool.is(instance_type, availability_zone))
     }
 }
 
@@ -117,33 +138,31 @@ validated!(
 
 /// One Spot instance to launch
 ///
-/// The adapter adds the parts that are not options: a public IPv4 address, IMDSv2 and an
-/// encrypted gp3 root volume deleted with the instance.
+/// The adapter adds the parts that are not options: a one-time request that terminates on
+/// interruption, IMDSv2 and an encrypted gp3 root volume deleted with the instance. The
+/// launch template supplies the security group; the subnets give the public IPv4 address.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AwsInstanceSpec {
     /// The `Name` tag
     pub name: InstanceName,
-    /// The instance types to try, in order
-    pub instance_types: InstanceTypeCandidates,
+    /// The pools EC2 may launch in
+    pub pools: LaunchPools,
+    /// The launch template every pool shares
+    pub launch_template: LaunchTemplate,
     /// The AMI
     pub image_id: AmiId,
     /// The AMI's root device name, from [`Ec2::describe_image`]
     pub root_device_name: String,
     /// The root volume size
     pub root_volume_gib: NonZeroU16,
-    /// The subnet
-    pub subnet_id: SubnetId,
-    /// The Availability Zone, which must be the subnet's
-    pub availability_zone: AvailabilityZone,
-    /// The security group
-    pub security_group_id: SecurityGroupId,
     /// The boot user data
     pub user_data: UserData,
-    /// The caller's key for this launch; each instance type gets its own client token
-    /// derived from it
+    /// The caller's key for this launch, from which its client token is derived
     pub idempotency_key: IdempotencyKey,
-    /// The Spot request's lifetime, interruption behavior and price cap
-    pub market: SpotMarket,
+    /// The most the instance may cost per hour in any pool; EC2 refuses a pool whose Spot
+    /// price is higher and reclaims the instance when it rises above it. `None` caps it at
+    /// the On-Demand price
+    pub max_price: Option<SpotMaxPrice>,
 }
 
 impl CreateSpec for AwsInstanceSpec {
@@ -152,6 +171,39 @@ impl CreateSpec for AwsInstanceSpec {
     fn kind(&self) -> AwsKind {
         AwsKind::Instance
     }
+}
+
+/// A launched instance and the pool EC2 chose for it
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchedInstance {
+    /// The instance as the launch reported it
+    pub instance: AwsInstance,
+    /// The pool it launched in
+    pub pool: SpotPool,
+}
+
+/// A Spot pool that took an owner's instance back
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpotInterruption {
+    /// The instance type
+    pub instance_type: InstanceType,
+    /// The Availability Zone
+    pub availability_zone: AvailabilityZone,
+    /// When EC2 terminated the instance, when its transition reason names a time
+    pub at: Option<UnixMillis>,
+}
+
+/// Reads which Spot pools recently took an owner's instances back
+///
+/// EC2 keeps a terminated instance visible for about an hour, so this sees only recent
+/// interruptions.
+pub trait SpotHistory {
+    /// Returns the pools in `region` that interrupted any generation of `owner`
+    fn spot_interruptions(
+        &self,
+        region: &AwsRegion,
+        owner: &OwnerId,
+    ) -> impl Future<Output = ProviderResult<Vec<SpotInterruption>>>;
 }
 
 /// A managed instance with its parsed tags and everything EC2 reported
@@ -210,8 +262,8 @@ impl<C: Ec2> Aws<C> {
         &self.scheme
     }
 
-    /// Returns the exact tags an instance and its Spot request get: the scheme's pairs and
-    /// `Name`
+    /// Returns the exact tags an instance, its root volume and its fleet get: the scheme's
+    /// pairs and `Name`
     #[must_use]
     pub fn instance_tags(&self, owner: &OwnerTags, name: &InstanceName) -> Vec<AwsTag> {
         self.scheme
@@ -234,48 +286,95 @@ impl<C: Ec2> Aws<C> {
         self.scheme.classify_pairs(&pairs)
     }
 
-    /// Launches a Spot instance and returns it as EC2 reported the launch
+    /// Launches a Spot instance in one of the spec's pools and returns it with the pool
     ///
-    /// Tries each instance type in order while EC2 reports no Spot capacity. Each type's
-    /// client token comes from the owner, generation, idempotency key and type, so repeating
-    /// a launch returns the instance the first one created. A launch is never replayed after
-    /// an [ambiguous failure](is_ambiguous_failure); the caller looks for the instance with
-    /// [`Aws::find_instances`].
+    /// One instant `CreateFleet` call offers every pool, and EC2 picks the one least likely
+    /// to be interrupted. The client token comes from the owner, generation and idempotency
+    /// key, so repeating a launch returns the instance the first one created. A launch is
+    /// never replayed after an [ambiguous failure](is_ambiguous_failure); the caller looks
+    /// for the instance with [`Aws::find_instances`]. A fleet that launched nothing is a
+    /// definite failure: [`ProviderErrorCode::NoCapacity`] when every pool refused for
+    /// capacity or price, and the first other error's class otherwise.
     pub async fn launch(
         &self,
         owner: &OwnerTags,
         spec: &AwsInstanceSpec,
-    ) -> ProviderResult<AwsInstance> {
+    ) -> ProviderResult<LaunchedInstance> {
         let tags = self.instance_tags(owner, &spec.name);
-        let mut last_capacity_error = None;
+        let request = CreateFleetRequest {
+            launch_template: spec.launch_template.clone(),
+            pools: spec.pools.as_slice().to_vec(),
+            image_id: spec.image_id.clone(),
+            root_device_name: spec.root_device_name.clone(),
+            root_volume_gib: spec.root_volume_gib,
+            max_price: spec.max_price.clone(),
+            user_data: spec.user_data.clone(),
+            tags: tags.clone(),
+            client_token: self.client_token(owner, &spec.idempotency_key),
+        };
+        let response = self.ec2.create_fleet(request).await?;
+        let Some(launched) = response.instances.first() else {
+            return Err(fleet_failure(&spec.pools, &response.errors));
+        };
 
-        for instance_type in spec.instance_types.as_slice() {
-            let request = RunInstancesRequest {
-                image_id: spec.image_id.clone(),
-                root_device_name: spec.root_device_name.clone(),
-                root_volume_gib: spec.root_volume_gib,
-                instance_type: instance_type.clone(),
-                subnet_id: spec.subnet_id.clone(),
-                availability_zone: spec.availability_zone.clone(),
-                security_group_id: spec.security_group_id.clone(),
-                tags: tags.clone(),
-                user_data: spec.user_data.clone(),
-                client_token: self.client_token(owner, &spec.idempotency_key, instance_type),
-                market: spec.market.clone(),
-            };
-            match self.ec2.run_instances(request).await {
-                Ok(instance) => return Ok(instance),
-                Err(error) if error.code == ProviderErrorCode::NoCapacity && error.retryable => {
-                    last_capacity_error = Some(error);
-                }
-                Err(error) => return Err(error),
-            }
+        // the fleet asks for one instance, so anything else is a response this adapter does
+        // not understand; whatever launched carries the lease's tags for its cleanup to find
+        let [instance_id] = launched.instance_ids.as_slice() else {
+            return Err(ProviderError::invalid_response(
+                "EC2 CreateFleet did not launch exactly one instance",
+            ));
+        };
+        if response.instances.len() > 1 {
+            return Err(ProviderError::invalid_response(
+                "EC2 CreateFleet did not launch exactly one instance",
+            ));
         }
+        let pool = launched_pool(&spec.pools, launched)?;
+        let instance = AwsInstance::present(
+            instance_id.clone(),
+            AwsInstanceState::Pending,
+            AwsInstanceDetails {
+                instance_type: pool.instance_type.as_str().to_owned(),
+                image_id: spec.image_id.as_str().to_owned(),
+                availability_zone: pool.availability_zone.as_str().to_owned(),
+                subnet_id: pool.subnet_id.as_str().to_owned(),
+                public_ipv4: None,
+                volumes: Vec::new(),
+                // the launch template holds the security group, so the launch does not name it
+                security_group_ids: Vec::new(),
+                spot: true,
+                imds_v2_required: true,
+            },
+            tags,
+        )?;
 
-        // candidates are never empty, so a capacity error was recorded
-        Err(last_capacity_error.unwrap_or_else(|| {
-            ProviderError::validation("a launch must try at least one instance type")
-        }))
+        Ok(LaunchedInstance { instance, pool })
+    }
+
+    /// Returns the pools that took any generation of `owner`'s instances back
+    ///
+    /// Terminated instances count, since EC2 lists them for about an hour after the
+    /// interruption; an instance whose type or zone EC2 no longer reports is skipped.
+    pub async fn spot_interruptions(
+        &self,
+        owner: &OwnerId,
+    ) -> ProviderResult<Vec<SpotInterruption>> {
+        let filter = InstanceFilter::Tag(AwsTag::new(
+            format!("{}-owner", self.scheme.prefix()),
+            owner.as_str(),
+        ));
+        let instances = self.ec2.list_instances(filter).await?;
+
+        Ok(instances
+            .iter()
+            .filter(|instance| {
+                matches!(
+                    self.classify(instance.tags()),
+                    TagMatch::Managed(tags) if tags.owner == *owner
+                )
+            })
+            .filter_map(interruption)
+            .collect())
     }
 
     /// Returns the live instances with an exact tag set for one owner and generation
@@ -337,6 +436,10 @@ impl<C: Ec2> Aws<C> {
     }
 
     /// Returns the Spot request that launched an instance, checking it carries `expected`
+    ///
+    /// A fleet cannot tag the Spot request it opens, so an untagged one-time request is
+    /// accepted as the instance's own: it closes with the instance and is never cancelled.
+    /// A request with any of the scheme's tags must carry exactly the instance's.
     pub async fn spot_request(
         &self,
         instance: &AwsInstance,
@@ -365,6 +468,9 @@ impl<C: Ec2> Aws<C> {
 
         match self.classify(&request.tags) {
             TagMatch::Managed(tags) if tags == *expected => Ok(Some(request)),
+            TagMatch::Foreign if request.request_type == AwsSpotInstanceRequestType::OneTime => {
+                Ok(Some(request))
+            }
             _ => Err(invariant_violation(
                 "the Spot request does not carry its instance's exact managed tags",
             )),
@@ -398,8 +504,11 @@ impl<C: Ec2> Aws<C> {
             }
         };
 
-        // a persistent request outlives its instance and would launch a replacement
+        // a persistent request outlives its instance and would launch a replacement; a
+        // one-time request closes with it, and a fleet's is untagged, so the policy would
+        // refuse its cancel
         if let Some(request) = self.spot_request(&instance, &tags).await?
+            && request.request_type != AwsSpotInstanceRequestType::OneTime
             && request.state.may_launch()
         {
             ignore_not_found(self.ec2.cancel_spot_instance_request(request.id).await)?;
@@ -411,19 +520,10 @@ impl<C: Ec2> Aws<C> {
         ignore_not_found(self.ec2.terminate_instance(id.as_str().to_owned()).await)
     }
 
-    fn client_token(
-        &self,
-        owner: &OwnerTags,
-        key: &IdempotencyKey,
-        instance_type: &InstanceType,
-    ) -> String {
-        let identity = format!(
-            "{}:{}:{}:{}",
-            owner.owner,
-            owner.generation,
-            key.as_str(),
-            instance_type.as_str()
-        );
+    // one token per launch: a repeat with other pools is refused by EC2 as a parameter
+    // mismatch rather than launching a second instance
+    fn client_token(&self, owner: &OwnerTags, key: &IdempotencyKey) -> String {
+        let identity = format!("{}:{}:{}", owner.owner, owner.generation, key.as_str());
         let digest = Sha256::digest(identity.as_bytes());
 
         // EC2 accepts up to 64 ASCII characters; this is at most 16 + 10 + 32
@@ -444,9 +544,9 @@ impl<C: Ec2> CloudProvider for Aws<C> {
         owner: &OwnerTags,
         spec: &AwsInstanceSpec,
     ) -> ProviderResult<ResourceId> {
-        let instance = self.launch(owner, spec).await?;
+        let launched = self.launch(owner, spec).await?;
 
-        ResourceId::parse(instance.id())
+        ResourceId::parse(launched.instance.id())
             .map_err(|_| ProviderError::invalid_response("EC2 returned an invalid instance ID"))
     }
 
@@ -543,6 +643,20 @@ impl<'a, C: Ec2> AwsRegions<'a, C> {
     }
 }
 
+impl<C: Ec2> SpotHistory for AwsRegions<'_, C> {
+    async fn spot_interruptions(
+        &self,
+        region: &AwsRegion,
+        owner: &OwnerId,
+    ) -> ProviderResult<Vec<SpotInterruption>> {
+        let aws = self.region(region).ok_or_else(|| {
+            ProviderError::validation(format!("AWS region {region} is not configured"))
+        })?;
+
+        aws.spot_interruptions(owner).await
+    }
+}
+
 impl<C: Ec2> CloudProvider for AwsRegions<'_, C> {
     type Kind = AwsKind;
     type Spec = RegionalSpec;
@@ -613,6 +727,148 @@ impl<C: Ec2> CloudProvider for AwsRegions<'_, C> {
 
         Ok(merged)
     }
+}
+
+/// Explains a fleet that launched nothing
+///
+/// EC2 created nothing, so the failure is never retryable as-is. When any pool refused for
+/// capacity or price it is [`ProviderErrorCode::NoCapacity`], so the caller may try another
+/// provider, even if other pools failed otherwise, such as a type a zone does not offer.
+/// Only a fleet whose every error is something else keeps that error's class.
+fn fleet_failure(pools: &LaunchPools, errors: &[FleetError]) -> ProviderError {
+    let (refused, other): (Vec<_>, Vec<_>) = errors.iter().partition(|error| {
+        client::classify_error(200, Some(&error.code)).0 == ProviderErrorCode::NoCapacity
+    });
+    if let ([], [first, ..]) = (refused.as_slice(), other.as_slice()) {
+        let (code, _) = client::classify_error(200, Some(&first.code));
+        let failures: Vec<_> = other.iter().map(|error| describe_failure(error)).collect();
+        return ProviderError::new(
+            code,
+            false,
+            format!("EC2 CreateFleet launched nothing: {}", failures.join(", ")),
+        );
+    }
+    if errors.is_empty() {
+        return ProviderError::invalid_response(
+            "EC2 CreateFleet launched nothing and reported no error",
+        );
+    }
+
+    let mut named: Vec<String> = refused
+        .iter()
+        .filter_map(|error| {
+            let instance_type = error.overrides.instance_type.as_deref()?;
+            let zone = error.overrides.availability_zone.as_deref()?;
+            Some(format!("{instance_type} in {zone}"))
+        })
+        .collect();
+    // in the order sent, each pool once
+    let mut seen = Vec::new();
+    named.retain(|pool| {
+        let first = !seen.contains(pool);
+        if first {
+            seen.push(pool.clone());
+        }
+        first
+    });
+    if named.is_empty() {
+        named = pools
+            .as_slice()
+            .iter()
+            .map(|pool| {
+                format!(
+                    "{} in {}",
+                    pool.instance_type.as_str(),
+                    pool.availability_zone.as_str()
+                )
+            })
+            .collect();
+    }
+    let mut message = format!(
+        "AWS has no Spot capacity under the price cap for {}",
+        named.join(", ")
+    );
+    if !other.is_empty() {
+        let failures: Vec<_> = other.iter().map(|error| describe_failure(error)).collect();
+        message.push_str(&format!("; other pools failed: {}", failures.join(", ")));
+    }
+
+    ProviderError::new(ProviderErrorCode::NoCapacity, false, message)
+}
+
+fn describe_failure(error: &FleetError) -> String {
+    let pool = match (
+        error.overrides.instance_type.as_deref(),
+        error.overrides.availability_zone.as_deref(),
+    ) {
+        (Some(instance_type), Some(zone)) => format!("{instance_type} in {zone}"),
+        (Some(instance_type), None) => instance_type.to_owned(),
+        _ => "a pool".to_owned(),
+    };
+    let message = error
+        .message
+        .as_deref()
+        .map(|message| format!(": {}", safe_message(message)))
+        .unwrap_or_default();
+
+    format!("{pool} ({}{message})", safe_code(&error.code))
+}
+
+/// Maps the override EC2 reports back to the spec's pool
+fn launched_pool(pools: &LaunchPools, launched: &FleetInstances) -> ProviderResult<SpotPool> {
+    let instance_type = launched
+        .overrides
+        .instance_type
+        .as_deref()
+        .or(launched.instance_type.as_deref());
+    let by_zone = instance_type.zip(launched.overrides.availability_zone.as_deref());
+    let by_subnet = || {
+        let instance_type = instance_type?;
+        let subnet = launched.overrides.subnet_id.as_deref()?;
+        pools.as_slice().iter().find(|pool| {
+            pool.instance_type.as_str() == instance_type && pool.subnet_id.as_str() == subnet
+        })
+    };
+
+    by_zone
+        .and_then(|(instance_type, zone)| pools.find(instance_type, zone))
+        .or_else(by_subnet)
+        .cloned()
+        .ok_or_else(|| {
+            ProviderError::invalid_response(
+                "EC2 CreateFleet launched in a pool the request did not offer",
+            )
+        })
+}
+
+fn interruption(instance: &AwsInstance) -> Option<SpotInterruption> {
+    let reason = instance.state_reason()?;
+    if reason.code != SPOT_INSTANCE_TERMINATION {
+        return None;
+    }
+
+    Some(SpotInterruption {
+        instance_type: InstanceType::parse(instance.instance_type()?).ok()?,
+        availability_zone: AvailabilityZone::parse(instance.availability_zone()?).ok()?,
+        at: reason.at,
+    })
+}
+
+// EC2 codes and messages are echoed into errors that reach alerts, so keep them printable
+// and short
+fn safe_code(code: &str) -> String {
+    code.chars()
+        .filter(|character| character.is_ascii_alphanumeric() || ".-_".contains(*character))
+        .take(96)
+        .collect()
+}
+
+fn safe_message(message: &str) -> String {
+    message
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(200)
+        .collect()
 }
 
 fn unrecognized(instance: &AwsInstance, reason: UnrecognizedReason) -> Unrecognized {

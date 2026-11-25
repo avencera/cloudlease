@@ -1,5 +1,7 @@
 //! Typed decoding of EC2 Query API responses
 
+use chrono::NaiveDateTime;
+use cloudlease_core::time::UnixMillis;
 use quick_xml::de::from_reader;
 use serde::{Deserialize, de::DeserializeOwned};
 
@@ -7,7 +9,8 @@ use super::ec2::{
     AwsImage, AwsInstance, AwsInstanceDetails, AwsInstanceState, AwsInstanceType,
     AwsInstanceVolume, AwsSecurityGroup, AwsSecurityGroupIngress, AwsSpotInstanceRequest,
     AwsSpotInstanceRequestState, AwsSpotInstanceRequestType, AwsSpotInterruptionBehavior,
-    AwsSubnet, AwsTag,
+    AwsStateReason, AwsSubnet, AwsTag, CreateFleetResponse, FleetError, FleetInstances,
+    FleetOverrides, RetiredPlacement,
 };
 use crate::error::{ProviderError, ProviderErrorCode, ProviderResult};
 
@@ -130,29 +133,41 @@ pub(crate) fn parse_instance_page(body: &[u8]) -> ProviderResult<Ec2Page<AwsInst
     })
 }
 
-/// The identifiers returned by one `RunInstances` response
-pub(crate) struct ParsedRunInstances {
-    /// Native EC2 instance ID
-    pub(crate) instance_id: String,
-    /// Native Spot Instance request ID
-    pub(crate) spot_instance_request_id: String,
-}
-
-/// Decodes the instance and Spot request IDs from one `RunInstances` response
-pub(crate) fn parse_run_instances(body: &[u8]) -> ProviderResult<ParsedRunInstances> {
-    let response: RunInstancesResponse = parse_response(body)?;
-    let instance = response
+/// Decodes one `CreateFleet` response, which lists both what launched and what failed
+pub(crate) fn parse_create_fleet(body: &[u8]) -> ProviderResult<CreateFleetResponse> {
+    let response: CreateFleetXml = parse_response(body)?;
+    let instances = response
         .instances
         .items
         .into_iter()
-        .next()
-        .ok_or_else(|| invalid_response("RunInstances response has no instance"))?;
-    Ok(ParsedRunInstances {
-        instance_id: required(instance.id, "instanceId")?,
-        spot_instance_request_id: required(
-            instance.spot_instance_request_id,
-            "spotInstanceRequestId",
-        )?,
+        .map(|item| FleetInstances {
+            instance_ids: item
+                .instance_ids
+                .items
+                .into_iter()
+                .filter_map(non_empty_value)
+                .collect(),
+            instance_type: non_empty(item.instance_type),
+            overrides: item.launch.into(),
+        })
+        .collect();
+    let errors = response
+        .errors
+        .items
+        .into_iter()
+        .map(|item| {
+            Ok(FleetError {
+                code: required(item.code, "errorCode")?,
+                message: non_empty(item.message),
+                overrides: item.launch.into(),
+            })
+        })
+        .collect::<ProviderResult<_>>()?;
+
+    Ok(CreateFleetResponse {
+        fleet_id: non_empty(response.fleet_id),
+        instances,
+        errors,
     })
 }
 
@@ -413,17 +428,59 @@ struct ReservationResponse {
 }
 
 #[derive(Deserialize)]
-struct RunInstancesResponse {
-    #[serde(rename = "instancesSet", default)]
-    instances: ItemSet<RunInstanceResponse>,
+struct CreateFleetXml {
+    #[serde(rename = "fleetId")]
+    fleet_id: Option<String>,
+    #[serde(rename = "fleetInstanceSet", default)]
+    instances: ItemSet<FleetInstanceXml>,
+    #[serde(rename = "errorSet", default)]
+    errors: ItemSet<FleetErrorXml>,
 }
 
 #[derive(Deserialize)]
-struct RunInstanceResponse {
-    #[serde(rename = "instanceId")]
-    id: Option<String>,
-    #[serde(rename = "spotInstanceRequestId")]
-    spot_instance_request_id: Option<String>,
+struct FleetInstanceXml {
+    #[serde(rename = "instanceIds", default)]
+    instance_ids: ItemSet<String>,
+    #[serde(rename = "instanceType")]
+    instance_type: Option<String>,
+    #[serde(rename = "launchTemplateAndOverrides", default)]
+    launch: LaunchTemplateAndOverridesXml,
+}
+
+#[derive(Deserialize)]
+struct FleetErrorXml {
+    #[serde(rename = "errorCode")]
+    code: Option<String>,
+    #[serde(rename = "errorMessage")]
+    message: Option<String>,
+    #[serde(rename = "launchTemplateAndOverrides", default)]
+    launch: LaunchTemplateAndOverridesXml,
+}
+
+#[derive(Default, Deserialize)]
+struct LaunchTemplateAndOverridesXml {
+    #[serde(default)]
+    overrides: OverridesXml,
+}
+
+#[derive(Default, Deserialize)]
+struct OverridesXml {
+    #[serde(rename = "instanceType")]
+    instance_type: Option<String>,
+    #[serde(rename = "availabilityZone")]
+    availability_zone: Option<String>,
+    #[serde(rename = "subnetId")]
+    subnet_id: Option<String>,
+}
+
+impl From<LaunchTemplateAndOverridesXml> for FleetOverrides {
+    fn from(value: LaunchTemplateAndOverridesXml) -> Self {
+        Self {
+            instance_type: non_empty(value.overrides.instance_type),
+            availability_zone: non_empty(value.overrides.availability_zone),
+            subnet_id: non_empty(value.overrides.subnet_id),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -496,6 +553,10 @@ struct InstanceResponse {
     spot_instance_request_id: Option<String>,
     #[serde(rename = "metadataOptions")]
     metadata_options: Option<MetadataOptionsResponse>,
+    #[serde(rename = "stateReason")]
+    state_reason: Option<StateReasonResponse>,
+    #[serde(rename = "reason")]
+    transition_reason: Option<String>,
     #[serde(rename = "tagSet", default)]
     tags: ItemSet<TagResponse>,
 }
@@ -513,9 +574,29 @@ impl TryFrom<InstanceResponse> for AwsInstance {
             .map(TryInto::try_into)
             .collect::<ProviderResult<_>>()?;
         let spot_instance_request_id = non_empty(value.spot_instance_request_id);
+        let state_reason = value
+            .state_reason
+            .and_then(|reason| non_empty(reason.code))
+            .map(|code| AwsStateReason {
+                code,
+                at: value
+                    .transition_reason
+                    .as_deref()
+                    .and_then(parse_transition_time),
+            });
         if state.is_retiring() {
-            let instance = Self::retiring(id, state, tags)?;
-            return Ok(with_spot_request(instance, spot_instance_request_id));
+            let placement = RetiredPlacement {
+                instance_type: non_empty(value.instance_type),
+                availability_zone: value
+                    .placement
+                    .and_then(|placement| non_empty(placement.availability_zone)),
+            };
+            let instance = Self::retiring(id, state, placement, tags)?;
+            return Ok(with_extras(
+                instance,
+                spot_instance_request_id,
+                state_reason,
+            ));
         }
 
         let volumes = value
@@ -557,18 +638,42 @@ impl TryFrom<InstanceResponse> for AwsInstance {
             tags,
         )?;
 
-        Ok(with_spot_request(instance, spot_instance_request_id))
+        Ok(with_extras(
+            instance,
+            spot_instance_request_id,
+            state_reason,
+        ))
     }
 }
 
-fn with_spot_request(
+fn with_extras(
     instance: AwsInstance,
     spot_instance_request_id: Option<String>,
+    state_reason: Option<AwsStateReason>,
 ) -> AwsInstance {
-    match spot_instance_request_id {
+    let instance = match spot_instance_request_id {
         Some(id) => instance.with_spot_instance_request_id(id),
         None => instance,
+    };
+    match state_reason {
+        Some(reason) => instance.with_state_reason(reason),
+        None => instance,
     }
+}
+
+/// Reads the time from a transition reason such as
+/// `User initiated (2026-11-24 18:30:00 GMT)`
+///
+/// EC2 documents this form for user-initiated changes; whether a Spot interruption's reason
+/// carries a time is unconfirmed, so a reason without one yields `None`.
+fn parse_transition_time(reason: &str) -> Option<UnixMillis> {
+    let (_, rest) = reason.rsplit_once('(')?;
+    let inner = rest.strip_suffix(')')?;
+    let time = NaiveDateTime::parse_from_str(inner, "%Y-%m-%d %H:%M:%S GMT").ok()?;
+
+    u64::try_from(time.and_utc().timestamp_millis())
+        .ok()
+        .and_then(UnixMillis::new)
 }
 
 fn parse_instance_state(state: &str) -> AwsInstanceState {
@@ -660,6 +765,11 @@ struct InstanceSecurityGroupResponse {
 }
 
 #[derive(Deserialize)]
+struct StateReasonResponse {
+    code: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct MetadataOptionsResponse {
     #[serde(rename = "httpTokens")]
     http_tokens: Option<String>,
@@ -669,28 +779,10 @@ struct MetadataOptionsResponse {
 mod tests {
     use super::{
         AwsInstanceState, AwsSpotInstanceRequestState, AwsSpotInstanceRequestType,
-        AwsSpotInterruptionBehavior, parse_image, parse_instance_page, parse_run_instances,
+        AwsSpotInterruptionBehavior, parse_create_fleet, parse_image, parse_instance_page,
         parse_security_group_page, parse_spot_instance_requests,
     };
-
-    #[test]
-    fn parses_the_persistent_spot_request_id_from_run_instances() {
-        let body = br#"
-            <RunInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
-                <instancesSet>
-                    <item>
-                        <instanceId>i-0123456789abcdef0</instanceId>
-                        <spotInstanceRequestId>sir-0123456789abcdef0</spotInstanceRequestId>
-                    </item>
-                </instancesSet>
-            </RunInstancesResponse>
-        "#;
-
-        let parsed = parse_run_instances(body).unwrap();
-
-        assert_eq!(parsed.instance_id, "i-0123456789abcdef0");
-        assert_eq!(parsed.spot_instance_request_id, "sir-0123456789abcdef0");
-    }
+    use crate::aws::ec2::SPOT_INSTANCE_TERMINATION;
 
     #[test]
     fn parses_spot_request_state_and_launch_policy() {
@@ -853,6 +945,74 @@ mod tests {
 
         assert_eq!(instance.state(), AwsInstanceState::Terminated);
         assert!(instance.details().is_none());
+        assert!(instance.state_reason().is_none());
+    }
+
+    #[test]
+    fn keeps_the_pool_and_state_reason_of_an_interrupted_instance() {
+        let body = br#"
+            <DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+                <reservationSet>
+                    <item>
+                        <instancesSet>
+                            <item>
+                                <instanceId>i-01234567</instanceId>
+                                <instanceState><name>terminated</name></instanceState>
+                                <instanceType>c8a.4xlarge</instanceType>
+                                <placement><availabilityZone>us-east-1a</availabilityZone></placement>
+                                <reason>Service initiated (2026-11-24 18:30:00 GMT)</reason>
+                                <stateReason>
+                                    <code>Server.SpotInstanceTermination</code>
+                                    <message>Server.SpotInstanceTermination: Spot instance termination</message>
+                                </stateReason>
+                            </item>
+                            <item>
+                                <instanceId>i-89abcdef</instanceId>
+                                <instanceState><name>terminated</name></instanceState>
+                                <reason></reason>
+                                <stateReason><code>Server.SpotInstanceTermination</code></stateReason>
+                            </item>
+                        </instancesSet>
+                    </item>
+                </reservationSet>
+            </DescribeInstancesResponse>
+        "#;
+
+        let page = parse_instance_page(body).unwrap();
+
+        let timed = &page.items[0];
+        assert_eq!(timed.instance_type(), Some("c8a.4xlarge"));
+        assert_eq!(timed.availability_zone(), Some("us-east-1a"));
+        let reason = timed.state_reason().unwrap();
+        assert_eq!(reason.code, SPOT_INSTANCE_TERMINATION);
+        assert_eq!(reason.at.unwrap().as_millis(), 1_795_545_000_000);
+        // a reason without a time still names the code
+        let untimed = &page.items[1];
+        assert_eq!(untimed.instance_type(), None);
+        assert_eq!(untimed.state_reason().unwrap().at, None);
+    }
+
+    #[test]
+    fn reads_an_empty_fleet_and_its_errors() {
+        let body = br#"
+            <CreateFleetResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+                <requestId>r-1</requestId>
+                <fleetId>fleet-01234567</fleetId>
+                <errorSet>
+                    <item>
+                        <errorCode>UnfulfillableCapacity</errorCode>
+                        <errorMessage>Unable to fulfill capacity</errorMessage>
+                    </item>
+                </errorSet>
+                <fleetInstanceSet/>
+            </CreateFleetResponse>
+        "#;
+
+        let response = parse_create_fleet(body).unwrap();
+
+        assert!(response.instances.is_empty());
+        assert_eq!(response.errors[0].code, "UnfulfillableCapacity");
+        assert_eq!(response.errors[0].overrides.instance_type, None);
     }
 
     #[test]

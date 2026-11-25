@@ -96,8 +96,10 @@
           "max_hours": 1
         },
         // an AWS class needs AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and its region in
-        // AWS_REGIONS; the network, security group and AMI come from infra/aws-machines
-        // (`terraform output -json class_fields`). Spot in us-east-1 on 2026-11-24:
+        // AWS_REGIONS; the network, launch template and AMI come from infra/aws-machines
+        // (`terraform output -json class_fields`). One instant fleet offers every type in
+        // every zone, and EC2 picks the pool least likely to be interrupted. Spot in us-east-1
+        // on 2026-11-24:
         // c8a.4xlarge $0.29 in 1f, $0.37 in 1b, $0.40 in 1d; c7a.4xlarge $0.27 to $0.40
         "aws-c8a-4xl": {
           "provider": "aws",
@@ -112,7 +114,11 @@
           "image_id": "ami-0a951420c495183dc",
           "root_device_name": "/dev/sda1",
           "root_volume_gib": 50,
-          "security_group_id": "sg-0eee604228baa1674",
+          // NOT APPLIED YET: replace with `launch_template_id` and `launch_template_version`
+          // from `terraform output -json class_fields` before deploying; this placeholder
+          // passes validation but every launch fails
+          "launch_template_id": "lt-00000000000000000",
+          "launch_template_version": 1,
           // above the Spot prices; EC2 never charges more than this for the instance
           "spot_max_price_usd": "0.45",
           // the max price plus about $0.01 for the 50 GiB gp3 root volume and the public IPv4

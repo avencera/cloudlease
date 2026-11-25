@@ -4,13 +4,14 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, VecDeque},
     future::Future,
-    num::NonZeroU16,
+    num::{NonZeroU16, NonZeroU32},
     task::{Context, Poll, Waker},
 };
 
 use cloudlease_core::{
     ids::{Generation, OwnerId, ResourceId, TagPrefix},
     tags::{OwnerTags, TagScheme, UnrecognizedReason},
+    time::UnixMillis,
 };
 use cloudlease_provider::{
     aws::{
@@ -18,9 +19,11 @@ use cloudlease_provider::{
         AwsInstanceSpec, AwsInstanceState, AwsInstanceType, AwsKind, AwsRegion, AwsRegions,
         AwsSecurityGroup, AwsSecurityGroupIngress, AwsSpotInstanceRequest,
         AwsSpotInstanceRequestState, AwsSpotInstanceRequestType, AwsSpotInterruptionBehavior,
-        AwsSubnet, AwsTag, Ec2, IdempotencyKey, InstanceFilter, InstanceName, InstanceType,
-        InstanceTypeCandidates, RegionalSpec, RunInstancesRequest, SecurityGroupId,
-        SharedSecurityGroup, SpotMarket, SubnetId, TcpIngress, UserData,
+        AwsStateReason, AwsSubnet, AwsTag, CreateFleetRequest, CreateFleetResponse, Ec2,
+        FleetError, FleetInstances, FleetOverrides, IdempotencyKey, InstanceFilter, InstanceName,
+        InstanceType, LaunchPools, LaunchTemplate, LaunchTemplateId, RegionalSpec,
+        RetiredPlacement, SPOT_INSTANCE_TERMINATION, SecurityGroupId, SharedSecurityGroup,
+        SpotHistory, SpotMaxPrice, SpotPool, SubnetId, TcpIngress, UserData,
     },
     error::{ProviderError, ProviderErrorCode, ProviderResult},
     firewall::{IngressPolicy, SourceCidr},
@@ -33,10 +36,7 @@ const VPC: &str = "vpc-01234567";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Call {
-    Run {
-        instance_type: String,
-        token: String,
-    },
+    Fleet { pools: Vec<String>, token: String },
     Cancel(String),
     Terminate(String),
     Authorize(String, String),
@@ -46,6 +46,7 @@ enum Call {
 struct FakeSpot {
     instance_id: String,
     state: AwsSpotInstanceRequestState,
+    request_type: AwsSpotInstanceRequestType,
     tags: Vec<AwsTag>,
 }
 
@@ -53,9 +54,15 @@ struct FakeSpot {
 struct State {
     instances: BTreeMap<String, AwsInstance>,
     spot_requests: BTreeMap<String, FakeSpot>,
-    // client token to the instance it created, like EC2's idempotent RunInstances
-    tokens: BTreeMap<String, String>,
+    // client token to the response it got, like EC2's idempotent CreateFleet
+    tokens: BTreeMap<String, CreateFleetResponse>,
+    // `type@zone` pools with no Spot capacity, refused in the fleet's error set
     no_capacity: Vec<String>,
+    // pools refused with another error code, as `type@zone` to code
+    pool_errors: BTreeMap<String, String>,
+    // a failure of the whole CreateFleet call, as for a bad template or missing permission
+    fleet_failure: Option<ProviderError>,
+    fleet_requests: Vec<CreateFleetRequest>,
     // forced failures for the next describe of an instance
     describe_failures: VecDeque<ProviderError>,
     group: Option<AwsSecurityGroup>,
@@ -75,7 +82,13 @@ impl FakeEc2 {
 
     fn add_instance(&self, id: &str, state: AwsInstanceState, tags: Vec<AwsTag>, spot: bool) {
         let mut instance = if state.is_retiring() {
-            AwsInstance::retiring(id.to_owned(), state, tags.clone()).unwrap()
+            AwsInstance::retiring(
+                id.to_owned(),
+                state,
+                RetiredPlacement::default(),
+                tags.clone(),
+            )
+            .unwrap()
         } else {
             AwsInstance::present(id.to_owned(), state, details("c7a.2xlarge"), tags.clone())
                 .unwrap()
@@ -89,11 +102,35 @@ impl FakeEc2 {
                 FakeSpot {
                     instance_id: id.to_owned(),
                     state: AwsSpotInstanceRequestState::Active,
+                    request_type: AwsSpotInstanceRequestType::Persistent,
                     tags,
                 },
             );
         }
         fake.instances.insert(id.to_owned(), instance);
+    }
+
+    // terminates an instance as EC2 does with `reason` and keeps it listed, with its type
+    // and zone, as EC2 does for about an hour
+    fn retire(&self, id: &str, reason: &str, at: Option<u64>) {
+        let mut fake = self.0.borrow_mut();
+        let instance = fake.instances[id].clone();
+        let details = instance.details().cloned().unwrap();
+        let retired = AwsInstance::retiring(
+            id.to_owned(),
+            AwsInstanceState::Terminated,
+            RetiredPlacement {
+                instance_type: Some(details.instance_type),
+                availability_zone: Some(details.availability_zone),
+            },
+            instance.tags().to_vec(),
+        )
+        .unwrap()
+        .with_state_reason(AwsStateReason {
+            code: reason.to_owned(),
+            at: at.and_then(UnixMillis::new),
+        });
+        fake.instances.insert(id.to_owned(), retired);
     }
 
     fn ingress(&self) -> Vec<AwsSecurityGroupIngress> {
@@ -294,49 +331,77 @@ impl Ec2 for FakeEc2 {
         ready(Ok(requests))
     }
 
-    fn run_instances(
+    // launches in the first pool, by the order sent, that has capacity; EC2 would pick by
+    // price and capacity instead, which the adapter does not depend on
+    fn create_fleet(
         &self,
-        request: RunInstancesRequest,
-    ) -> LocalFuture<'_, ProviderResult<AwsInstance>> {
+        request: CreateFleetRequest,
+    ) -> LocalFuture<'_, ProviderResult<CreateFleetResponse>> {
         let mut fake = self.0.borrow_mut();
-        let instance_type = request.instance_type.as_str().to_owned();
-        fake.calls.push(Call::Run {
-            instance_type: instance_type.clone(),
+        fake.calls.push(Call::Fleet {
+            pools: request.pools.iter().map(pool_name).collect(),
             token: request.client_token.clone(),
         });
-        if let Some(id) = fake.tokens.get(&request.client_token) {
-            return ready(Ok(fake.instances[id].clone()));
+        fake.fleet_requests.push(request.clone());
+        if let Some(error) = fake.fleet_failure.clone() {
+            return ready(Err(error));
         }
-        if fake.no_capacity.contains(&instance_type) {
-            return ready(Err(ProviderError::new(
-                ProviderErrorCode::NoCapacity,
-                true,
-                "AWS EC2 RunInstances request failed with error code InsufficientInstanceCapacity",
-            )));
+        if let Some(response) = fake.tokens.get(&request.client_token) {
+            return ready(Ok(response.clone()));
         }
 
-        fake.next_id += 1;
-        let id = format!("i-{:08x}", fake.next_id);
-        let request_id = format!("sir-{id}");
-        let instance = AwsInstance::present(
-            id.clone(),
-            AwsInstanceState::Pending,
-            details(&instance_type),
-            request.tags.clone(),
-        )
-        .unwrap()
-        .with_spot_instance_request_id(request_id.clone());
-        fake.spot_requests.insert(
-            request_id,
-            FakeSpot {
-                instance_id: id.clone(),
-                state: AwsSpotInstanceRequestState::Active,
-                tags: request.tags,
-            },
-        );
-        fake.instances.insert(id.clone(), instance.clone());
-        fake.tokens.insert(request.client_token, id);
-        ready(Ok(instance))
+        let mut response = CreateFleetResponse {
+            fleet_id: Some(format!("fleet-{:08x}", fake.next_id + 1)),
+            ..CreateFleetResponse::default()
+        };
+        for pool in &request.pools {
+            let name = pool_name(pool);
+            let refusal = if fake.no_capacity.contains(&name) {
+                Some("InsufficientInstanceCapacity".to_owned())
+            } else {
+                fake.pool_errors.get(&name).cloned()
+            };
+            if let Some(code) = refusal {
+                response.errors.push(FleetError {
+                    code,
+                    message: Some("refused".to_owned()),
+                    overrides: overrides(pool),
+                });
+                continue;
+            }
+
+            fake.next_id += 1;
+            let id = format!("i-{:08x}", fake.next_id);
+            let mut details = details(pool.instance_type.as_str());
+            details.availability_zone = pool.availability_zone.as_str().to_owned();
+            details.subnet_id = pool.subnet_id.as_str().to_owned();
+            let instance = AwsInstance::present(
+                id.clone(),
+                AwsInstanceState::Pending,
+                details,
+                request.tags.clone(),
+            )
+            .unwrap();
+            // a fleet's one-time Spot request carries no tags
+            fake.spot_requests.insert(
+                format!("sir-{id}"),
+                FakeSpot {
+                    instance_id: id.clone(),
+                    state: AwsSpotInstanceRequestState::Active,
+                    request_type: AwsSpotInstanceRequestType::OneTime,
+                    tags: Vec::new(),
+                },
+            );
+            fake.instances.insert(id.clone(), instance);
+            response.instances.push(FleetInstances {
+                instance_ids: vec![id],
+                instance_type: Some(pool.instance_type.as_str().to_owned()),
+                overrides: overrides(pool),
+            });
+            break;
+        }
+        fake.tokens.insert(request.client_token, response.clone());
+        ready(Ok(response))
     }
 
     fn terminate_instance(&self, instance_id: String) -> LocalFuture<'_, ProviderResult<()>> {
@@ -348,6 +413,7 @@ impl Ec2 for FakeEc2 {
         let terminated = AwsInstance::retiring(
             instance_id.clone(),
             AwsInstanceState::Terminated,
+            RetiredPlacement::default(),
             instance.tags().to_vec(),
         )
         .unwrap();
@@ -361,9 +427,36 @@ fn spot(id: &str, request: &FakeSpot) -> AwsSpotInstanceRequest {
         id: id.to_owned(),
         instance_id: Some(request.instance_id.clone()),
         state: request.state,
-        request_type: AwsSpotInstanceRequestType::Persistent,
-        interruption_behavior: AwsSpotInterruptionBehavior::Stop,
+        request_type: request.request_type,
+        interruption_behavior: match request.request_type {
+            AwsSpotInstanceRequestType::OneTime => AwsSpotInterruptionBehavior::Terminate,
+            _ => AwsSpotInterruptionBehavior::Stop,
+        },
         tags: request.tags.clone(),
+    }
+}
+
+fn pool_name(pool: &SpotPool) -> String {
+    format!(
+        "{}@{}",
+        pool.instance_type.as_str(),
+        pool.availability_zone.as_str()
+    )
+}
+
+fn overrides(pool: &SpotPool) -> FleetOverrides {
+    FleetOverrides {
+        instance_type: Some(pool.instance_type.as_str().to_owned()),
+        availability_zone: Some(pool.availability_zone.as_str().to_owned()),
+        subnet_id: Some(pool.subnet_id.as_str().to_owned()),
+    }
+}
+
+fn pool(instance_type: &str, zone: &str) -> SpotPool {
+    SpotPool {
+        instance_type: InstanceType::parse(instance_type).unwrap(),
+        availability_zone: AvailabilityZone::parse(zone).unwrap(),
+        subnet_id: SubnetId::parse(format!("subnet-0000000{}", &zone[zone.len() - 1..])).unwrap(),
     }
 }
 
@@ -389,25 +482,27 @@ fn owner(project: &str, generation: u64) -> OwnerTags {
     }
 }
 
+// every type in us-east-1a and us-east-1b, in that order
 fn spec(types: &[&str]) -> AwsInstanceSpec {
     AwsInstanceSpec {
         name: InstanceName::parse("rb-builder-prj_1-1").unwrap(),
-        instance_types: InstanceTypeCandidates::new(
+        pools: LaunchPools::new(
             types
                 .iter()
-                .map(|name| InstanceType::parse(*name).unwrap())
+                .flat_map(|name| [pool(name, "us-east-1a"), pool(name, "us-east-1b")])
                 .collect(),
         )
         .unwrap(),
+        launch_template: LaunchTemplate {
+            id: LaunchTemplateId::parse("lt-01234567").unwrap(),
+            version: NonZeroU32::new(4).unwrap(),
+        },
         image_id: AmiId::parse("ami-01234567").unwrap(),
         root_device_name: "/dev/sda1".to_owned(),
         root_volume_gib: NonZeroU16::new(50).unwrap(),
-        subnet_id: SubnetId::parse("subnet-01234567").unwrap(),
-        availability_zone: AvailabilityZone::parse("us-east-1a").unwrap(),
-        security_group_id: SecurityGroupId::parse(GROUP).unwrap(),
         user_data: UserData::parse("#cloud-config").unwrap(),
         idempotency_key: IdempotencyKey::parse("op-1").unwrap(),
-        market: SpotMarket::persistent_stop(),
+        max_price: Some(SpotMaxPrice::parse("0.45").unwrap()),
     }
 }
 
@@ -440,45 +535,70 @@ fn id(value: &str) -> ResourceId {
     ResourceId::parse(value).unwrap()
 }
 
+fn fleet_calls(aws: &Aws<FakeEc2>) -> Vec<(Vec<String>, String)> {
+    aws.ec2()
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::Fleet { pools, token } => Some((pools, token)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
-fn create_tags_the_instance_and_spot_request_and_repeats_idempotently() {
+fn create_offers_every_pool_in_one_fleet_and_repeats_idempotently() {
     let ec2 = FakeEc2::default();
     let aws = Aws::new(ec2, scheme());
     let owner = owner("prj_1", 3);
 
-    let first = block_on(aws.create(&owner, &spec(&["c7a.2xlarge"]))).unwrap();
-    let second = block_on(aws.create(&owner, &spec(&["c7a.2xlarge"]))).unwrap();
+    let first = block_on(aws.create(&owner, &spec(&["c7a.2xlarge", "c7i.2xlarge"]))).unwrap();
+    let second = block_on(aws.create(&owner, &spec(&["c7a.2xlarge", "c7i.2xlarge"]))).unwrap();
 
+    // the repeat returns the first launch's instance and launches nothing more
     assert_eq!(first, second);
+    assert_eq!(aws.ec2().0.borrow().instances.len(), 1);
+    let expected_tags = [
+        tag("rb-managed", "true"),
+        tag("rb-owner", "prj_1"),
+        tag("rb-gen", "3"),
+        tag("rb-kind", "instance"),
+        tag("Name", "rb-builder-prj_1-1"),
+    ];
     let instance = aws.ec2().0.borrow().instances[first.as_str()].clone();
+    assert_eq!(instance.tags(), expected_tags);
+
+    let fake = aws.ec2().0.borrow();
+    let request = &fake.fleet_requests[0];
     assert_eq!(
-        instance.tags(),
+        request.pools.iter().map(pool_name).collect::<Vec<_>>(),
         [
-            tag("rb-managed", "true"),
-            tag("rb-owner", "prj_1"),
-            tag("rb-gen", "3"),
-            tag("rb-kind", "instance"),
-            tag("Name", "rb-builder-prj_1-1"),
+            "c7a.2xlarge@us-east-1a",
+            "c7a.2xlarge@us-east-1b",
+            "c7i.2xlarge@us-east-1a",
+            "c7i.2xlarge@us-east-1b",
         ]
     );
-    let fake = aws.ec2().0.borrow();
-    let request = &fake.spot_requests[instance.spot_instance_request_id().unwrap()];
-    assert_eq!(request.tags, instance.tags());
+    assert_eq!(request.pools[1].subnet_id.as_str(), "subnet-0000000b");
+    assert_eq!(request.tags, expected_tags);
+    assert_eq!(request.user_data.as_str(), "#cloud-config");
+    assert_eq!(request.launch_template.id.as_str(), "lt-01234567");
+    assert_eq!(request.launch_template.version.get(), 4);
+    assert_eq!(request.image_id.as_str(), "ami-01234567");
+    assert_eq!(request.root_volume_gib.get(), 50);
+    assert_eq!(
+        request.max_price.as_ref().map(SpotMaxPrice::as_str),
+        Some("0.45")
+    );
+    drop(fake);
 
-    let tokens: Vec<_> = fake
-        .calls
-        .iter()
-        .filter_map(|call| match call {
-            Call::Run { token, .. } => Some(token.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(tokens.len(), 2);
-    assert_eq!(tokens[0], tokens[1]);
-    assert!(tokens[0].starts_with("rb-instance-") && tokens[0].len() == 44);
+    // one token per launch, whatever its pools
+    let calls = fleet_calls(&aws);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].1, calls[1].1);
+    assert!(calls[0].1.starts_with("rb-instance-") && calls[0].1.len() == 44);
 
     // another generation or idempotency key is another launch
-    drop(fake);
     let mut other_key = spec(&["c7a.2xlarge"]);
     other_key.idempotency_key = IdempotencyKey::parse("op-2").unwrap();
     let third = block_on(aws.create(&owner, &other_key)).unwrap();
@@ -489,47 +609,185 @@ fn create_tags_the_instance_and_spot_request_and_repeats_idempotently() {
 }
 
 #[test]
-fn launch_falls_through_the_pool_only_on_spot_capacity() {
+fn launch_reports_the_pool_ec2_chose_after_others_refused() {
     let ec2 = FakeEc2::default();
-    ec2.0.borrow_mut().no_capacity = vec!["c7a.2xlarge".to_owned()];
+    ec2.0.borrow_mut().no_capacity = vec![
+        "c7a.2xlarge@us-east-1a".to_owned(),
+        "c7a.2xlarge@us-east-1b".to_owned(),
+    ];
+    let aws = Aws::new(ec2, scheme());
+
+    let launched =
+        block_on(aws.launch(&owner("prj_1", 1), &spec(&["c7a.2xlarge", "c7i.2xlarge"]))).unwrap();
+
+    assert_eq!(launched.pool, pool("c7i.2xlarge", "us-east-1a"));
+    let details = launched.instance.details().unwrap();
+    assert_eq!(details.instance_type, "c7i.2xlarge");
+    assert_eq!(details.availability_zone, "us-east-1a");
+    assert_eq!(details.subnet_id, "subnet-0000000a");
+    assert!(details.spot && details.imds_v2_required);
+    // one call, not one per pool
+    assert_eq!(fleet_calls(&aws).len(), 1);
+}
+
+#[test]
+fn a_fleet_that_launches_nothing_names_the_refused_pools() {
+    let ec2 = FakeEc2::default();
+    ec2.0.borrow_mut().no_capacity = vec![
+        "c7a.2xlarge@us-east-1a".to_owned(),
+        "c7a.2xlarge@us-east-1b".to_owned(),
+    ];
+    let aws = Aws::new(ec2, scheme());
+
+    let error = block_on(aws.launch(&owner("prj_1", 1), &spec(&["c7a.2xlarge"]))).unwrap_err();
+
+    assert_eq!(error.code, ProviderErrorCode::NoCapacity);
+    assert!(!error.retryable);
+    assert_eq!(
+        error.message(),
+        "AWS has no Spot capacity under the price cap for c7a.2xlarge in us-east-1a, \
+         c7a.2xlarge in us-east-1b"
+    );
+
+    // a pool refused for its price is no capacity under the cap too, and a pool that fails
+    // otherwise does not hide the others' refusals
+    let ec2 = FakeEc2::default();
+    ec2.0.borrow_mut().pool_errors = BTreeMap::from([
+        (
+            "c7a.2xlarge@us-east-1a".to_owned(),
+            "SpotMaxPriceTooLow".to_owned(),
+        ),
+        (
+            "c7a.2xlarge@us-east-1b".to_owned(),
+            "Unsupported".to_owned(),
+        ),
+    ]);
+    let aws = Aws::new(ec2, scheme());
+    let error = block_on(aws.launch(&owner("prj_1", 1), &spec(&["c7a.2xlarge"]))).unwrap_err();
+    assert_eq!(error.code, ProviderErrorCode::NoCapacity);
+    assert!(error.message().contains("for c7a.2xlarge in us-east-1a;"));
+    assert!(
+        error
+            .message()
+            .contains("other pools failed: c7a.2xlarge in us-east-1b (Unsupported: refused)")
+    );
+}
+
+#[test]
+fn a_hard_fleet_failure_keeps_its_class() {
+    // a fleet whose every pool fails with something other than capacity launched nothing,
+    // so it is a definite failure of that class
+    let ec2 = FakeEc2::default();
+    ec2.0.borrow_mut().pool_errors = BTreeMap::from([
+        (
+            "c7a.2xlarge@us-east-1a".to_owned(),
+            "InvalidParameterValue".to_owned(),
+        ),
+        (
+            "c7a.2xlarge@us-east-1b".to_owned(),
+            "InvalidParameterValue".to_owned(),
+        ),
+    ]);
+    let aws = Aws::new(ec2, scheme());
+    let error = block_on(aws.launch(&owner("prj_1", 1), &spec(&["c7a.2xlarge"]))).unwrap_err();
+    assert_eq!(error.code, ProviderErrorCode::Validation);
+    assert!(!error.retryable);
+    assert!(
+        error
+            .message()
+            .starts_with("EC2 CreateFleet launched nothing: c7a.2xlarge in")
+    );
+
+    // an API error, such as a missing permission, passes through as it is
+    let ec2 = FakeEc2::default();
+    ec2.0.borrow_mut().fleet_failure = Some(ProviderError::new(
+        ProviderErrorCode::PermissionDenied,
+        false,
+        "AWS EC2 CreateFleet request failed with error code UnauthorizedOperation",
+    ));
+    let aws = Aws::new(ec2, scheme());
+    let error = block_on(aws.launch(&owner("prj_1", 1), &spec(&["c7a.2xlarge"]))).unwrap_err();
+    assert_eq!(error.code, ProviderErrorCode::PermissionDenied);
+    assert!(aws.ec2().0.borrow().instances.is_empty());
+}
+
+#[test]
+fn deleting_a_fleet_instance_accepts_its_untagged_one_time_spot_request() {
+    let ec2 = FakeEc2::default();
     let aws = Aws::new(ec2, scheme());
     let owner = owner("prj_1", 1);
+    let id = block_on(aws.create(&owner, &spec(&["c7a.2xlarge"]))).unwrap();
+    let instance = aws.ec2().0.borrow().instances[id.as_str()].clone();
+    let request = block_on(aws.spot_request(&instance, &owner.with_kind(AwsKind::Instance)))
+        .unwrap()
+        .unwrap();
+    assert!(request.tags.is_empty());
 
-    let instance = block_on(aws.launch(
-        &owner,
-        &spec(&["c7a.2xlarge", "c7i.2xlarge", "m7a.2xlarge"]),
+    block_on(aws.delete_owned(&owner, &id)).unwrap();
+
+    // a one-time request closes with its instance, so only the terminate is sent
+    assert_eq!(
+        aws.ec2().calls().last(),
+        Some(&Call::Terminate(id.as_str().to_owned()))
+    );
+    assert!(
+        !aws.ec2()
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Cancel(_)))
+    );
+
+    // a request that carries another owner's tags is still refused
+    let other = id.as_str().to_owned();
+    aws.ec2()
+        .0
+        .borrow_mut()
+        .spot_requests
+        .get_mut(&format!("sir-{other}"))
+        .unwrap()
+        .tags = pairs(&self::owner("prj_2", 1));
+    let error = block_on(aws.delete_owned(&owner, &id)).unwrap_err();
+    assert_eq!(error.code, ProviderErrorCode::InvariantViolation);
+}
+
+#[test]
+fn interruptions_name_the_pools_that_took_an_owners_instances_back() {
+    let ec2 = FakeEc2::default();
+    let aws = Aws::new(ec2, scheme());
+    let mut ids = Vec::new();
+    for (generation, instance_type) in [(1, "c7a.2xlarge"), (2, "c7i.2xlarge"), (3, "m7a.2xlarge")]
+    {
+        ids.push(
+            block_on(aws.create(&owner("prj_1", generation), &spec(&[instance_type]))).unwrap(),
+        );
+    }
+    let other_owner = block_on(aws.create(&owner("prj_2", 1), &spec(&["c7a.2xlarge"]))).unwrap();
+    aws.ec2()
+        .retire(ids[0].as_str(), SPOT_INSTANCE_TERMINATION, Some(1_000));
+    aws.ec2()
+        .retire(ids[1].as_str(), "Client.UserInitiatedShutdown", None);
+    aws.ec2()
+        .retire(other_owner.as_str(), SPOT_INSTANCE_TERMINATION, None);
+    let regions = AwsRegions::new([(AwsRegion::parse("us-east-1").unwrap(), &aws)]).unwrap();
+
+    let interruptions = block_on(regions.spot_interruptions(
+        &AwsRegion::parse("us-east-1").unwrap(),
+        &OwnerId::parse("prj_1").unwrap(),
     ))
     .unwrap();
 
-    assert_eq!(instance.details().unwrap().instance_type, "c7i.2xlarge");
-    let runs: Vec<_> = aws
-        .ec2()
-        .calls()
-        .into_iter()
-        .filter_map(|call| match call {
-            Call::Run {
-                instance_type,
-                token,
-            } => Some((instance_type, token)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        runs.iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>(),
-        ["c7a.2xlarge", "c7i.2xlarge"]
+    // every generation of the owner counts, a user's own termination does not
+    assert_eq!(interruptions.len(), 1);
+    assert_eq!(interruptions[0].instance_type.as_str(), "c7a.2xlarge");
+    assert_eq!(interruptions[0].availability_zone.as_str(), "us-east-1a");
+    assert_eq!(interruptions[0].at, UnixMillis::new(1_000));
+    assert!(
+        block_on(regions.spot_interruptions(
+            &AwsRegion::parse("us-west-2").unwrap(),
+            &OwnerId::parse("prj_1").unwrap(),
+        ))
+        .is_err()
     );
-    assert_ne!(runs[0].1, runs[1].1);
-
-    // when every type lacks capacity, the last capacity error is returned
-    aws.ec2().0.borrow_mut().no_capacity = vec!["c7a.2xlarge".to_owned(), "c7i.2xlarge".to_owned()];
-    let error = block_on(aws.launch(
-        &self::owner("prj_2", 1),
-        &spec(&["c7a.2xlarge", "c7i.2xlarge"]),
-    ))
-    .unwrap_err();
-    assert_eq!(error.code, ProviderErrorCode::NoCapacity);
 }
 
 #[test]

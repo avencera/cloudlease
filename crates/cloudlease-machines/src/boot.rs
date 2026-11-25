@@ -3,7 +3,8 @@
 //! The user data is a POSIX shell script that cloud-init runs once as root. In order, it:
 //!
 //! 1. writes `/etc/cloudlease/lease.json` (mode 0600): the lease ID, its token, the API base,
-//!    the hard deadline and the heartbeat TTL
+//!    the hard deadline, the heartbeat TTL and, for a provider that can take the machine back,
+//!    where the machine hears that it is about to
 //! 2. formats and mounts the class's volume, when the class has one
 //! 3. writes each client file, then runs each client command, stopping at the first failure
 //!
@@ -184,6 +185,15 @@ fn check_mode(mode: &str) -> Result<(), BootError> {
     Ok(())
 }
 
+/// Where a machine hears that its provider is about to take it back
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptionNotice {
+    /// The EC2 instance metadata service, which posts a Spot interruption notice about two
+    /// minutes before EC2 reclaims the instance
+    AwsImds,
+}
+
 /// The machine's `lease.json`
 #[derive(Clone, Debug, Serialize)]
 pub struct LeaseFile<'a> {
@@ -197,6 +207,10 @@ pub struct LeaseFile<'a> {
     pub hard_deadline_at: Timestamp,
     /// How long a renew keeps the lease alive
     pub heartbeat_ttl_secs: u64,
+    /// Where the machine hears of an interruption, absent for a provider that never takes a
+    /// leased machine back
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interruption_notice: Option<InterruptionNotice>,
 }
 
 /// The class volume the boot script formats and mounts
@@ -303,6 +317,8 @@ pub fn check_fits(
         api_base,
         hard_deadline_at: Timestamp(latest),
         heartbeat_ttl_secs: u64::MAX,
+        // the longest lease file, whatever the provider
+        interruption_notice: Some(InterruptionNotice::AwsImds),
     };
     let volume = mount.map(|mount| VolumeMount {
         name: &volume,
@@ -327,8 +343,8 @@ mod tests {
     use cloudlease_provider::digitalocean::ResourceName;
 
     use super::{
-        Boot, BootError, BootFile, BootPayload, LeaseFile, MountPath, VolumeMount, check_fits,
-        quote, render_user_data,
+        Boot, BootError, BootFile, BootPayload, InterruptionNotice, LeaseFile, MountPath,
+        VolumeMount, check_fits, quote, render_user_data,
     };
     use crate::time::Timestamp;
 
@@ -354,6 +370,7 @@ mod tests {
             api_base: "https://machines.example.test",
             hard_deadline_at: Timestamp(UnixMillis::new(1_795_572_000_000).unwrap()),
             heartbeat_ttl_secs: 600,
+            interruption_notice: None,
         }
     }
 
@@ -426,7 +443,21 @@ mod tests {
         assert_eq!(lease_json["token"], "cll_secret");
         assert_eq!(lease_json["hard_deadline_at"], "2026-11-25T02:00:00Z");
         assert_eq!(lease_json["heartbeat_ttl_secs"], 600);
+        // a provider that never takes a leased machine back names no notice at all
+        assert!(lease_json.get("interruption_notice").is_none());
         assert_eq!(encoded("config.toml"), payload().files[0].content);
+    }
+
+    #[test]
+    fn an_aws_lease_file_names_the_metadata_service_as_its_interruption_notice() {
+        let lease = LeaseFile {
+            interruption_notice: Some(InterruptionNotice::AwsImds),
+            ..lease()
+        };
+
+        let json: serde_json::Value = serde_json::to_value(&lease).unwrap();
+
+        assert_eq!(json["interruption_notice"], "aws_imds");
     }
 
     #[test]

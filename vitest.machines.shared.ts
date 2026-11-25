@@ -98,7 +98,7 @@ export function machinesConfig(include: string[], extraBindings: Record<string, 
                   price_per_hour_usd: "0.02",
                   max_hours: 12,
                 },
-                // an AWS Spot instance, billed per second; two types tried in two zones
+                // an AWS Spot instance, billed per second; one fleet offers two types in two zones
                 spot: {
                   provider: "aws",
                   region: "us-east-1",
@@ -109,7 +109,8 @@ export function machinesConfig(include: string[], extraBindings: Record<string, 
                   ],
                   image_id: "ami-0123456789abcdef0",
                   root_volume_gib: 150,
-                  security_group_id: "sg-0123456789abcdef0",
+                  launch_template_id: "lt-0123456789abcdef0",
+                  launch_template_version: 3,
                   spot_max_price_usd: "0.025",
                   price_per_hour_usd: "0.03",
                   max_hours: 12,

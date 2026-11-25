@@ -426,7 +426,7 @@ pub const PRESENCE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long after a lease starts its machine is first checked
 ///
-/// EC2 reads are eventually consistent: a describe sent just after `RunInstances` may not
+/// EC2 reads are eventually consistent: a describe sent just after `CreateFleet` may not
 /// find the new instance yet, which must not read as an interruption.
 pub const PRESENCE_GRACE: Duration = Duration::from_secs(2 * 60);
 
