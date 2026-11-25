@@ -82,7 +82,14 @@ Account-wide prerequisites this does not manage:
 - the Spot service-linked role `AWSServiceRoleForEC2Spot`, which the account already has
   because rembuild runs Spot builders
 - the "All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests" vCPU quota in the
-  region, which must cover the largest pool: 16 machines of 16 vCPUs need 256
+  region (quota code `L-34B43A08`), which must cover the largest pool: 16 machines of 16 vCPUs
+  need 256, which was us-east-1's quota on 2026-11-24, with no headroom
 
-`terraform validate` passed on this configuration; it has not been planned or applied against
-the account.
+The apply needs an identity that may create IAM users, policies and access keys under
+`/service-accounts/`. On 2026-11-24 the Mac mini's default `local-automation` user could create
+the network but was refused the IAM resources (its IAM writes reach only rembuild's user), so
+the IAM half and the access key were made with the account's admin profile.
+
+Applied on 2026-11-24 in us-east-1, with zones `us-east-1f`, `us-east-1b` and `us-east-1d` and
+AMI `ami-0a951420c495183dc`: 18 resources. The state and `terraform.tfvars` live on the Mac mini
+in `~/code/cloudlease/infra/aws-machines`, and git ignores both. The state holds no access key.

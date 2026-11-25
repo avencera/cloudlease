@@ -6,3 +6,9 @@ _scratch/
 /tests/worker/.wrangler/
 /apps/machines/build/
 /apps/machines/.wrangler/
+# Terraform working files: state and tfvars stay on the machine that applies them
+/infra/**/.terraform/
+/infra/**/*.tfstate
+/infra/**/*.tfstate.*
+/infra/**/terraform.tfvars
+/infra/**/*.plan
