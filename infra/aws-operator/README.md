@@ -32,9 +32,9 @@ policies, the user can do only what the boundary also allows. Both boundaries li
   cancellation only on resources with one of those `rb-managed` values
 
 The users' own policies keep their finer limits (pinned AMI, subnets, instance types, root
-volume size and exact tag sets), except where EC2 sends no condition key: a `CreateFleet`
-cannot be limited by instance type or root volume size (`infra/aws-machines/README.md`, "What
-EC2 checks on `CreateFleet`"). The boundaries leave those out on purpose, so moving to a new
+volume size and exact tag sets). A fleet's launch is a `RunInstances` made as the user, so
+those limits and the boundary's `RunInstances` grants apply to fleets as well
+(`infra/aws-machines/README.md`, "What EC2 checks on `CreateFleet`"). The boundaries leave those out on purpose, so moving to a new
 AMI or subnet stays an operator change and does not need an administrator.
 
 Neither boundary allows IAM, STS, S3 or any service besides EC2, another region, or the other

@@ -21,6 +21,10 @@ locals {
     "${local.prefix}-until",
   ]
 
+  # a fleet's launch adds EC2's own fleet tag to the instance (whether aws:TagKeys counts it is
+  # unconfirmed); no caller can set an aws: key, so allowing it lets nothing else through
+  launch_tag_keys = concat(local.managed_tag_keys, ["aws:ec2:fleet-id"])
+
   common_tags = {
     ManagedBy = "Terraform"
     Service   = "cloudlease-machines"
@@ -113,8 +117,8 @@ resource "aws_launch_template" "machines" {
   instance_initiated_shutdown_behavior = "terminate"
   vpc_security_group_ids               = [aws_security_group.machines.id]
 
-  # each launch asks for IMDSv2 too; a fleet's override can change this default and IAM has no
-  # IMDS condition key for CreateFleet, so for fleets it rests on the adapter's request
+  # each launch asks for IMDSv2 too, and the launch policy requires it of every RunInstances,
+  # a fleet's included
   metadata_options {
     http_endpoint = "enabled"
     http_tokens   = "required"
@@ -234,7 +238,7 @@ data "aws_iam_policy_document" "launch" {
     condition {
       test     = "ForAllValues:StringEquals"
       variable = "aws:TagKeys"
-      values   = local.managed_tag_keys
+      values   = local.launch_tag_keys
     }
   }
 
@@ -349,11 +353,12 @@ data "aws_iam_policy_document" "launch" {
     }
   }
 
+  # a fleet's launch tags the root volume too
   statement {
     sid       = "TagOnlyOnLaunch"
     effect    = "Allow"
     actions   = ["ec2:CreateTags"]
-    resources = [local.instance_arn, local.spot_request_arn]
+    resources = [local.instance_arn, local.spot_request_arn, local.volume_arn]
 
     condition {
       test     = "StringEquals"
@@ -370,7 +375,7 @@ data "aws_iam_policy_document" "launch" {
     condition {
       test     = "ForAllValues:StringEquals"
       variable = "aws:TagKeys"
-      values   = local.managed_tag_keys
+      values   = local.launch_tag_keys
     }
   }
 }
@@ -381,11 +386,10 @@ data "aws_iam_policy_document" "launch" {
 # usual keys. The instance check carries no ec2:AvailabilityZone, ec2:InstanceType or
 # ec2:Tenancy and the volume check no ec2:VolumeSize, although the Service Authorization
 # Reference lists them, so a condition on any of them can never match. The security group,
-# network interface, snapshot and Spot request are not checked at all. The zone rests on the
-# pinned subnets, the security group on the launch template, and Spot, IMDSv2, tenancy, the
-# instance type, the root volume size and the instance's tags on the request the adapter
-# sends. The RunInstances statements
-# above stay in case a fleet's launch is also authorized against the caller
+# network interface, snapshot and Spot request are not checked at all. The fleet then launches
+# with a RunInstances made as the caller (invokedBy ec2fleet.amazonaws.com in CloudTrail), so
+# the launch policy above binds the zone, type, Spot market, IMDSv2, tenancy, root volume and
+# instance tags of every fleet launch
 data "aws_iam_policy_document" "fleet" {
   statement {
     sid       = "CreateFleetOfTaggedInstance"

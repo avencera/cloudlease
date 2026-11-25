@@ -48,7 +48,7 @@ variable "ami_id" {
 }
 
 variable "allowed_instance_type_patterns" {
-  description = "EC2 instance-type patterns the machines Worker may launch with RunInstances; CreateFleet sends no instance-type key, so fleets rest on the classes' types"
+  description = "EC2 instance-type patterns the machines Worker may launch, directly or through a fleet's RunInstances"
   type        = set(string)
   default     = ["c7a.*", "c8a.*", "m7a.*", "c7i.*"]
 

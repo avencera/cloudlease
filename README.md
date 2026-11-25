@@ -129,10 +129,10 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
   fake EC2: the launch template was applied and deployed on 2026-11-25, and the first live
   `CreateFleet` that day was refused with `UnauthorizedOperation` before any launch, because
   the fleet policy required the zone and instance type, which EC2 does not send on a fleet's
-  instance check (`infra/aws-machines/README.md`, "What EC2 checks on `CreateFleet`"; the
-  policy was fixed the same day). Whether the fleet's Spot request carries tags, whether
-  `CreateFleet` also evaluates the caller's `RunInstances` conditions, and how long EC2 keeps
-  a `ClientToken` are unconfirmed. Leaving out the pool of a machine
+  instance check, and the launch policy, which a fleet's own `RunInstances` must pass, could
+  not tag the root volume (`infra/aws-machines/README.md`, "What EC2 checks on
+  `CreateFleet`"; both fixed the same day). Whether the fleet's Spot request carries tags and
+  how long EC2 keeps a `ClientToken` are unconfirmed. Leaving out the pool of a machine
   whose Spot request is `marked-for-termination` has also run only against the fake EC2
 - Firewalls on DigitalOcean, phoenixNAP and Latitude.sh. `firewall::IngressPolicy` has only
   the AWS shared security group implementation

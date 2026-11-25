@@ -46,8 +46,8 @@ and version.
     instance, its root volume and the fleet, and `clm-owner`, `clm-gen`, `clm-until` and
     `Name` on the instance; `CreateTags` of the fleet, instance and volume only as part of
     that `CreateFleet`
-- **launch:** `RunInstances` only, kept because whether `CreateFleet` also authorizes
-  `RunInstances` against the caller is unconfirmed
+- **launch:** `RunInstances` only. An instant fleet launches each attempt with a
+  `RunInstances` made as the Worker's user, so these limits hold for fleets too (see below)
   - of the pinned AMI (and its root snapshot) and the launch template (EC2's launch template
     permissions guide asks for `RunInstances` on a template to launch from it), into this
     configuration's subnets, VPC and security group, with a public IPv4 address
@@ -55,8 +55,10 @@ and version.
     IMDSv2 required and default tenancy
   - with a root volume no larger than `max_root_volume_gib`
   - with the exact managed tag keys (`Name`, `clm-managed`, `clm-owner`, `clm-gen`,
-    `clm-kind`, `clm-until`), `clm-managed=true` and `clm-kind=instance` on the instance and
-    its Spot request; `CreateTags` only as part of that launch
+    `clm-kind`, `clm-until`, and EC2's own `aws:ec2:fleet-id` on a fleet's instance),
+    `clm-managed=true` and `clm-kind=instance` on the instance and its Spot request;
+    `CreateTags` of the instance, its Spot request and its root volume only as part of that
+    launch
 - **cleanup:** `TerminateInstances` and `CancelSpotInstanceRequests` only on resources tagged
   `clm-managed=true` and `clm-kind=instance`
 
@@ -86,31 +88,33 @@ encoded message names only the first resource refused, and its decoded context l
 `ec2:Region` and the request tags even when EC2 sends them, so read it with that in mind; the
 Worker logs it (never in the ntfy alert) for `aws sts decode-authorization-message`.
 
-So the fleet policy pins what EC2 checks and cannot express the rest. Each guarantee rests on:
+So the fleet policy pins only what the `CreateFleet` check carries. The launch itself is a
+second check: the first live fleet (2026-11-25) showed in CloudTrail one `RunInstances` per
+launch attempt, made as `cloudlease-machines` with `invokedBy: ec2fleet.amazonaws.com`. Each
+carried the full launch: the template, the override's type, zone, subnet, image and root
+volume, `marketType: spot` as a one-time request that terminates, `httpTokens: required`,
+and the instance's and volume's tags plus EC2's `aws:ec2:fleet-id` on the instance. That
+first fleet failed in every pool because the launch policy allowed `CreateTags` only on the
+instance and Spot request, not the root volume. So the launch policy's statements bind every
+fleet launch, and with them:
 
-- **Zone:** the subnets. The policy names only this configuration's subnets, one per listed
-  zone, and the template's security group belongs to this VPC, so a launch cannot leave it.
-- **Instance type:** the adapter, which sends only the class's types from `MACHINES_CONFIG`,
-  and the Worker's spend caps. IAM cannot cap the type of a fleet's instance.
-- **Spot only:** the adapter, which sends `DefaultTargetCapacityType=spot` with a total
-  capacity of 1 and no On-Demand capacity; the launch template sets no market options. A
-  caller with this key could launch an On-Demand instance through a fleet.
-- **IMDSv2:** the adapter, whose every override sends `HttpTokens=required`. The launch
-  template requires IMDSv2 too, but a fleet's override can change that, so for a caller with
-  this key it is only a default.
-- **Default tenancy:** the adapter, which never sets one; the template names none. A fleet's
-  override can set a tenancy.
-- **Root volume size:** the class's `root_volume_gib`. `max_root_volume_gib` caps only
-  `RunInstances`.
+- **Zone and instance type:** the listed zones and the allowed instance-type patterns.
+- **Spot only, IMDSv2 and default tenancy:** `ec2:InstanceMarketType`,
+  `ec2:MetadataHttpTokens` and `ec2:Tenancy` on the instance. The launch template also
+  requires IMDSv2 and the adapter sends it on every override.
+- **Root volume size:** `max_root_volume_gib`.
+- **Tags:** the exact managed tag keys on the instance, with `clm-managed=true`,
+  `clm-kind=instance` and the owner, generation, deadline and name. A `CreateFleet` that
+  leaves out the instance's tag specification passes the fleet check, but its launch is a
+  `RunInstances` without the instance's tags, which the launch policy and the boundary
+  refuse.
 - **Public IPv4 and the security group:** the template, which has no network interface block
   and names the outbound-only group; a fleet cannot override the group, and the subnets assign
   a public IPv4 on launch.
-- **Tags:** IAM refuses a wrong or missing managed tag on the fleet, and a wrong one on the
-  instance or volume. A request that leaves out the instance's or the volume's tag
-  specification entirely is not refused (as with rembuild's Spot request below), so that the
-  instance carries its tags rests on the adapter, which always sends all three. An untagged
-  instance would be invisible to the sweep, and the cleanup policy would refuse to terminate
-  it; only an operator could find and end it.
+
+The negative cases were checked with `RunInstances` DryRuns of the fleet's launch as the
+Worker's user (an `t3.nano`, a 500 GiB volume, IMDSv1, On-Demand, and no instance tags, each
+refused); a real fleet was tried only with the adapter's own request.
 
 An instant fleet needs no `AWSServiceRoleForEC2Fleet` (EC2 Fleet prerequisites guide), and the
 account has none.
