@@ -1301,7 +1301,6 @@ impl Provisioning<'_> {
             image: class.image.clone(),
             boot: self.user_data()?,
             ssh_key_ids: class.ssh_key_ids.clone(),
-            vpc_uuid: class.vpc_uuid.clone(),
         }));
         self.create(&spec).await?;
 

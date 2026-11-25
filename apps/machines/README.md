@@ -257,9 +257,6 @@ started billing increment is billed in full:
   internet, about $0.09 per GB after the account's first 100 GB a month, is billed by AWS
   but not counted by either cap.
 
-A class may set a `billing_increment_secs` that is a whole multiple of its provider's, such as
-7200 for phoenixNAP, never a finer or uneven one, since either could bill less than the provider.
-
 - **Per run**: the run's accrued spend is each machine's price times its billed life, from
   create until it was confirmed gone, in whole increments and at least the minimum. On
   phoenixNAP the spend steps up at each hour from create, and the run object checks it
@@ -322,11 +319,11 @@ alarm for every priority 5 message.
 | `HOURLY_SPEND_CAP_CENTS` | var | the hourly cap, default 100 |
 | `MACHINES_CONFIG` | var, JSON | `api_base`, `max_run_hours`, `max_machines_per_run`, `run_spend_cap_usd`, `heartbeat_ttl_secs` (default 180, at least 60), `boot_grace_secs` (the boot grace of DigitalOcean classes, default 480, at least the heartbeat window), `classes` and the classes each app may use |
 
-Every class has `price_per_hour_usd`, `max_hours`, and optionally `boot_grace_secs` and
-`billing_increment_secs`, which default to its provider's. Then by `provider`:
+Every class has `price_per_hour_usd` and `max_hours`; its billing increment and boot grace
+are its provider's. Then by `provider`:
 
 - `digitalocean`, the default when `provider` is absent: `{region, size, image,
-  ssh_key_ids?, vpc_uuid?}`
+  ssh_key_ids?}`
 - `phoenixnap`: `{server_type, locations, os, ssh_key_ids}`, with `locations` such as
   `["SEA", "NLD"]` and `ssh_key_ids` the IDs of account SSH keys, at least one: phoenixNAP
   refuses a Linux server with no SSH key, and the Worker never adds the account's default

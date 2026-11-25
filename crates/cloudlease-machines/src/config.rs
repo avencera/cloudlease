@@ -126,18 +126,9 @@ struct RawConfig {
 struct RawCommon {
     price_per_hour_usd: String,
     max_hours: u64,
-    #[serde(default)]
-    boot_grace_secs: Option<u64>,
-    #[serde(default)]
-    billing_increment_secs: Option<u64>,
 }
 
-const COMMON_FIELDS: [&str; 4] = [
-    "price_per_hour_usd",
-    "max_hours",
-    "boot_grace_secs",
-    "billing_increment_secs",
-];
+const COMMON_FIELDS: [&str; 2] = ["price_per_hour_usd", "max_hours"];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,8 +138,6 @@ struct RawDigitalOceanClass {
     image: String,
     #[serde(default)]
     ssh_key_ids: Vec<NonZeroU64>,
-    #[serde(default)]
-    vpc_uuid: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -210,8 +199,6 @@ pub struct DigitalOceanClass {
     pub image: DropletImage,
     /// SSH keys installed for break-glass access
     pub ssh_key_ids: Vec<NonZeroU64>,
-    /// The VPC, when not the region default
-    pub vpc_uuid: Option<ResourceId>,
 }
 
 /// A phoenixNAP Bare Metal Cloud server, billed hourly
@@ -633,24 +620,7 @@ fn machine_class(
     let gate_units = price_per_hour
         .cents_per_hour()
         .map_err(|error| ConfigError::invalid(field("price_per_hour_usd"), error))?;
-    let billing = match common.billing_increment_secs {
-        None => billing,
-        Some(secs) => billing
-            .with_increment(Duration::from_secs(secs))
-            .map_err(|error| ConfigError::invalid(field("billing_increment_secs"), error))?,
-    };
-    let boot_grace = common
-        .boot_grace_secs
-        .map_or(boot_grace, Duration::from_secs);
-    let heartbeat = Heartbeat::new(defaults.heartbeat_ttl, boot_grace).map_err(|error| {
-        // a class's own boot grace is named as the class's field
-        match (error, common.boot_grace_secs) {
-            (ConfigError::Invalid { message, .. }, Some(_)) => {
-                ConfigError::invalid(field("boot_grace_secs"), message)
-            }
-            (error, _) => error,
-        }
-    })?;
+    let heartbeat = Heartbeat::new(defaults.heartbeat_ttl, boot_grace)?;
 
     let class = MachineClass {
         provider,
@@ -685,19 +655,12 @@ fn digitalocean_class(
         Some(id) => DropletImage::Id(id),
         None => DropletImage::Slug(slug("image", raw.image)?),
     };
-    let vpc_uuid = raw
-        .vpc_uuid
-        .map(|value| {
-            ResourceId::parse(value).map_err(|error| ConfigError::invalid(field("vpc_uuid"), error))
-        })
-        .transpose()?;
 
     Ok(DigitalOceanClass {
         region: slug("region", raw.region)?,
         size: slug("size", raw.size)?,
         image,
         ssh_key_ids: raw.ssh_key_ids,
-        vpc_uuid,
     })
 }
 
@@ -1045,13 +1008,10 @@ pub(crate) mod tests {
         // phoenixNAP refuses a Linux server with no SSH key
         assert!(broken(&["classes", "pnap-s2", "ssh_key_ids"], json!([])).is_err());
         // billing finer than phoenixNAP's hour would undercount
-        assert!(broken(&["classes", "pnap-s2", "billing_increment_secs"], json!(60)).is_err());
-        assert!(broken(&["classes", "pnap-s2", "boot_grace_secs"], json!(30)).is_err());
         assert!(broken(&["classes", "lat-m4", "sites"], json!(["DAL", "DAL"])).is_err());
         assert!(broken(&["classes", "lat-m4", "sites"], json!([])).is_err());
         assert!(broken(&["classes", "lat-m4", "plan"], json!("m4 metal")).is_err());
         assert!(broken(&["classes", "lat-m4", "locations"], json!(["DAL"])).is_err());
-        assert!(broken(&["classes", "lat-m4", "billing_increment_secs"], json!(60)).is_err());
         // a Spot cap above the counted price would let EC2 bill more than the spend shows
         assert!(broken(&["classes", "aws-c8a", "spot_max_price_usd"], json!("0.49")).is_err());
         assert!(broken(&["classes", "aws-c8a", "spot_max_price_usd"], json!("0")).is_err());
@@ -1135,20 +1095,6 @@ pub(crate) mod tests {
             class("pnap-s2").heartbeat.boot_grace(),
             Duration::from_secs(1_200)
         );
-
-        let mut config = sample();
-        config["classes"]["pnap-s2"]["boot_grace_secs"] = json!(900);
-        config["classes"]["do-c16"]["billing_increment_secs"] = json!(3_600);
-        let own = MachinesConfig::parse(&config.to_string()).unwrap();
-        let homebased = AppName::parse("homebased").unwrap();
-        let pnap = own
-            .class_for(&homebased, &ClassName::parse("pnap-s2").unwrap())
-            .unwrap();
-        assert_eq!(pnap.heartbeat.boot_grace(), Duration::from_secs(900));
-        let hourly = own
-            .class_for(&homebased, &ClassName::parse("do-c16").unwrap())
-            .unwrap();
-        assert_eq!(hourly.billing.increment(), Duration::from_secs(3_600));
 
         // a run created with a two hour boot grace still starts leases of a class a later
         // config cut to one hour

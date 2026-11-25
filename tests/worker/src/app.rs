@@ -215,6 +215,5 @@ fn droplet_spec() -> cloudlease_provider::error::ProviderResult<DoSpec> {
         image: DropletImage::Slug(Slug::parse("ubuntu-24-04-x64")?),
         boot: BootScript::parse("#!/bin/sh\ntrue\n")?,
         ssh_key_ids: Vec::new(),
-        vpc_uuid: None,
     }))
 }

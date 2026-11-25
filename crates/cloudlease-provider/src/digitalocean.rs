@@ -108,8 +108,6 @@ pub struct DropletSpec {
     pub boot: BootScript,
     /// SSH key IDs to install
     pub ssh_key_ids: Vec<NonZeroU64>,
-    /// The VPC, when not the region default
-    pub vpc_uuid: Option<ResourceId>,
 }
 
 /// A DigitalOcean create request
@@ -220,7 +218,7 @@ fn droplet_body(spec: &DropletSpec, tags: Vec<String>) -> Value {
         DropletImage::Slug(slug) => Value::String(slug.as_str().to_owned()),
         DropletImage::Id(id) => Value::Number(id.get().into()),
     };
-    let mut body = json!({
+    json!({
         "name": spec.name.as_str(),
         "region": spec.region.as_str(),
         "size": spec.size.as_str(),
@@ -230,12 +228,7 @@ fn droplet_body(spec: &DropletSpec, tags: Vec<String>) -> Value {
         "tags": tags,
         "monitoring": true,
         "ipv6": true,
-    });
-    if let Some(vpc_uuid) = &spec.vpc_uuid {
-        body["vpc_uuid"] = Value::String(vpc_uuid.as_str().to_owned());
-    }
-
-    body
+    })
 }
 
 fn resource_id(value: impl Into<String>) -> ProviderResult<ResourceId> {

@@ -296,7 +296,6 @@ fn droplet_spec(name: &str) -> DoSpec {
         image: DropletImage::Slug(Slug::parse("ubuntu-24-04-x64").unwrap()),
         boot: BootScript::parse("#!/bin/sh\necho hello\n").unwrap(),
         ssh_key_ids: Vec::new(),
-        vpc_uuid: None,
     })
 }
 
