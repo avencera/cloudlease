@@ -3,7 +3,7 @@
 use cloudlease_core::{
     alarm::Backoff,
     deletes::DeleteTarget,
-    holding::{Holding, HoldingError},
+    holding::{Holding, HoldingError, TagSearch},
     time::UnixMillis,
 };
 
@@ -31,7 +31,9 @@ pub struct Reaped<K> {
 ///
 /// `clock` is read after each provider answer, since a released holding records when its
 /// last resource was confirmed gone and spend is counted up to then: a time from before slow
-/// delete and confirm calls would undercount it.
+/// delete and confirm calls would undercount it. It is also read before each tag search,
+/// since only the time the search was sent shows whether its snapshot came after the
+/// settle time.
 pub async fn reap<P: CloudProvider>(
     provider: &P,
     holding: &Holding<P::Kind>,
@@ -80,11 +82,16 @@ async fn step<P: CloudProvider>(
 ) -> Result<Option<Result<Holding<P::Kind>, HoldingError>>, ProviderError> {
     match target {
         DeleteTarget::Tagged { kind } => {
+            let sent = clock();
             let found = provider
                 .find(holding.owner(), holding.generation(), *kind)
                 .await?;
+            let search = TagSearch {
+                sent,
+                answered: clock(),
+            };
 
-            Ok(holding.resolve_tagged(*kind, found, clock()).transpose())
+            Ok(holding.resolve_tagged(*kind, found, search).transpose())
         }
         DeleteTarget::Known { kind, id } => {
             provider.delete(*kind, id).await?;

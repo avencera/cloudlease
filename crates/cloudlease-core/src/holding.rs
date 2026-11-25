@@ -125,6 +125,18 @@ pub enum HoldingState<K> {
 /// by then; if one still lands later, the sweep deletes it as unclaimed.
 pub const TAG_SEARCH_SETTLE: Duration = Duration::from_secs(120);
 
+/// When a tag search was sent and when its answer arrived
+///
+/// The provider's snapshot can be as old as `sent`, so only that time shows whether the
+/// search came after [`TAG_SEARCH_SETTLE`]; `answered` is when cleanup learned the result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TagSearch {
+    /// When the search request was sent
+    pub sent: UnixMillis,
+    /// When its answer arrived
+    pub answered: UnixMillis,
+}
+
 /// A rejected holding transition
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum HoldingError {
@@ -352,24 +364,24 @@ impl<K: ResourceKind> Holding<K> {
 
     /// Replaces a tagged target with the IDs a tag search found
     ///
-    /// Returns `None` for an empty search within [`TAG_SEARCH_SETTLE`] of the lease's end:
-    /// a create sent just before then may not be visible yet, so the target stays pending
-    /// and the owner retries.
+    /// Returns `None` for an empty search sent within [`TAG_SEARCH_SETTLE`] of the lease's
+    /// end: a create sent just before then may not be visible yet, so the target stays
+    /// pending and the owner retries. A holding this releases records `search.answered`.
     pub fn resolve_tagged(
         &self,
         kind: K,
         found: impl IntoIterator<Item = ResourceId>,
-        now: UnixMillis,
+        search: TagSearch,
     ) -> Result<Option<Self>, HoldingError> {
         let (reason, since, deletes) = self.releasing("resolve a tagged deletion for")?;
         let found: Vec<_> = found.into_iter().collect();
-        if found.is_empty() && now < since.saturating_add(TAG_SEARCH_SETTLE) {
+        if found.is_empty() && search.sent < since.saturating_add(TAG_SEARCH_SETTLE) {
             return Ok(None);
         }
 
         let remaining = deletes.resolve_tagged(kind, found)?;
 
-        Ok(Some(self.after_progress(reason, since, remaining, now)))
+        Ok(Some(self.after_progress(reason, since, remaining, search.answered)))
     }
 
     /// Schedules the next cleanup attempt after one that failed or did not confirm absence

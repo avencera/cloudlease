@@ -9,7 +9,9 @@ use cloudlease_core::{
     alarm::{Backoff, Wake, next_alarm},
     capacity::{Permit, PermitKey, PermitStatus, PermitUnits},
     deletes::{DeleteTarget, DeletesError},
-    holding::{Holding, HoldingError, HoldingState, ReleaseReason, Retry, TAG_SEARCH_SETTLE},
+    holding::{
+        Holding, HoldingError, HoldingState, ReleaseReason, Retry, TAG_SEARCH_SETTLE, TagSearch,
+    },
     ids::{Generation, LeaseId, OwnerId, PermitId, ResourceId},
     lease::{Expiry, Lease, LeaseError, LeasePolicy},
     sweep::{
@@ -58,6 +60,13 @@ const MINUTE: Duration = Duration::from_secs(60);
 
 fn at(millis: u64) -> UnixMillis {
     UnixMillis::new(millis).unwrap()
+}
+
+fn search(sent: u64, answered: u64) -> TagSearch {
+    TagSearch {
+        sent: at(sent),
+        answered: at(answered),
+    }
 }
 
 fn start() -> UnixMillis {
@@ -170,19 +179,34 @@ fn an_expired_lease_releases_machines_before_disks_and_finds_lost_creates_by_tag
     let nothing: [ResourceId; 0] = [];
     assert_eq!(
         machine_gone
-            .resolve_tagged(Kind::Disk, nothing.clone(), at(settled - 1))
+            .resolve_tagged(Kind::Disk, nothing.clone(), search(settled - 1, settled - 1))
             .unwrap(),
         None
     );
+
+    // what counts is when the provider took its snapshot, not when the answer arrived
+    assert_eq!(
+        machine_gone
+            .resolve_tagged(Kind::Disk, nothing.clone(), search(settled - 1, settled + 1_000))
+            .unwrap(),
+        None
+    );
+
     let settled_empty = machine_gone
-        .resolve_tagged(Kind::Disk, nothing, at(settled))
+        .resolve_tagged(Kind::Disk, nothing, search(settled, settled + 1_000))
         .unwrap()
         .unwrap();
-    assert!(settled_empty.is_released());
+    assert_eq!(
+        settled_empty.state(),
+        &HoldingState::Released {
+            reason: ReleaseReason::HeartbeatMissed,
+            at: at(settled + 1_000),
+        }
+    );
 
     // a tag search that finds the lost disk turns it into a known target at once
     let found = machine_gone
-        .resolve_tagged(Kind::Disk, [id("vol-1")], at(1_122_000))
+        .resolve_tagged(Kind::Disk, [id("vol-1")], search(1_122_000, 1_122_000))
         .unwrap()
         .unwrap();
     assert_eq!(
