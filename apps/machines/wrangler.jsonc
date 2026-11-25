@@ -127,7 +127,9 @@
           "max_hours": 1
         }
       },
-      "apps": { "homebased": { "classes": ["do-s1-1g", "pnap-s2-large", "pnap-s2-small", "lat-m4-medium", "aws-c8a-4xl"] } }
+      // aws-c8a-4xl stays off until its launch template is applied and set above, so a deploy
+      // before then refuses the class instead of failing every launch
+      "apps": { "homebased": { "classes": ["do-s1-1g", "pnap-s2-large", "pnap-s2-small", "lat-m4-medium"] } }
     }
   }
 }
