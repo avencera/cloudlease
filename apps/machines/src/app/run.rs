@@ -340,13 +340,12 @@ impl Run {
 
     async fn release_run(&self, stores: &Stores, caller: &Caller, now: UnixMillis) -> Answer {
         let loaded = client_run(stores, caller)?;
-        if loaded.run.ended.is_none() {
-            let run = RunRecord {
-                ended: Some(RunEnd::Requested { at: now }),
-                ..loaded.run.clone()
-            };
-            stores.runs.put_run(&run).map_err(internal)?;
-        }
+        stores
+            .runs
+            .update_run(|run| {
+                run.ended.get_or_insert(RunEnd::Requested { at: now });
+            })
+            .map_err(internal)?;
         let end = LeaseEnd::Revoke {
             reason: ReleaseReason::RunReleased,
             by: ReleasedBy::Client,
@@ -651,15 +650,18 @@ impl Run {
             self.return_permits(stores).await.map_err(internal)?;
         }
 
-        if loaded.run.create_failure_alerted {
+        let mut first_failure = false;
+        stores
+            .runs
+            .update_run(|run| {
+                first_failure = !run.create_failure_alerted;
+                run.create_failure_alerted = true;
+            })
+            .map_err(internal)?;
+        if !first_failure {
             worker::console_error!("create of {} failed: {error}", record.hostname);
             return Ok(());
         }
-        let alerted = RunRecord {
-            create_failure_alerted: true,
-            ..loaded.run.clone()
-        };
-        stores.runs.put_run(&alerted).map_err(internal)?;
         notify(
             &self.env,
             &Alert {
@@ -926,11 +928,9 @@ impl Run {
         loaded: &Loaded,
         now: UnixMillis,
     ) -> CloudleaseResult<()> {
-        let run = RunRecord {
-            ended: Some(RunEnd::SpendCap { at: now }),
-            ..loaded.run.clone()
-        };
-        stores.runs.put_run(&run)?;
+        stores.runs.update_run(|run| {
+            run.ended.get_or_insert(RunEnd::SpendCap { at: now });
+        })?;
 
         let end = LeaseEnd::Revoke {
             reason: ReleaseReason::SpendCap,
@@ -946,7 +946,8 @@ impl Run {
             }
         }
 
-        let spend = run_spend(&loaded.run, &loaded.entries(), now);
+        let run = &loaded.run;
+        let spend = run_spend(run, &loaded.entries(), now);
         notify(
             &self.env,
             &Alert {

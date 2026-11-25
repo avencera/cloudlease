@@ -145,6 +145,59 @@ describe("phoenixNAP machines in miniflare", () => {
     expect(await permits()).toEqual([expect.objectContaining({ ownerId: other.run_id, generation: 1 })]);
   });
 
+  it("keeps a run released while a refused create returns its permit", async () => {
+    pnap.outOfStock.add("SEA");
+    pnap.outOfStock.add("NLD");
+    const run = await metalRun({ name: "pool-refused-release" });
+
+    // hold the first create request until the gate is stalled, so the refusal's permit
+    // return waits on the gate
+    let sendCreate!: () => void;
+    const createHeld = new Promise<void>((resolve) => {
+      sendCreate = resolve;
+    });
+    let createArrived!: () => void;
+    const arrived = new Promise<void>((resolve) => {
+      createArrived = resolve;
+    });
+    const inner = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      if (request.method === "POST" && new URL(request.url).pathname === "/bmc/v1/servers") {
+        createArrived();
+        await createHeld;
+      }
+      return inner(input, init);
+    });
+    let openGate!: () => void;
+    const gateClosed = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+
+    const create = call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-metal-refused-release"));
+    await arrived;
+    const stall = runInDurableObject(gateStub(), (_instance, state) => state.blockConcurrencyWhile(() => gateClosed));
+    sendCreate();
+    await vi.waitUntil(async () => (await readRun(run.run_id)).machines[0]?.release?.reason === "create_failed", {
+      timeout: 5_000,
+      interval: 20,
+    });
+
+    const released = await call("POST", `/v1/runs/${run.run_id}/release`, CLIENT, { reason: "requested" });
+    expect(released.status).toBe(202);
+    openGate();
+    await stall;
+    expect((await create).status).toBe(201);
+
+    // the create's failure alert must not undo the release
+    expect((await readRun(run.run_id)).state).not.toBe("open");
+    await expectError(
+      await call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-metal-after-release")),
+      409,
+      "run_ended",
+    );
+  }, 20_000);
+
   it("keeps the permit of a create whose outcome is unknown until its cleanup confirms it", async () => {
     await gateLimit(2);
     pnap.failCreates = true;

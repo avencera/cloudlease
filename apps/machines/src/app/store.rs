@@ -64,6 +64,24 @@ impl RunStore {
         self.first("SELECT record FROM machines_run WHERE id = 1", None)
     }
 
+    /// Changes the stored run and returns it as written, or `None` before the run exists
+    ///
+    /// Read and write happen with no await between them, so a request that changed the run
+    /// while the caller awaited a provider or the gate is never undone by the caller's
+    /// older copy.
+    pub fn update_run(
+        &self,
+        change: impl FnOnce(&mut RunRecord),
+    ) -> CloudleaseResult<Option<RunRecord>> {
+        let Some(mut run) = self.run()? else {
+            return Ok(None);
+        };
+        change(&mut run);
+        self.put_run(&run)?;
+
+        Ok(Some(run))
+    }
+
     /// Writes the run
     pub fn put_run(&self, run: &RunRecord) -> CloudleaseResult<()> {
         self.0.exec(
