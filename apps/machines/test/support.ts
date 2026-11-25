@@ -10,7 +10,7 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { expect } from "vitest";
+import { expect, vi } from "vitest";
 // scheduled controllers cannot cross the loopback binding, so the suite calls the shim directly
 // @ts-expect-error worker-build emits no declaration for its JavaScript shim
 import RustWorker from "../build/index.js";
@@ -192,6 +192,14 @@ export async function settle(lease: LeaseView): Promise<LeaseView> {
   for (let pass = 0; pass < 10; pass += 1) {
     const current = await readLease(lease.lease_id);
     if (current.state === "released") {
+      // an alarm miniflare ran itself may have saved the release and still be returning the
+      // permit to the gate
+      const generation = generationOf(lease.lease_id);
+      await vi.waitUntil(
+        async () =>
+          !(await permits()).some((permit) => permit.ownerId === lease.run_id && permit.generation === generation),
+        { timeout: 5_000, interval: 20 },
+      );
       return current;
     }
 
