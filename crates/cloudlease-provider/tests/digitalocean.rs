@@ -12,6 +12,7 @@ use std::{
 
 use cloudlease_core::{
     alarm::Backoff,
+    deletes::DeleteTarget,
     holding::{Holding, HoldingState, ReleaseReason},
     ids::{Generation, LeaseId, OwnerId, ResourceId, TagPrefix},
     lease::{Lease, LeasePolicy},
@@ -564,6 +565,44 @@ fn a_released_holding_records_the_time_after_the_provider_confirmed_its_droplet_
             reason: ReleaseReason::HeartbeatMissed,
             at: at(122_000),
         }
+    );
+}
+
+#[test]
+fn an_empty_tag_search_sent_before_the_settle_time_keeps_the_holding_releasing() {
+    let harness = harness();
+    let owner = owner_tags("job_1", 1);
+
+    // the droplet's create was sent but its answer was lost, and it is not listed yet
+    let policy = LeasePolicy::new(Duration::from_secs(120), Duration::from_secs(3_600)).unwrap();
+    let lease = Lease::start(LeaseId::parse("lease_1").unwrap(), &policy, at(0), None).unwrap();
+    let releasing = Holding::leased(owner.owner.clone(), owner.generation, lease)
+        .request(DoKind::Droplet, at(0))
+        .unwrap()
+        .expire(at(120_000))
+        .unwrap();
+
+    // the search is sent a second before the two minute settle time ends and, since each
+    // provider request takes a second, answers after it
+    let requests_before = harness.api.borrow().log.len();
+    let clock = || {
+        let requests = harness.api.borrow().log.len() - requests_before;
+        at(239_000 + 1_000 * u64::try_from(requests).unwrap())
+    };
+    let reaped = block_on(reap(
+        &harness.provider,
+        &releasing,
+        clock,
+        &Backoff::default(),
+    ))
+    .unwrap();
+
+    assert!(harness.api.borrow().log.len() > requests_before);
+    assert_eq!(
+        reaped.holding.ready_deletes(),
+        vec![DeleteTarget::Tagged {
+            kind: DoKind::Droplet
+        }]
     );
 }
 
