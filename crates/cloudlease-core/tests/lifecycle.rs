@@ -179,7 +179,11 @@ fn an_expired_lease_releases_machines_before_disks_and_finds_lost_creates_by_tag
     let nothing: [ResourceId; 0] = [];
     assert_eq!(
         machine_gone
-            .resolve_tagged(Kind::Disk, nothing.clone(), search(settled - 1, settled - 1))
+            .resolve_tagged(
+                Kind::Disk,
+                nothing.clone(),
+                search(settled - 1, settled - 1)
+            )
             .unwrap(),
         None
     );
@@ -187,7 +191,11 @@ fn an_expired_lease_releases_machines_before_disks_and_finds_lost_creates_by_tag
     // what counts is when the provider took its snapshot, not when the answer arrived
     assert_eq!(
         machine_gone
-            .resolve_tagged(Kind::Disk, nothing.clone(), search(settled - 1, settled + 1_000))
+            .resolve_tagged(
+                Kind::Disk,
+                nothing.clone(),
+                search(settled - 1, settled + 1_000)
+            )
             .unwrap(),
         None
     );

@@ -381,7 +381,12 @@ impl<K: ResourceKind> Holding<K> {
 
         let remaining = deletes.resolve_tagged(kind, found)?;
 
-        Ok(Some(self.after_progress(reason, since, remaining, search.answered)))
+        Ok(Some(self.after_progress(
+            reason,
+            since,
+            remaining,
+            search.answered,
+        )))
     }
 
     /// Schedules the next cleanup attempt after one that failed or did not confirm absence
