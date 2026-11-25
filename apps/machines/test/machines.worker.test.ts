@@ -645,4 +645,40 @@ describe("cloudlease machines in miniflare", () => {
     await createMachine(run, "hb-old-gate");
     expect(await permits()).toHaveLength(2);
   });
+  it("keeps the spend check due while another machine's create is in flight", async () => {
+    const run = await createRun();
+    const first = await createMachine(run, "hb-spend-wake-1");
+    // $0.01 an hour against the $0.05 cap: with the second machine's one cent minimum, the run
+    // reaches its cap about 30 seconds after the second create
+    await backdateMachine(first, 4 * HOUR - 30_000);
+
+    let sendCreate!: () => void;
+    const createHeld = new Promise<void>((resolve) => {
+      sendCreate = resolve;
+    });
+    let createArrived!: () => void;
+    const arrived = new Promise<void>((resolve) => {
+      createArrived = resolve;
+    });
+    const inner = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      if (request.method === "POST" && new URL(request.url).pathname === "/v2/droplets") {
+        createArrived();
+        await createHeld;
+      }
+      return inner(input, init);
+    });
+
+    const second = call("POST", `/v1/runs/${run.run_id}/machines`, CLIENT, machineBody("hb-spend-wake-2"));
+    await arrived;
+    // the second machine's lease is saved before its droplet is created, and must not push the
+    // run's alarm past the spend check; the stub is made here, since this code now runs in
+    // the context of the request that resolved `arrived`
+    const during = await runInDurableObject(runStub(run.run_id), (_instance, state) => state.storage.getAlarm());
+    sendCreate();
+    expect((await second).status).toBe(201);
+    expect(during).not.toBeNull();
+    expect(during ?? Infinity).toBeLessThan(Date.now() + 2 * MINUTE);
+  });
 });

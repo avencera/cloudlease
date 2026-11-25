@@ -20,6 +20,28 @@ pub async fn rearm(
     }
 }
 
+/// Moves the alarm earlier when a wake is due before it, and otherwise leaves it as it is
+///
+/// For a change that can only add deadlines, such as saving one holding: the owner may have
+/// wakes of its own beyond its holdings, such as a spend check, which a full [`rearm`] from
+/// holdings alone would push back. An alarm left earlier than needed only runs a pass that
+/// re-arms from everything the owner knows.
+pub async fn pull_earlier(
+    storage: &Storage,
+    wakes: impl IntoIterator<Item = Wake>,
+    now: UnixMillis,
+) -> CloudleaseResult<()> {
+    let Some(at) = next_alarm(wakes, now) else {
+        return Ok(());
+    };
+    let current = storage.get_alarm().await?;
+    if current.is_some_and(|current| current <= i64::try_from(at.as_millis()).unwrap_or(i64::MAX)) {
+        return Ok(());
+    }
+
+    set_at(storage, at).await
+}
+
 /// Sets the alarm a few seconds out after a handler failed
 ///
 /// A failing alarm handler must leave an alarm behind, or nothing enforces an expired lease

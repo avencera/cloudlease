@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use worker::{Request, Response, Storage};
 
 use crate::{
-    alarm::{rearm, rearm_after_failure},
+    alarm::{pull_earlier, rearm, rearm_after_failure},
     error::{CloudleaseError, CloudleaseResult},
     http::{HttpError, json_response, read_json},
     store::HoldingStore,
@@ -39,7 +39,10 @@ pub struct Processed<K> {
     pub errors: Vec<ProviderError>,
 }
 
-/// Saves a holding and re-arms the alarm for the earliest deadline of all holdings
+/// Saves a holding and moves the alarm earlier if one of the holdings is due before it
+///
+/// The alarm is never moved later here: the owner may have deadlines of its own beyond its
+/// holdings, and only its alarm handler, which knows them all, re-arms from scratch.
 pub async fn save<K>(
     storage: &Storage,
     store: &HoldingStore,
@@ -52,7 +55,7 @@ where
     store.put(holding, now)?;
     let holdings = store.list::<K>()?;
 
-    rearm(storage, holdings.iter().filter_map(Holding::wake), now).await
+    pull_earlier(storage, holdings.iter().filter_map(Holding::wake), now).await
 }
 
 /// Creates one resource for a leased generation, saving the intent before the provider call

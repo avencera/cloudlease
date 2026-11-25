@@ -532,9 +532,9 @@ impl Run {
         owner::save(&stores.storage, &stores.holdings, &holding, now)
             .await
             .map_err(internal)?;
-        // owner::save and owner::create arm the alarm from holdings alone, so the spend wake
-        // is missing while the provider calls run; the rearm after them restores it, and if
-        // this object dies first, the next renew from any machine of the run does
+        // the new machine brings the spend check closer, and the provider calls below can
+        // take seconds; owner saves during them only ever move the alarm earlier
+        self.rearm(stores, now).await.map_err(internal)?;
 
         let provisioned = self
             .create_resources(
