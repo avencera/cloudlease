@@ -34,6 +34,11 @@ the launch template (`lt-010f6147c2e816163`, version 1), the `fleet` policy and 
 and the launch policy's template grant. The AWS classes of `MACHINES_CONFIG` name that template
 and version.
 
+**Fixed 2026-11-25** with the default profile, after the first live fleets were refused: the
+`fleet` policy now pins only what the `CreateFleet` check carries, and the `launch` policy
+lets a fleet's own `RunInstances` tag the root volume. A live fleet then launched a Spot
+instance, and an AWS FIS interruption of it ran end to end.
+
 ## What the policies allow
 
 - **inventory:** `DescribeInstances` and `DescribeSpotInstanceRequests` in the region. The
@@ -119,8 +124,8 @@ refused); a real fleet was tried only with the adapter's own request.
 An instant fleet needs no `AWSServiceRoleForEC2Fleet` (EC2 Fleet prerequisites guide), and the
 account has none.
 
-A fleet cannot tag the Spot request it opens. Whether that request carries any tags is
-unconfirmed, so the adapter accepts an untagged one-time request as its instance's own and
+A fleet cannot tag the Spot request it opens, and on 2026-11-25 both live fleets' requests
+carried no tags, so the adapter accepts an untagged one-time request as its instance's own and
 never cancels it (the cleanup policy would refuse a cancel of an untagged request): it closes
 with its instance. `CreateFleet` keeps a `ClientToken` for an unconfirmed time; the adapter
 never replays a launch whose answer was lost, and finds its instance by tags instead.
