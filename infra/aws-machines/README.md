@@ -49,7 +49,8 @@ operator user may create launch templates was not checked.
     that `CreateFleet`
 - **launch:** `RunInstances` only, kept because whether `CreateFleet` also authorizes
   `RunInstances` against the caller is unconfirmed
-  - of the pinned AMI (and its root snapshot) and the launch template, into this
+  - of the pinned AMI (and its root snapshot) and the launch template (EC2's launch template
+    permissions guide asks for `RunInstances` on a template to launch from it), into this
     configuration's subnets, VPC and security group, with a public IPv4 address
   - in the listed zones, of the allowed instance-type patterns, on the Spot market, with
     IMDSv2 required and default tenancy

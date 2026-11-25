@@ -238,11 +238,15 @@ data "aws_iam_policy_document" "launch" {
     }
   }
 
+  # launching from a launch template needs RunInstances on the template, a fleet's launch too
   statement {
-    sid       = "UseFixedImageAndSubnets"
-    effect    = "Allow"
-    actions   = ["ec2:RunInstances"]
-    resources = concat([local.image_arn, local.snapshot_arn], local.subnet_arns)
+    sid     = "UseFixedImageTemplateAndSubnets"
+    effect  = "Allow"
+    actions = ["ec2:RunInstances"]
+    resources = concat(
+      [local.image_arn, local.snapshot_arn, aws_launch_template.machines.arn],
+      local.subnet_arns,
+    )
 
     condition {
       test     = "StringEquals"
