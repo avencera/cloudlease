@@ -126,7 +126,8 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
   heartbeat-lapse and hard-deadline deletes ran live only on DigitalOcean, out-of-stock
   fall-through only on Latitude.sh, and a real AWS Spot interruption (rather than an
   out-of-band terminate) has not run. The AWS `CreateFleet` launch has run only against the
-  fake EC2: the launch template is not applied yet, and whether the fleet's Spot request
+  fake EC2: the launch template was applied and deployed on 2026-11-25, but no live machine
+  has used it yet. Whether the fleet's Spot request
   carries tags, whether `CreateFleet` also evaluates the caller's `RunInstances` conditions,
   and how long EC2 keeps a `ClientToken` are unconfirmed. Leaving out the pool of a machine
   whose Spot request is `marked-for-termination` has also run only against the fake EC2
