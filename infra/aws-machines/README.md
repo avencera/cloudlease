@@ -17,18 +17,40 @@ terminate or cancel the other app's instances.
 - one internet gateway and a public IPv4 route
 - one security group, `cloudlease-machines`, with all egress and no ingress: machines reach
   their coordinator outbound over iroh, so nothing connects in
-- one IAM user, `cloudlease-machines`, with three managed policies, named with the region
+- one launch template, `cloudlease-machines`: the security group (a fleet cannot override it),
+  no network interface block (so the subnets' automatic public IPv4 applies), IMDSv2 required,
+  the pinned AMI and terminate on shutdown. Each launch overrides the type, subnet, zone, AMI,
+  root volume, IMDSv2 and max price and brings its own user data, so one version serves every
+  machine
+- one IAM user, `cloudlease-machines`, with four managed policies, named with the region
 
-The `class_fields` output holds the region, AMI, root device, security group and zones with
-their subnet IDs that an AWS class in `MACHINES_CONFIG` names.
+The `class_fields` output holds the region, AMI, root device, launch template ID and version,
+and zones with their subnet IDs that an AWS class in `MACHINES_CONFIG` names. A class pins the
+template version as a number, so a template change takes effect only once the classes name its
+new `latest_version`.
+
+**Not applied yet.** The launch template and the `fleet` policy were added on 2026-11-24 and
+have not been applied: the applied state predates them. Apply this configuration, apply
+`infra/aws-operator` first for the widened boundary (an administrator change), then put
+`launch_template_id` and `launch_template_version` from `class_fields` in the AWS classes of
+`MACHINES_CONFIG` before deploying a Worker that launches with `CreateFleet`. Whether the
+operator user may create launch templates was not checked.
 
 ## What the policies allow
 
 - **inventory:** `DescribeInstances` and `DescribeSpotInstanceRequests` in the region. The
   sweep lists by the `clm-managed` tag key; describes cannot be scoped by tag.
-- **launch:** `RunInstances` only
-  - of the pinned AMI (and its root snapshot), into this configuration's subnets, VPC and
-    security group, with a public IPv4 address
+- **fleet:** `CreateFleet`, which the Worker launches with
+  - of instances in the listed zones and of the allowed instance-type patterns
+  - from this configuration's launch template, security group, pinned AMI (and its root
+    snapshot) and subnets, with a network interface and a root volume in the region
+  - with the exact managed tag keys, `clm-managed=true` and `clm-kind=instance` on the
+    instance and the fleet; `CreateTags` of the fleet, instance and volume only as part of
+    that `CreateFleet`
+- **launch:** `RunInstances` only, kept because whether `CreateFleet` also authorizes
+  `RunInstances` against the caller is unconfirmed
+  - of the pinned AMI (and its root snapshot) and the launch template, into this
+    configuration's subnets, VPC and security group, with a public IPv4 address
   - in the listed zones, of the allowed instance-type patterns, on the Spot market, with
     IMDSv2 required and default tenancy
   - with a root volume no larger than `max_root_volume_gib`
@@ -41,6 +63,37 @@ their subnet IDs that an AWS class in `MACHINES_CONFIG` names.
 IAM has no condition keys for the Spot request type, interruption behavior or max price. The
 adapter always sends a one-time request that terminates on interruption, with the class's max
 price, and the Worker's tests check the request it sends.
+
+### What the fleet policy cannot enforce
+
+On `CreateFleet` the instance's condition keys are only the region, `ec2:AvailabilityZone`,
+`ec2:InstanceType` and the request tags (Service Authorization Reference). So, unlike the
+`RunInstances` statements, the fleet policy cannot require:
+
+- **Spot only.** `ec2:InstanceMarketType` is not a `CreateFleet` key. The adapter always sends
+  `DefaultTargetCapacityType=spot` with a total capacity of 1 and no On-Demand capacity, and
+  the launch template sets no market options. A caller with this key could launch an
+  On-Demand instance through a fleet.
+- **IMDSv2.** `ec2:MetadataHttpTokens` is not a `CreateFleet` key. Every override sends
+  `HttpTokens=required`, and the launch template requires IMDSv2 as well, so a fleet that
+  omitted the override still gets it.
+- **Default tenancy.** `ec2:Tenancy` is not a `CreateFleet` key. The adapter never sets a
+  tenancy and the template names none, so instances get the VPC's default tenancy.
+- **Root volume size.** Whether `CreateFleet` evaluates `ec2:VolumeSize` is unconfirmed, so
+  `max_root_volume_gib` caps only `RunInstances`. The class's `root_volume_gib` sets the size.
+- **Public IPv4 on the interface.** The interface statement names no subnet or
+  `ec2:AssociatePublicIpAddress` condition, since their `CreateFleet` keys are unconfirmed;
+  the subnet statement still pins the subnets, which assign a public IPv4 on launch.
+
+A fleet cannot tag the Spot request it opens. Whether that request carries any tags is
+unconfirmed, so the adapter accepts an untagged one-time request as its instance's own and
+never cancels it (the cleanup policy would refuse a cancel of an untagged request): it closes
+with its instance. `CreateFleet` keeps a `ClientToken` for an unconfirmed time; the adapter
+never replays a launch whose answer was lost, and finds its instance by tags instead.
+
+An instant fleet needs no `AWSServiceRoleForEC2Fleet`, has no fleet-count quota, and is deleted
+by EC2 some time after its instance terminates, so nothing here or in the Worker cleans fleets
+up.
 
 As for rembuild's policy, AWS does not evaluate the Spot-request resource when a caller omits its
 tag specification, so IAM cannot make an untagged Spot request impossible. The instance itself

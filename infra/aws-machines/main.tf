@@ -10,7 +10,8 @@ data "aws_ami" "ubuntu" {
 locals {
   prefix = var.tag_prefix
 
-  # the tags the adapter writes on an instance and its Spot request, and nothing else
+  # the tags the adapter writes on an instance, its root volume and its fleet (and, on the old
+  # RunInstances path, its Spot request), and nothing else
   managed_tag_keys = [
     "Name",
     "${local.prefix}-gen",
@@ -26,6 +27,7 @@ locals {
   }
 
   ec2_account_arn_prefix = "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${var.aws_account_id}"
+  fleet_arn              = "${local.ec2_account_arn_prefix}:fleet/*"
   image_arn              = "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}::image/${var.ami_id}"
   instance_arn           = "${local.ec2_account_arn_prefix}:instance/*"
   network_interface_arn  = "${local.ec2_account_arn_prefix}:network-interface/*"
@@ -93,6 +95,29 @@ resource "aws_security_group" "machines" {
     protocol         = "-1"
     cidr_blocks      = ["0.0.0.0/0"]
     ipv6_cidr_blocks = ["::/0"]
+  }
+
+  tags = merge(local.common_tags, { Name = "cloudlease-machines" })
+}
+
+# what every launch shares. A fleet cannot override the security group, so it lives here, and
+# no network interface block, so the subnets' automatic public IPv4 applies. Each launch pins a
+# version number, so a change here takes effect only once the AWS classes in MACHINES_CONFIG
+# name the new version. The image, subnet, root volume, IMDSv2 and user data come with each
+# launch as overrides
+resource "aws_launch_template" "machines" {
+  name        = "cloudlease-machines"
+  description = "cloudlease machines: outbound-only Spot instances"
+
+  image_id                             = var.ami_id
+  instance_initiated_shutdown_behavior = "terminate"
+  vpc_security_group_ids               = [aws_security_group.machines.id]
+
+  # each launch asks for IMDSv2 too; IAM has no IMDS condition key for CreateFleet, so the
+  # template holds it as well
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
   }
 
   tags = merge(local.common_tags, { Name = "cloudlease-machines" })
@@ -346,6 +371,176 @@ data "aws_iam_policy_document" "launch" {
   }
 }
 
+# CreateFleet has fewer condition keys than RunInstances: on the instance only the region, zone,
+# instance type and request tags. It has no ec2:InstanceMarketType, ec2:MetadataHttpTokens or
+# ec2:Tenancy, so those guarantees rest on the request the adapter sends (spot capacity, IMDSv2
+# per override) and on the launch template (IMDSv2, default tenancy); see the README. The
+# RunInstances statements above stay, in case CreateFleet also authorizes RunInstances
+# against the caller
+data "aws_iam_policy_document" "fleet" {
+  statement {
+    sid       = "CreateFleetOfTaggedInstance"
+    effect    = "Allow"
+    actions   = ["ec2:CreateFleet"]
+    resources = [local.instance_arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:Region"
+      values   = [var.aws_region]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:AvailabilityZone"
+      values   = var.availability_zones
+    }
+
+    condition {
+      test     = "StringLike"
+      variable = "ec2:InstanceType"
+      values   = sort(tolist(var.allowed_instance_type_patterns))
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/${local.prefix}-managed"
+      values   = ["true"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/${local.prefix}-kind"
+      values   = ["instance"]
+    }
+
+    condition {
+      test     = "Null"
+      variable = "aws:RequestTag/${local.prefix}-owner"
+      values   = ["false"]
+    }
+
+    condition {
+      test     = "Null"
+      variable = "aws:RequestTag/${local.prefix}-gen"
+      values   = ["false"]
+    }
+
+    condition {
+      test     = "Null"
+      variable = "aws:RequestTag/${local.prefix}-until"
+      values   = ["false"]
+    }
+
+    condition {
+      test     = "Null"
+      variable = "aws:RequestTag/Name"
+      values   = ["false"]
+    }
+
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "aws:TagKeys"
+      values   = local.managed_tag_keys
+    }
+  }
+
+  statement {
+    sid       = "CreateTaggedFleet"
+    effect    = "Allow"
+    actions   = ["ec2:CreateFleet"]
+    resources = [local.fleet_arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:Region"
+      values   = [var.aws_region]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/${local.prefix}-managed"
+      values   = ["true"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/${local.prefix}-kind"
+      values   = ["instance"]
+    }
+
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "aws:TagKeys"
+      values   = local.managed_tag_keys
+    }
+  }
+
+  statement {
+    sid    = "FleetFromPinnedTemplateImageAndSubnets"
+    effect = "Allow"
+    actions = [
+      "ec2:CreateFleet",
+    ]
+    resources = concat(
+      [
+        aws_launch_template.machines.arn,
+        aws_security_group.machines.arn,
+        local.image_arn,
+        local.snapshot_arn,
+      ],
+      local.subnet_arns,
+    )
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:Region"
+      values   = [var.aws_region]
+    }
+  }
+
+  # the interface is created in one of the subnets above and the volume from the pinned
+  # image; whether CreateFleet evaluates ec2:VolumeSize is unconfirmed, so the root volume's
+  # size is not capped here
+  statement {
+    sid       = "FleetNetworkInterfaceAndRootVolume"
+    effect    = "Allow"
+    actions   = ["ec2:CreateFleet"]
+    resources = [local.network_interface_arn, local.volume_arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:Region"
+      values   = [var.aws_region]
+    }
+  }
+
+  statement {
+    sid       = "TagOnlyOnFleetLaunch"
+    effect    = "Allow"
+    actions   = ["ec2:CreateTags"]
+    resources = [local.fleet_arn, local.instance_arn, local.volume_arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:CreateAction"
+      values   = ["CreateFleet"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/${local.prefix}-managed"
+      values   = ["true"]
+    }
+
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "aws:TagKeys"
+      values   = local.managed_tag_keys
+    }
+  }
+}
+
 data "aws_iam_policy_document" "cleanup" {
   statement {
     sid       = "TerminateOnlyOwnInstances"
@@ -401,6 +596,7 @@ data "aws_iam_policy_document" "cleanup" {
 locals {
   policy_documents = {
     cleanup   = data.aws_iam_policy_document.cleanup.json
+    fleet     = data.aws_iam_policy_document.fleet.json
     inventory = data.aws_iam_policy_document.inventory.json
     launch    = data.aws_iam_policy_document.launch.json
   }

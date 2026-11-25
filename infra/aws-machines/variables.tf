@@ -67,7 +67,7 @@ variable "allowed_instance_type_patterns" {
 }
 
 variable "max_root_volume_gib" {
-  description = "Largest root volume RunInstances may create"
+  description = "Largest root volume RunInstances may create; CreateFleet launches are not capped by it"
   type        = number
   default     = 200
 

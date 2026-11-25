@@ -120,10 +120,47 @@ data "aws_iam_policy_document" "machines_boundary" {
     }
   }
 
+  # a launch template is named too, for when CreateFleet also authorizes RunInstances against
+  # the caller
   statement {
-    sid       = "LaunchResources"
-    actions   = ["ec2:RunInstances"]
-    resources = flatten([for region in var.machines_regions : local.launch_resource_arns[region]])
+    sid     = "LaunchResources"
+    actions = ["ec2:RunInstances"]
+    resources = flatten([
+      for region in var.machines_regions : concat(
+        local.launch_resource_arns[region],
+        ["${local.ec2_arn_prefix[region]}:launch-template/*"],
+      )
+    ])
+  }
+
+  # an instant fleet of one Spot instance; the fleet object and the instance carry the managed
+  # tags
+  statement {
+    sid     = "FleetManagedInstance"
+    actions = ["ec2:CreateFleet"]
+    resources = flatten([
+      for region in var.machines_regions : [
+        "${local.ec2_arn_prefix[region]}:fleet/*",
+        "${local.ec2_arn_prefix[region]}:instance/*",
+      ]
+    ])
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/${var.machines_tag_prefix}-managed"
+      values   = ["true"]
+    }
+  }
+
+  statement {
+    sid     = "FleetResources"
+    actions = ["ec2:CreateFleet"]
+    resources = flatten([
+      for region in var.machines_regions : concat(
+        local.launch_resource_arns[region],
+        ["${local.ec2_arn_prefix[region]}:launch-template/*"],
+      )
+    ])
   }
 
   statement {
@@ -131,15 +168,17 @@ data "aws_iam_policy_document" "machines_boundary" {
     actions = ["ec2:CreateTags"]
     resources = flatten([
       for region in var.machines_regions : [
+        "${local.ec2_arn_prefix[region]}:fleet/*",
         "${local.ec2_arn_prefix[region]}:instance/*",
         "${local.ec2_arn_prefix[region]}:spot-instances-request/*",
+        "${local.ec2_arn_prefix[region]}:volume/*",
       ]
     ])
 
     condition {
       test     = "StringEquals"
       variable = "ec2:CreateAction"
-      values   = ["RunInstances"]
+      values   = ["CreateFleet", "RunInstances"]
     }
 
     condition {

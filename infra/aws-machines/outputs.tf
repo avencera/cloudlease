@@ -13,14 +13,20 @@ output "security_group_id" {
   value       = aws_security_group.machines.id
 }
 
+output "launch_template_id" {
+  description = "The launch template every AWS class launches from; it holds the security group"
+  value       = aws_launch_template.machines.id
+}
+
 output "class_fields" {
-  description = "The region, zones, AMI and security group an AWS class in MACHINES_CONFIG names"
+  description = "The region, zones, AMI and launch template an AWS class in MACHINES_CONFIG names"
   value = {
-    provider          = "aws"
-    region            = var.aws_region
-    image_id          = var.ami_id
-    root_device_name  = data.aws_ami.ubuntu.root_device_name
-    security_group_id = aws_security_group.machines.id
+    provider                = "aws"
+    region                  = var.aws_region
+    image_id                = var.ami_id
+    root_device_name        = data.aws_ami.ubuntu.root_device_name
+    launch_template_id      = aws_launch_template.machines.id
+    launch_template_version = aws_launch_template.machines.latest_version
     zones = [
       for zone in var.availability_zones : {
         zone      = zone

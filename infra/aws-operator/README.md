@@ -18,10 +18,13 @@ policies, the user can do only what the boundary also allows. Both boundaries li
 `policy/boundaries/` and allow EC2 only, in their own regions, on their own app's tags:
 
 - **`boundaries/cloudlease-machines`:** `DescribeInstances` and `DescribeSpotInstanceRequests`
-  in `machines_regions`; `RunInstances` of instances and Spot requests tagged `clm-managed=true`,
-  with the images, snapshots, subnets, network interfaces, security groups and volumes a launch
-  touches; `CreateTags` only as part of that launch; `TerminateInstances` and
-  `CancelSpotInstanceRequests` only on `clm-managed=true` resources
+  in `machines_regions`; `CreateFleet` of fleets and instances tagged `clm-managed=true`, and
+  `RunInstances` of instances and Spot requests tagged `clm-managed=true`, each with the
+  images, snapshots, subnets, network interfaces, security groups, launch templates and
+  volumes a launch touches; `CreateTags` of fleets, instances, volumes and Spot requests only
+  as part of a `CreateFleet` or `RunInstances`; `TerminateInstances` and
+  `CancelSpotInstanceRequests` only on `clm-managed=true` resources. The `CreateFleet` grants
+  were added on 2026-11-24 and are not applied yet
 - **`boundaries/rembuild-worker`:** the seven describes rembuild uses in `rembuild_regions`;
   ingress changes only on the security group tagged `rb-managed=rembuild` and `rb-kind=firewall`;
   `RunInstances` and `CreateTags` on launch with `rb-managed` set to `rembuild` (legacy shape) or
