@@ -158,9 +158,9 @@ describe("cloudlease sweep in miniflare", () => {
     vi.unstubAllGlobals();
   });
 
-  it("deletes a tagged droplet and volume whose owner object never existed", async () => {
+  it("deletes tagged droplets whose owner object never existed", async () => {
     fake.addDroplet(301, tags("ghost_owner", 1, "droplet"));
-    fake.addVolume("vol-301", tags("ghost_owner", 1, "volume"), [301]);
+    fake.addDroplet(302, tags("ghost_owner", 1, "droplet"));
 
     // another owner is mid-create: the droplet exists and is tagged, but its ID is not
     // recorded yet, so only the intent saved before the create call protects it
@@ -184,7 +184,7 @@ describe("cloudlease sweep in miniflare", () => {
     expect(report.ownersFailed).toEqual([]);
     expect(outcomes(report)).toEqual([
       ["301", "unclaimed", "gone"],
-      ["vol-301", "unclaimed", "gone"],
+      ["302", "unclaimed", "gone"],
     ]);
     expect(fake.droplets.has(inFlight.id)).toBe(true);
 
@@ -194,15 +194,11 @@ describe("cloudlease sweep in miniflare", () => {
     expect(await created.json()).toMatchObject({ id: String(inFlight.id) });
     expect(outcomes(await sweep())).toEqual([]);
     expect(fake.droplets.has(inFlight.id)).toBe(true);
-    // the droplet is confirmed gone before its attached volume is deleted
-    expect(fake.deletesOf(301, "vol-301")).toEqual([
-      "DELETE droplets/301",
-      "DELETE volumes/vol-301",
-    ]);
+    // each delete is confirmed by a read before the sweep reports it gone
+    expect(fake.deletesOf(301, 302)).toEqual(["DELETE droplets/301", "DELETE droplets/302"]);
     expect(fake.log).toContain("GET droplets/301");
-    expect(fake.log).toContain("GET volumes/vol-301");
+    expect(fake.log).toContain("GET droplets/302");
     expect([...fake.droplets.keys()]).toEqual([inFlight.id]);
-    expect(fake.volumes.size).toBe(0);
     await expect(holdings("ghost_owner")).resolves.toEqual([]);
   });
 
@@ -256,7 +252,7 @@ describe("cloudlease sweep in miniflare", () => {
     expect(fake.droplets.size).toBe(0);
   });
 
-  it("leaves a live owned droplet and its pending volume alone but deletes a duplicate", async () => {
+  it("leaves a live owned droplet alone but deletes a duplicate", async () => {
     const now = Date.now();
     await seedHolding(
       "job_live",
@@ -264,11 +260,10 @@ describe("cloudlease sweep in miniflare", () => {
         "job_live",
         1,
         { startedAt: now, heartbeatDueAt: now + 10 * MINUTE, hardDeadline: now + 60 * MINUTE },
-        { droplet: { status: "created", id: "501" }, volume: { status: "requested" } },
+        { droplet: { status: "created", id: "501" } },
       ),
     );
     fake.addDroplet(501, tags("job_live", 1, "droplet"));
-    fake.addVolume("vol-501", tags("job_live", 1, "volume"), [501]);
     // a second droplet for the same generation that the lease never recorded
     fake.addDroplet(502, tags("job_live", 1, "droplet"));
 
@@ -276,7 +271,6 @@ describe("cloudlease sweep in miniflare", () => {
 
     expect(outcomes(report)).toEqual([["502", "unclaimed", "gone"]]);
     expect([...fake.droplets.keys()]).toEqual([501]);
-    expect([...fake.volumes.keys()]).toEqual(["vol-501"]);
   });
 
   it("deletes a claimed droplet past its ceiling before asking its owner", async () => {
@@ -436,19 +430,18 @@ describe("cloudlease sweep in miniflare", () => {
         "job_alarm",
         1,
         { startedAt: now - 5 * MINUTE, heartbeatDueAt: now - MINUTE, hardDeadline: now + 55 * MINUTE },
-        { droplet: { status: "created", id: "1001" }, volume: { status: "requested" } },
+        { droplet: { status: "requested" } },
       ),
     );
+    // the droplet's create response was lost, so only its tags lead to it
     fake.addDroplet(1001, tags("job_alarm", 1, "droplet"));
-    // the volume's create response was lost, so only its tags lead to it
-    fake.addVolume("vol-1001", tags("job_alarm", 1, "volume"), [1001]);
     const stub = ownerStub("job_alarm");
     await parkAlarm(stub);
 
     // the first pass deletes the droplet, which is still visible once, and retries a second later
     expect(await runDurableObjectAlarm(stub)).toBe(true);
     const retryAt = await parkAlarm(stub);
-    expect(fake.deletesOf(1001, "vol-1001")).toEqual(["DELETE droplets/1001"]);
+    expect(fake.deletesOf(1001)).toEqual(["DELETE droplets/1001"]);
     expect((await holdings("job_alarm"))[0]?.state.state).toBe("releasing");
     expect(retryAt).toBeGreaterThan(now);
     expect(retryAt).toBeLessThan(Date.now() + 2_000);
@@ -456,13 +449,8 @@ describe("cloudlease sweep in miniflare", () => {
     await new Promise((resolve) => setTimeout(resolve, 1_100));
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
-    expect(fake.deletesOf(1001, "vol-1001")).toEqual([
-      "DELETE droplets/1001",
-      "DELETE droplets/1001",
-      "DELETE volumes/vol-1001",
-    ]);
+    expect(fake.deletesOf(1001)).toEqual(["DELETE droplets/1001", "DELETE droplets/1001"]);
     expect(fake.droplets.size).toBe(0);
-    expect(fake.volumes.size).toBe(0);
     expect((await holdings("job_alarm"))[0]?.state.state).toBe("released");
   });
 
@@ -495,16 +483,6 @@ describe("cloudlease sweep in miniflare", () => {
     expect(states.map((holding) => holding.state.state)).toEqual(["released", "leased"]);
     const alarm = await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm());
     expect(alarm).toBe(states[1]?.state.lease?.heartbeatDueAt);
-  });
-
-  it("sweeps despite a volume whose tags and attachments are null", async () => {
-    fake.addDroplet(1301, tags("ghost_nulls", 1, "droplet"));
-    fake.addVolume("vol-unrelated", null, null);
-
-    const report = await sweep();
-
-    expect(outcomes(report)).toEqual([["1301", "unclaimed", "gone"]]);
-    expect(fake.volumes.has("vol-unrelated")).toBe(true);
   });
 
   it("runs the sweep from the cron trigger", async () => {

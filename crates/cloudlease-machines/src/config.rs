@@ -34,7 +34,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    boot::{BootError, MountPath},
+    boot::BootError,
     ids::{AppName, ClassName},
     money::{Billing, MicroUsd},
     provider::{AwsZone, InstanceTypes, Locations, ProviderName},
@@ -146,8 +146,6 @@ struct RawDigitalOceanClass {
     size: String,
     image: String,
     #[serde(default)]
-    volume: Option<RawVolume>,
-    #[serde(default)]
     ssh_key_ids: Vec<NonZeroU64>,
     #[serde(default)]
     vpc_uuid: Option<String>,
@@ -197,27 +195,11 @@ struct RawAwsZone {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawVolume {
-    size_gib: NonZeroU32,
-    mount: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawApp {
     classes: BTreeSet<ClassName>,
 }
 
-/// A block storage volume each machine of a class gets, formatted and mounted at boot
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VolumeClass {
-    /// The size in GiB
-    pub size_gib: NonZeroU32,
-    /// Where the boot script mounts it
-    pub mount: MountPath,
-}
-
-/// A DigitalOcean droplet, with an optional volume
+/// A DigitalOcean droplet, which works on its local disk
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DigitalOceanClass {
     /// The region slug
@@ -226,8 +208,6 @@ pub struct DigitalOceanClass {
     pub size: Slug,
     /// The boot image
     pub image: DropletImage,
-    /// The volume each machine gets, if any; local disk is preferred
-    pub volume: Option<VolumeClass>,
     /// SSH keys installed for break-glass access
     pub ssh_key_ids: Vec<NonZeroU64>,
     /// The VPC, when not the region default
@@ -337,15 +317,6 @@ impl ProviderClass {
                 .map_err(|_| BootError::UserDataTooLarge),
         }
     }
-
-    /// Returns where the boot script mounts the class's volume, if it has one
-    #[must_use]
-    pub fn volume_mount(&self) -> Option<&MountPath> {
-        match self {
-            Self::DigitalOcean(class) => class.volume.as_ref().map(|volume| &volume.mount),
-            Self::PhoenixNap(_) | Self::Latitude(_) | Self::Aws(_) => None,
-        }
-    }
 }
 
 /// What one class of machine is and costs
@@ -353,7 +324,7 @@ impl ProviderClass {
 pub struct MachineClass {
     /// The provider and its machine
     pub provider: ProviderClass,
-    /// The machine and its volume together, per hour
+    /// The machine, per hour
     pub price_per_hour: MicroUsd,
     /// The price in whole cents per hour, the machine's weight in the hourly spend gate
     pub gate_units: PermitUnits,
@@ -723,16 +694,6 @@ fn digitalocean_class(
         Some(id) => DropletImage::Id(id),
         None => DropletImage::Slug(slug("image", raw.image)?),
     };
-    let volume = raw
-        .volume
-        .map(|volume| {
-            Ok::<_, ConfigError>(VolumeClass {
-                size_gib: volume.size_gib,
-                mount: MountPath::parse(&volume.mount)
-                    .map_err(|error| ConfigError::invalid(field("volume.mount"), error))?,
-            })
-        })
-        .transpose()?;
     let vpc_uuid = raw
         .vpc_uuid
         .map(|value| {
@@ -744,7 +705,6 @@ fn digitalocean_class(
         region: slug("region", raw.region)?,
         size: slug("size", raw.size)?,
         image,
-        volume,
         ssh_key_ids: raw.ssh_key_ids,
         vpc_uuid,
     })
@@ -916,14 +876,13 @@ pub(crate) mod tests {
                     "price_per_hour_usd": "0.50",
                     "max_hours": 12
                 },
-                "do-c16-disk": {
+                "do-c16-image": {
                     "provider": "digitalocean",
                     "region": "nyc3",
                     "size": "c-16",
                     "image": "212345678",
                     "price_per_hour_usd": "0.514",
-                    "max_hours": 12,
-                    "volume": { "size_gib": 100, "mount": "/mnt/data" }
+                    "max_hours": 12
                 },
                 "pnap-s2": {
                     "provider": "phoenixnap",
@@ -961,7 +920,7 @@ pub(crate) mod tests {
             },
             "apps": {
                 "homebased": {
-                    "classes": ["do-c16", "do-c16-disk", "pnap-s2", "lat-m4", "aws-c8a"]
+                    "classes": ["do-c16", "do-c16-image", "pnap-s2", "lat-m4", "aws-c8a"]
                 }
             }
         })
@@ -971,18 +930,14 @@ pub(crate) mod tests {
     fn a_valid_config_names_the_classes_each_app_may_use() {
         let config = MachinesConfig::parse(&sample().to_string()).unwrap();
         let homebased = AppName::parse("homebased").unwrap();
-        let class = ClassName::parse("do-c16-disk").unwrap();
+        let class = ClassName::parse("do-c16-image").unwrap();
 
         assert_eq!(config.heartbeat_ttl, Duration::from_secs(180));
 
-        let disk = config.class_for(&homebased, &class).unwrap();
-        assert_eq!(disk.gate_units.get(), 52);
-        assert_eq!(disk.heartbeat.boot_grace(), Duration::from_secs(480));
-        assert_eq!(disk.billing, Billing::DIGITALOCEAN);
-        let ProviderClass::DigitalOcean(droplet) = &disk.provider else {
-            panic!("do-c16-disk is a DigitalOcean class");
-        };
-        assert_eq!(droplet.volume.as_ref().unwrap().size_gib.get(), 100);
+        let droplet = config.class_for(&homebased, &class).unwrap();
+        assert_eq!(droplet.gate_units.get(), 52);
+        assert_eq!(droplet.heartbeat.boot_grace(), Duration::from_secs(480));
+        assert_eq!(droplet.billing, Billing::DIGITALOCEAN);
 
         // a phoenixNAP class bills by the started hour and waits 20 minutes for its boot
         let pnap = config
@@ -1001,7 +956,6 @@ pub(crate) mod tests {
             .map(|l| l.as_str())
             .collect();
         assert_eq!(locations, ["SEA", "NLD"]);
-        assert_eq!(pnap.provider.volume_mount(), None);
 
         // a Latitude.sh class bills by the hour for now and waits 15 minutes for its boot
         let lat = config
@@ -1088,13 +1042,6 @@ pub(crate) mod tests {
         assert!(broken(&["classes", "do-c16", "price_per_hour_usd"], json!("700")).is_err());
         assert!(broken(&["classes", "do-c16", "size"], json!("C 16")).is_err());
         assert!(broken(&["classes", "do-c16", "surprise"], json!(1)).is_err());
-        assert!(
-            broken(
-                &["classes", "do-c16-disk", "volume"],
-                json!({ "size_gib": 1, "mount": "../x" })
-            )
-            .is_err()
-        );
         assert!(broken(&["apps", "homebased", "classes"], json!(["do-gpu"])).is_err());
         assert!(broken(&["classes", "do-c16", "provider"], json!("aws")).is_err());
         // a provider's fields do not fit another's class

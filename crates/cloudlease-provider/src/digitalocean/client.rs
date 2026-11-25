@@ -105,21 +105,6 @@ pub struct WireDroplet {
     pub tags: Vec<String>,
 }
 
-/// A block storage volume as the API returns it
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct WireVolume {
-    /// The UUID
-    pub id: String,
-    /// The name
-    pub name: String,
-    /// The droplets it is attached to, which the API returns as `null` for a detached volume
-    #[serde(default, deserialize_with = "null_as_empty")]
-    pub droplet_ids: Vec<u64>,
-    /// The tags, which the API may return as `null`
-    #[serde(default, deserialize_with = "null_as_empty")]
-    pub tags: Vec<String>,
-}
-
 fn null_as_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -182,40 +167,6 @@ impl<T: HttpTransport, R: Runtime> DigitalOceanClient<T, R> {
         let url = self.resource_url("droplets", id)?;
 
         self.delete(url, "delete droplet").await
-    }
-
-    /// Lists every volume in the account
-    ///
-    /// The volumes endpoint has no tag filter, so callers filter by tag.
-    pub async fn list_volumes(&self) -> ProviderResult<Vec<WireVolume>> {
-        let mut url = self.url_for("volumes")?;
-        url.query_pairs_mut().append_pair("per_page", PAGE_SIZE);
-
-        self.list(url, "list volumes", "volumes").await
-    }
-
-    /// Reads one volume, or `None` when it does not exist
-    pub async fn get_volume(&self, id: &str) -> ProviderResult<Option<WireVolume>> {
-        let url = self.resource_url("volumes", id)?;
-
-        self.get_optional(url, "read volume", "volume").await
-    }
-
-    /// Creates a volume and returns it; never replayed
-    pub async fn create_volume(&self, body: Value) -> ProviderResult<WireVolume> {
-        let url = self.url_for("volumes")?;
-        let value = self
-            .request(url, "create volume", HttpMethod::Post, Some(body))
-            .await?;
-
-        decode_root(&value, "volume")
-    }
-
-    /// Requests deletion of a volume, treating an absent volume as success
-    pub async fn delete_volume(&self, id: &str) -> ProviderResult<()> {
-        let url = self.resource_url("volumes", id)?;
-
-        self.delete(url, "delete volume").await
     }
 
     async fn get_optional<Item: DeserializeOwned>(

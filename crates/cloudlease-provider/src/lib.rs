@@ -8,7 +8,7 @@
 //! - [`reaper::reap`]: one delete-and-confirm pass over a releasing holding
 //! - [`sweep::delete_doomed`]: deletes the resources a sweep doomed, lowest rank first
 //! - [`firewall::IngressPolicy`]: inbound access for one generation, an optional capability
-//! - [`digitalocean`]: droplets and volumes over the DigitalOcean v2 API
+//! - [`digitalocean`]: droplets over the DigitalOcean v2 API
 //! - [`phoenixnap`]: Bare Metal Cloud servers over the phoenixNAP BMC v1 API
 //! - [`latitude`]: bare metal servers and their user data over the Latitude.sh API
 //! - [`aws`]: EC2 Spot instances over the EC2 Query API, and security group ingress

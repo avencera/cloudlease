@@ -106,8 +106,6 @@ impl fmt::Display for ProviderName {
 pub enum MachineKind {
     /// A DigitalOcean droplet
     Droplet,
-    /// A DigitalOcean block storage volume
-    Volume,
     /// A phoenixNAP Bare Metal Cloud server
     PnapServer,
     /// A Latitude.sh server
@@ -123,14 +121,14 @@ impl MachineKind {
     #[must_use]
     pub const fn provider(self) -> ProviderName {
         match self {
-            Self::Droplet | Self::Volume => ProviderName::DigitalOcean,
+            Self::Droplet => ProviderName::DigitalOcean,
             Self::PnapServer => ProviderName::PhoenixNap,
             Self::LatServer | Self::LatUserData => ProviderName::Latitude,
             Self::AwsInstance => ProviderName::Aws,
         }
     }
 
-    /// Reports whether this kind is the machine itself rather than its storage or records
+    /// Reports whether this kind is the machine itself rather than a record it boots from
     #[must_use]
     pub const fn is_machine(self) -> bool {
         matches!(
@@ -152,7 +150,6 @@ impl MachineKind {
 impl ResourceKind for MachineKind {
     const ALL: &'static [Self] = &[
         Self::Droplet,
-        Self::Volume,
         Self::PnapServer,
         Self::LatServer,
         Self::LatUserData,
@@ -165,7 +162,6 @@ impl ResourceKind for MachineKind {
     fn tag_name(self) -> &'static str {
         match self {
             Self::Droplet => DoKind::Droplet.tag_name(),
-            Self::Volume => DoKind::Volume.tag_name(),
             Self::PnapServer => PnapKind::Server.tag_name(),
             Self::LatServer => LatKind::Server.tag_name(),
             Self::LatUserData => LatKind::UserData.tag_name(),
@@ -176,7 +172,6 @@ impl ResourceKind for MachineKind {
     fn delete_rank(self) -> u8 {
         match self {
             Self::Droplet => DoKind::Droplet.delete_rank(),
-            Self::Volume => DoKind::Volume.delete_rank(),
             Self::PnapServer => PnapKind::Server.delete_rank(),
             Self::LatServer => LatKind::Server.delete_rank(),
             Self::LatUserData => LatKind::UserData.delete_rank(),
@@ -189,7 +184,6 @@ impl From<DoKind> for MachineKind {
     fn from(kind: DoKind) -> Self {
         match kind {
             DoKind::Droplet => Self::Droplet,
-            DoKind::Volume => Self::Volume,
         }
     }
 }
@@ -325,7 +319,7 @@ pub struct AwsZone {
 /// A create request for one resource of a machine
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MachineSpec {
-    /// A DigitalOcean droplet or volume
+    /// A DigitalOcean droplet
     DigitalOcean(DoSpec),
     /// A phoenixNAP server, tried in each location until one has stock
     PhoenixNap(PnapPlacement),
@@ -539,7 +533,6 @@ impl From<MachineKind> for ProviderKind {
     fn from(kind: MachineKind) -> Self {
         match kind {
             MachineKind::Droplet => Self::DigitalOcean(DoKind::Droplet),
-            MachineKind::Volume => Self::DigitalOcean(DoKind::Volume),
             MachineKind::PnapServer => Self::PhoenixNap(PnapKind::Server),
             MachineKind::LatServer => Self::Latitude(LatKind::Server),
             MachineKind::LatUserData => Self::Latitude(LatKind::UserData),
@@ -684,7 +677,7 @@ where
 #[cfg(test)]
 mod tests {
     use cloudlease_core::tags::ResourceKind;
-    use cloudlease_provider::{digitalocean::DoKind, phoenixnap::Location};
+    use cloudlease_provider::phoenixnap::Location;
 
     use super::{Locations, MachineKind};
 
@@ -701,9 +694,7 @@ mod tests {
         // a Latitude.sh record is deleted only once its server is gone, and is never billed
         assert!(MachineKind::LatServer.delete_rank() < MachineKind::LatUserData.delete_rank());
         assert!(!MachineKind::LatUserData.is_billed() && MachineKind::LatServer.is_billed());
-        assert!(MachineKind::Droplet.delete_rank() < MachineKind::Volume.delete_rank());
-        assert_eq!(MachineKind::from(DoKind::Volume), MachineKind::Volume);
-        assert!(MachineKind::PnapServer.is_machine() && !MachineKind::Volume.is_machine());
+        assert!(MachineKind::PnapServer.is_machine() && !MachineKind::LatUserData.is_machine());
         assert_eq!(MachineKind::AwsInstance.tag_name(), "instance");
         assert!(MachineKind::AwsInstance.is_machine() && MachineKind::AwsInstance.is_billed());
     }

@@ -1,10 +1,9 @@
-//! The DigitalOcean adapter, reaper and sweep executor against a stateful fake API
+//! The DigitalOcean adapter and reaper against a stateful fake API
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     future::Future,
-    num::NonZeroU32,
     rc::Rc,
     task::{Context, Poll, Waker},
     time::Duration,
@@ -14,25 +13,23 @@ use cloudlease_core::{
     alarm::Backoff,
     deletes::DeleteTarget,
     holding::{Holding, HoldingState, ReleaseReason},
-    ids::{Generation, LeaseId, OwnerId, ResourceId, TagPrefix},
+    ids::{Generation, LeaseId, OwnerId, TagPrefix},
     lease::{Lease, LeasePolicy},
-    sweep::{DoomReason, OwnerAnswer, OwnerReply, doom_unclaimed, plan},
     tags::{OwnerTags, TagScheme, UnrecognizedReason},
     time::UnixMillis,
 };
 use cloudlease_provider::{
     digitalocean::{
         BootScript, ClientOptions, DigitalOcean, DigitalOceanClient, DigitalOceanToken, DoKind,
-        DoSpec, DropletImage, DropletSpec, ResourceName, Slug, VolumeSpec,
+        DoSpec, DropletImage, DropletSpec, ResourceName, Slug,
     },
     error::ProviderErrorCode,
     http::{
         HttpMethod, HttpRequest, HttpResponse, HttpTransport, LocalFuture, Runtime, TransportError,
     },
-    provider::{CloudProvider, Presence},
+    provider::CloudProvider,
     reaper::reap,
     rest::RetryPolicy,
-    sweep::{ConfirmPolicy, DeleteOutcome, delete_doomed},
 };
 use serde_json::{Value, json};
 
@@ -46,17 +43,9 @@ struct FakeDroplet {
     reads_until_gone: Option<u8>,
 }
 
-struct FakeVolume {
-    name: String,
-    tags: Value,
-    droplet_ids: Vec<u64>,
-    reads_until_gone: Option<u8>,
-}
-
 #[derive(Default)]
 struct FakeApi {
     droplets: BTreeMap<u64, FakeDroplet>,
-    volumes: BTreeMap<String, FakeVolume>,
     next_id: u64,
     log: Vec<String>,
     // forced responses by "METHOD path", consumed in order
@@ -84,13 +73,9 @@ impl FakeApi {
         let segments: Vec<_> = path.split('/').collect();
         match (request.method, segments.as_slice()) {
             (HttpMethod::Get, ["droplets"]) => self.list_droplets(request),
-            (HttpMethod::Get, ["volumes"]) => self.list_volumes(request),
             (HttpMethod::Get, ["droplets", id]) => self.read_droplet(id),
-            (HttpMethod::Get, ["volumes", id]) => self.read_volume(id),
             (HttpMethod::Delete, ["droplets", id]) => self.delete_droplet(id),
-            (HttpMethod::Delete, ["volumes", id]) => self.delete_volume(id),
             (HttpMethod::Post, ["droplets"]) => self.create_droplet(request),
-            (HttpMethod::Post, ["volumes"]) => self.create_volume(request),
             _ => respond(404, json!({ "id": "not_found" })),
         }
     }
@@ -148,27 +133,6 @@ impl FakeApi {
         )
     }
 
-    fn list_volumes(&self, request: &HttpRequest) -> HttpResponse {
-        let all: Vec<_> = self
-            .volumes
-            .iter()
-            .map(|(id, volume)| {
-                json!({
-                    "id": id,
-                    "name": volume.name,
-                    "tags": volume.tags,
-                    "droplet_ids": volume.droplet_ids,
-                })
-            })
-            .collect();
-        let (start, end, next) = self.page(request, all.len());
-
-        respond(
-            200,
-            json!({ "volumes": all[start..end], "links": { "pages": { "next": next } } }),
-        )
-    }
-
     fn read_droplet(&mut self, id: &str) -> HttpResponse {
         let Some(numeric) = id.parse::<u64>().ok() else {
             return respond(404, json!({ "id": "not_found" }));
@@ -179,9 +143,6 @@ impl FakeApi {
         match droplet.reads_until_gone {
             Some(0) => {
                 self.droplets.remove(&numeric);
-                for volume in self.volumes.values_mut() {
-                    volume.droplet_ids.retain(|attached| *attached != numeric);
-                }
                 respond(404, json!({ "id": "not_found" }))
             }
             Some(reads) => {
@@ -200,24 +161,6 @@ impl FakeApi {
         }
     }
 
-    fn read_volume(&mut self, id: &str) -> HttpResponse {
-        let Some(volume) = self.volumes.get_mut(id) else {
-            return respond(404, json!({ "id": "not_found" }));
-        };
-        if volume.reads_until_gone == Some(0) {
-            self.volumes.remove(id);
-            return respond(404, json!({ "id": "not_found" }));
-        }
-
-        if let Some(reads) = volume.reads_until_gone.as_mut() {
-            *reads -= 1;
-        }
-        respond(
-            200,
-            json!({ "volume": { "id": id, "name": volume.name, "tags": volume.tags } }),
-        )
-    }
-
     fn delete_droplet(&mut self, id: &str) -> HttpResponse {
         let droplet = id
             .parse::<u64>()
@@ -227,21 +170,6 @@ impl FakeApi {
             return respond(404, json!({ "id": "not_found" }));
         };
         droplet.reads_until_gone.get_or_insert(1);
-
-        respond(204, Value::Null)
-    }
-
-    fn delete_volume(&mut self, id: &str) -> HttpResponse {
-        let Some(volume) = self.volumes.get_mut(id) else {
-            return respond(404, json!({ "id": "not_found" }));
-        };
-        if !volume.droplet_ids.is_empty() {
-            return respond(
-                409,
-                json!({ "id": "conflict", "message": "volume is attached to a droplet" }),
-            );
-        }
-        volume.reads_until_gone.get_or_insert(0);
 
         respond(204, Value::Null)
     }
@@ -263,26 +191,6 @@ impl FakeApi {
         respond(
             202,
             json!({ "droplet": { "id": id, "name": body["name"], "status": "new", "tags": tags } }),
-        )
-    }
-
-    fn create_volume(&mut self, request: &HttpRequest) -> HttpResponse {
-        let body: Value = serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
-        self.next_id += 1;
-        let id = format!("vol-{}", self.next_id);
-        self.volumes.insert(
-            id.clone(),
-            FakeVolume {
-                name: body["name"].as_str().unwrap().to_owned(),
-                tags: body["tags"].clone(),
-                droplet_ids: Vec::new(),
-                reads_until_gone: None,
-            },
-        );
-
-        respond(
-            201,
-            json!({ "volume": { "id": id, "name": body["name"], "tags": body["tags"] } }),
         )
     }
 }
@@ -388,29 +296,8 @@ fn droplet_spec(name: &str) -> DoSpec {
         image: DropletImage::Slug(Slug::parse("ubuntu-24-04-x64").unwrap()),
         boot: BootScript::parse("#!/bin/sh\necho hello\n").unwrap(),
         ssh_key_ids: Vec::new(),
-        volume_ids: Vec::new(),
         vpc_uuid: None,
     })
-}
-
-fn volume_spec(name: &str) -> DoSpec {
-    DoSpec::Volume(VolumeSpec {
-        name: ResourceName::parse(name).unwrap(),
-        region: Slug::parse("nyc3").unwrap(),
-        size_gib: NonZeroU32::new(100).unwrap(),
-    })
-}
-
-fn attach(harness: &Harness, volume: &ResourceId, droplet: &ResourceId) {
-    let droplet: u64 = droplet.as_str().parse().unwrap();
-    harness
-        .api
-        .borrow_mut()
-        .volumes
-        .get_mut(volume.as_str())
-        .unwrap()
-        .droplet_ids
-        .push(droplet);
 }
 
 fn deletes(harness: &Harness) -> Vec<String> {
@@ -465,30 +352,17 @@ fn inventory_reports_wrong_shapes_and_ignores_foreign_resources() {
                 reads_until_gone: None,
             },
         );
-        // a droplet tagged as a volume is not safe to manage
+        // a droplet tagged as a kind the adapter does not manage is not safe to manage
+        let mislabeled = scheme()
+            .render(&owner_tags("job_1", 1), DoKind::Droplet)
+            .into_iter()
+            .map(|tag| tag.replace("cl-kind-droplet", "cl-kind-volume"))
+            .collect();
         api.droplets.insert(
             2,
             FakeDroplet {
                 name: "mislabeled".to_owned(),
-                tags: scheme().render(&owner_tags("job_1", 1), DoKind::Volume),
-                reads_until_gone: None,
-            },
-        );
-        api.volumes.insert(
-            "vol-foreign".to_owned(),
-            FakeVolume {
-                name: "other-app".to_owned(),
-                tags: json!(["rb-managed"]),
-                droplet_ids: Vec::new(),
-                reads_until_gone: None,
-            },
-        );
-        api.volumes.insert(
-            "vol-null".to_owned(),
-            FakeVolume {
-                name: "untagged".to_owned(),
-                tags: Value::Null,
-                droplet_ids: Vec::new(),
+                tags: mislabeled,
                 reads_until_gone: None,
             },
         );
@@ -505,7 +379,7 @@ fn inventory_reports_wrong_shapes_and_ignores_foreign_resources() {
             .collect::<Vec<_>>(),
         vec![
             ("1", UnrecognizedReason::ExtraTag),
-            ("2", UnrecognizedReason::KindMismatch),
+            ("2", UnrecognizedReason::InvalidValue),
         ]
     );
     // a page size of one forces the client to follow pagination links
@@ -607,23 +481,17 @@ fn an_empty_tag_search_sent_before_the_settle_time_keeps_the_holding_releasing()
 }
 
 #[test]
-fn an_expired_holding_deletes_its_droplet_before_finding_and_deleting_a_lost_volume() {
+fn an_expired_holding_finds_and_deletes_a_droplet_whose_create_answer_was_lost() {
     let harness = harness();
     let owner = owner_tags("job_1", 1);
+    // the droplet was created but its response was lost, so the holding never recorded it
     let droplet = block_on(harness.provider.create(&owner, &droplet_spec("job-1-a"))).unwrap();
-    // the volume was created but its response was lost, so the holding never recorded it
-    let volume = block_on(harness.provider.create(&owner, &volume_spec("job-1-data"))).unwrap();
-    attach(&harness, &volume, &droplet);
 
     let policy = LeasePolicy::new(Duration::from_secs(120), Duration::from_secs(3_600)).unwrap();
     let lease_id = LeaseId::parse("lease_1").unwrap();
     let lease = Lease::start(lease_id, &policy, at(0), None).unwrap();
     let holding = Holding::leased(owner.owner.clone(), owner.generation, lease)
         .request(DoKind::Droplet, at(0))
-        .unwrap()
-        .record_created(DoKind::Droplet, droplet.clone(), at(0))
-        .unwrap()
-        .request(DoKind::Volume, at(0))
         .unwrap();
     let releasing = holding.expire(at(120_000)).unwrap();
     let backoff = Backoff::default();
@@ -665,11 +533,9 @@ fn an_expired_holding_deletes_its_droplet_before_finding_and_deleting_a_lost_vol
         vec![
             format!("DELETE droplets/{droplet}"),
             format!("DELETE droplets/{droplet}"),
-            format!("DELETE volumes/{volume}"),
         ]
     );
     assert!(harness.api.borrow().droplets.is_empty());
-    assert!(harness.api.borrow().volumes.is_empty());
 }
 
 #[test]
@@ -714,106 +580,6 @@ fn a_failing_provider_turns_into_a_retry_without_losing_targets() {
 }
 
 #[test]
-fn the_sweep_deletes_an_orphaned_droplet_and_volume_in_rank_order() {
-    let harness = harness();
-    let orphan = owner_tags("ghost", 4);
-    let droplet = block_on(harness.provider.create(&orphan, &droplet_spec("ghost-a"))).unwrap();
-    let volume = block_on(harness.provider.create(&orphan, &volume_spec("ghost-data"))).unwrap();
-    attach(&harness, &volume, &droplet);
-
-    let inventory = block_on(harness.provider.inventory()).unwrap();
-    let plan = plan(&inventory, &[], at(0));
-    // the owner object never existed, so its answer claims nothing
-    let replies = BTreeMap::from([(
-        orphan.owner.clone(),
-        OwnerReply::Answered(OwnerAnswer::default()),
-    )]);
-    let doomed = doom_unclaimed(&plan, &replies);
-    assert!(
-        doomed
-            .iter()
-            .all(|doomed| doomed.reason == DoomReason::Unclaimed)
-    );
-
-    let reports = block_on(delete_doomed(
-        &harness.provider,
-        &harness.runtime,
-        doomed,
-        ConfirmPolicy::default(),
-    ));
-
-    assert_eq!(
-        reports
-            .iter()
-            .map(|report| (report.resource.tags.kind, report.outcome.clone()))
-            .collect::<Vec<_>>(),
-        vec![
-            (DoKind::Droplet, DeleteOutcome::Gone),
-            (DoKind::Volume, DeleteOutcome::Gone),
-        ]
-    );
-    assert_eq!(
-        deletes(&harness),
-        vec![
-            format!("DELETE droplets/{droplet}"),
-            format!("DELETE volumes/{volume}"),
-        ]
-    );
-    assert_eq!(
-        block_on(harness.provider.presence(DoKind::Volume, &volume)).unwrap(),
-        Presence::Absent
-    );
-    assert!(reports.iter().all(|report| report.survivor().is_none()));
-}
-
-#[test]
-fn the_sweep_defers_a_volume_while_its_droplet_is_still_present() {
-    let harness = harness();
-    let orphan = owner_tags("ghost", 1);
-    let droplet = block_on(harness.provider.create(&orphan, &droplet_spec("ghost-a"))).unwrap();
-    let volume = block_on(harness.provider.create(&orphan, &volume_spec("ghost-data"))).unwrap();
-    attach(&harness, &volume, &droplet);
-
-    let inventory = block_on(harness.provider.inventory()).unwrap();
-    let doomed = doom_unclaimed(
-        &plan(&inventory, &[], at(0)),
-        &BTreeMap::from([(
-            orphan.owner.clone(),
-            OwnerReply::Answered(OwnerAnswer::default()),
-        )]),
-    );
-    let reports = block_on(delete_doomed(
-        &harness.provider,
-        &harness.runtime,
-        doomed,
-        ConfirmPolicy {
-            reads: 1,
-            pause: Duration::from_secs(1),
-        },
-    ));
-
-    assert_eq!(
-        reports
-            .iter()
-            .map(|report| report.outcome.clone())
-            .collect::<Vec<_>>(),
-        vec![DeleteOutcome::StillPresent, DeleteOutcome::Deferred]
-    );
-    assert_eq!(
-        reports
-            .iter()
-            .filter_map(|report| report.survivor())
-            .collect::<BTreeSet<_>>()
-            .len(),
-        1
-    );
-    assert_eq!(
-        deletes(&harness),
-        vec![format!("DELETE droplets/{droplet}")]
-    );
-}
-
-#[test]
 fn creates_are_never_replayed_and_reads_retry() {
     let harness = harness();
     harness
@@ -840,7 +606,7 @@ fn creates_are_never_replayed_and_reads_retry() {
         .api
         .borrow_mut()
         .failures
-        .insert("GET volumes".to_owned(), vec![429, 502]);
+        .insert("GET droplets".to_owned(), vec![429, 502]);
     let inventory = block_on(harness.provider.inventory()).unwrap();
     assert!(inventory.managed.is_empty());
     assert_eq!(harness.runtime.sleeps.borrow().len(), 2);
@@ -858,8 +624,8 @@ fn pagination_cannot_leave_the_api_origin() {
                 Ok(respond(
                     200,
                     json!({
-                        "volumes": [],
-                        "links": { "pages": { "next": "https://evil.test/v2/volumes?page=2" } },
+                        "droplets": [],
+                        "links": { "pages": { "next": "https://evil.test/v2/droplets?page=2" } },
                     }),
                 ))
             })
@@ -877,6 +643,6 @@ fn pagination_cannot_leave_the_api_origin() {
         .unwrap();
     let client = DigitalOceanClient::new(options, Hostile, FakeRuntime::default());
 
-    let error = block_on(client.list_volumes()).unwrap_err();
+    let error = block_on(client.list_droplets_by_tag("cl-managed")).unwrap_err();
     assert_eq!(error.code, ProviderErrorCode::InvalidResponse);
 }

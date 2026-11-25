@@ -32,7 +32,8 @@ The app declares its own Durable Object classes and wraps the handlers in
   capped (`not_after`) by a run deadline.
 - A **holding** is one owner generation's resources. It moves from `leased` to `releasing`
   to `released`. It leaves `releasing` only after the provider reports every resource
-  absent, deleting in rank order (droplets before volumes). A resource whose create
+  absent, deleting in rank order (a Latitude.sh server before the user data record it
+  boots from). A resource whose create
   response was lost is found by its tags. An empty tag search counts as absence only
   when it was sent two minutes or more after the lease ended, so a create still in
   flight is not missed.
@@ -114,8 +115,7 @@ just check        # all of the above
 The miniflare suite runs the test Worker against a fake DigitalOcean API, installed over
 `fetch`, and needs no account or token. It covers:
 
-- an orphan droplet and volume whose owner never existed, swept while another owner is
-  mid-create
+- orphan droplets whose owner never existed, swept while another owner is mid-create
 - resources past their hard deadline or ceiling
 - live resources that must be kept
 - failing and stalled owners, unrecognized tags and malformed ceilings

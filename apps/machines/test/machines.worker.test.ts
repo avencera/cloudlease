@@ -203,10 +203,9 @@ describe("cloudlease machines in miniflare", () => {
   });
 
   it("deletes a machine whose heartbeat lapsed", async () => {
-    const run = await createRun({ class: "disk" });
+    const run = await createRun();
     const lease = await createMachine(run, "hb-lapse-1");
     const token = leaseToken("hb-lapse-1");
-    expect(fake.volumes.size).toBe(1);
 
     await editHolding(lease, (holding) => {
       holding.state.lease.heartbeatDueAt = Date.now() - 1_000;
@@ -217,7 +216,6 @@ describe("cloudlease machines in miniflare", () => {
     expect(released.release).toMatchObject({ reason: "heartbeat_lapsed", by: "cloudlease" });
     expect(released.gone_at).not.toBeNull();
     expect(fake.droplets.size).toBe(0);
-    expect(fake.log.filter((entry) => entry.startsWith("DELETE volumes/"))).toHaveLength(1);
 
     // the token stops working, and the permit goes back to the gate
     await expectError(await call("POST", `/v1/leases/${lease.lease_id}/renew`, token, {}), 410, "lease_ended");
@@ -243,12 +241,11 @@ describe("cloudlease machines in miniflare", () => {
     expect(fake.droplets.size).toBe(0);
   });
 
-  it("deletes a released machine at once, and reports released only once its droplet and volume are gone", async () => {
+  it("deletes a released machine at once, and reports released only once its droplet is gone", async () => {
     fake.dropletReadsAfterDelete = 2;
-    const run = await createRun({ class: "disk" });
+    const run = await createRun();
     const lease = await createMachine(run, "hb-release-1");
     const token = leaseToken("hb-release-1");
-    const volumeId = [...fake.volumes.keys()][0];
 
     const response = await call("POST", `/v1/leases/${lease.lease_id}/release`, token, { reason: "done" });
     expect(response.status).toBe(202);
@@ -257,17 +254,15 @@ describe("cloudlease machines in miniflare", () => {
     expect(releasing.release).toMatchObject({ reason: "done", by: "machine" });
 
     // the release is due at once, so miniflare runs the alarm itself; the droplet is still
-    // listed after its delete, so the volume must wait
+    // listed after its delete, so the lease keeps releasing and its permit stays held
     const dropletDelete = `DELETE droplets/${dropletOf("hb-release-1")?.id}`;
     await vi.waitUntil(() => fake.log.includes(dropletDelete), { timeout: 5_000 });
-    expect(fake.log).not.toContain(`DELETE volumes/${volumeId}`);
     expect((await readLease(lease.lease_id)).state).toBe("releasing");
     expect(await permits()).toHaveLength(1);
 
     const released = await settle(lease);
     expect(released.state).toBe("released");
     expect(fake.droplets.size).toBe(0);
-    expect(fake.log).toContain(`DELETE volumes/${volumeId}`);
     expect(await permits()).toEqual([]);
 
     // a released lease's token no longer reads it, and a second release changes nothing

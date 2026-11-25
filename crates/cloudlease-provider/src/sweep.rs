@@ -84,8 +84,8 @@ impl<K> DeleteReport<K> {
 /// Deletes doomed resources one generation at a time, lowest delete rank first
 ///
 /// Within a generation, a rank starts only after every resource of the ranks below it is
-/// confirmed gone, so a volume is not deleted while its droplet may still hold it. Resources
-/// left over are reported and picked up by the next sweep.
+/// confirmed gone, so a Latitude.sh user data record is not deleted while its server may still
+/// boot from it. Resources left over are reported and picked up by the next sweep.
 pub async fn delete_doomed<P, R>(
     provider: &P,
     runtime: &R,

@@ -42,7 +42,7 @@ Bodies:
 
 A lease is `provisioning` until its droplet or server exists or it first renews, then
 `running`, `releasing` once it ended, and `released` only after the provider confirms every
-resource gone: the droplet and volume, the server, or the instance. Its `release` says why
+resource gone: the droplet, the server, or the instance. Its `release` says why
 (`requested`, `idle`, `done`, `heartbeat_lapsed`, `hard_deadline`, `run_released`,
 `spend_cap`, `create_failed`, `interrupted`) and who (`client`, `machine`, `cloudlease`).
 `interrupted` means the provider took the machine back while its lease was live, such as an
@@ -76,7 +76,7 @@ it, with a core holding.
    keeps the windows its config and class had when the run was created, so renews never
    read the config. A missed heartbeat ends the lease on the alarm, or on any earlier read
    or renew of it; a release ends it at once.
-3. **Tag sweep.** Every 5 minutes the cron trigger lists every droplet, volume and
+3. **Tag sweep.** Every 5 minutes the cron trigger lists every droplet and
    phoenixNAP server tagged with `CLOUDLEASE_TAG_PREFIX`, every Latitude.sh server and
    user data record in `LATITUDE_PROJECT`, and every EC2 instance carrying the
    `{prefix}-managed` tag key in each region of `AWS_REGIONS`. It first deletes every one past
@@ -95,7 +95,7 @@ it, with a core holding.
    and the heartbeat still ends a lease whose machine stopped renewing.
 5. **Spend caps.** See below.
 
-A machine is `released` only after the droplet, then the volume, or the server, then its
+A machine is `released` only after the droplet, or the server, then its
 Latitude.sh user data record, or the EC2 instance, are confirmed absent; until then the run object retries with backoff. phoenixNAP shows a
 deprovisioned server as `deleting` for a while, and it counts as present until it leaves
 the server list.
@@ -243,9 +243,8 @@ Prices come from the class table in `MACHINES_CONFIG`, in US dollars per hour. E
 started billing increment is billed in full:
 
 - DigitalOcean bills droplets per second with a minimum of 60 seconds or $0.01, whichever
-  is higher, and a powered-off droplet still bills; volumes bill hourly whether or not
-  they are attached (DigitalOcean's billing docs, read 2026-11-24). A class with a volume
-  should include the volume's price in its hourly price.
+  is higher, and a powered-off droplet still bills (DigitalOcean's billing docs, read
+  2026-11-24). Classes use the droplet's local disk; the Worker creates no volumes.
 - phoenixNAP bills every started hour in full, with a minimum of one hour, until the
   server is deleted, so a server deleted after 5 minutes costs an hour (phoenixNAP's
   billing docs, read 2026-11-24).
@@ -311,7 +310,7 @@ alarm for every priority 5 message.
 
 | Name | Kind | What |
 | --- | --- | --- |
-| `DIGITALOCEAN_TOKEN` | secret | droplet and volume create, read and delete |
+| `DIGITALOCEAN_TOKEN` | secret | droplet create, read and delete |
 | `PNAP_CLIENT_ID`, `PNAP_CLIENT_SECRET` | secrets, optional | phoenixNAP OAuth client credentials (BMC servers and Tag Manager); set both or neither |
 | `LATITUDE_API_KEY`, `LATITUDE_PROJECT` | secrets, optional | a Latitude.sh API key and the project ID (`proj_…`) the Worker creates and sweeps in; set both or neither |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | secrets, optional | the access key of the Worker's own IAM user (`infra/aws-machines`); set both or neither |
@@ -326,8 +325,8 @@ alarm for every priority 5 message.
 Every class has `price_per_hour_usd`, `max_hours`, and optionally `boot_grace_secs` and
 `billing_increment_secs`, which default to its provider's. Then by `provider`:
 
-- `digitalocean`, the default when `provider` is absent: `{region, size, image, volume?:
-  {size_gib, mount}, ssh_key_ids?, vpc_uuid?}`
+- `digitalocean`, the default when `provider` is absent: `{region, size, image,
+  ssh_key_ids?, vpc_uuid?}`
 - `phoenixnap`: `{server_type, locations, os, ssh_key_ids}`, with `locations` such as
   `["SEA", "NLD"]` and `ssh_key_ids` the IDs of account SSH keys, at least one: phoenixNAP
   refuses a Linux server with no SSH key, and the Worker never adds the account's default
@@ -347,8 +346,7 @@ Every class has `price_per_hour_usd`, `max_hours`, and optionally `boot_grace_se
 The machine's user data is a POSIX `sh` script, which DigitalOcean runs at first boot and
 phoenixNAP, Latitude.sh and EC2 pass to cloud-init. It logs to `/var/log/cloudlease-boot.log`, writes
 `/etc/cloudlease/lease.json` (`lease_id`, `token`, `api_base`, `hard_deadline_at`,
-and `heartbeat_ttl_secs`) with mode `0600`, formats and mounts the volume when the class has
-one, writes the client's files under a `077` umask, and runs its commands in order.
+and `heartbeat_ttl_secs`) with mode `0600`, writes the client's files under a `077` umask, and runs its commands in order.
 
 ## Tests
 
@@ -360,7 +358,7 @@ Latitude.sh and EC2 Query APIs and a fake ntfy topic, then
 Latitude.sh or AWS credentials. It covers
 run and machine create idempotency, renew by lease token and refusal on another lease, a
 lapsed heartbeat, an immediate release, the hard deadline, `released` only after the droplet
-and volume are gone, `max_machines`, both spend caps and a client's lower run cap, a failed
+is gone, `max_machines`, both spend caps and a client's lower run cap, a failed
 create, a create whose pending record expired while it waited on the gate, a stalled run
 object whose droplet is past its hard deadline, and the sweep's orphan and failure alerts.
 The phoenixNAP suite covers a server's create with its location, tags and boot data, a

@@ -15,18 +15,8 @@ interface Droplet {
   readsUntilGone: number | null;
 }
 
-// the API may return null for a volume's tags and attachments
-interface Volume {
-  id: string;
-  name: string;
-  tags: string[] | null;
-  dropletIds: number[] | null;
-  deleted: boolean;
-}
-
 export class FakeDigitalOcean {
   readonly droplets = new Map<number, Droplet>();
-  readonly volumes = new Map<string, Volume>();
   readonly log: string[] = [];
   // reads that still return a droplet after its delete request
   dropletReadsAfterDelete = 1;
@@ -41,10 +31,6 @@ export class FakeDigitalOcean {
 
   addDroplet(id: number, tags: string[], name = `droplet-${id}`): void {
     this.droplets.set(id, { id, name, tags, userData: "", readsUntilGone: null });
-  }
-
-  addVolume(id: string, tags: string[] | null, dropletIds: number[] | null = []): void {
-    this.volumes.set(id, { id, name: `volume-${id}`, tags, dropletIds, deleted: false });
   }
 
   // owner objects from earlier tests keep their alarms, so a test reads only the deletes of
@@ -104,7 +90,6 @@ export class FakeDigitalOcean {
         name: string;
         tags: string[];
         user_data?: string;
-        volumes?: string[];
       };
       const droplet: Droplet = {
         id: this.nextId++,
@@ -114,28 +99,9 @@ export class FakeDigitalOcean {
         readsUntilGone: null,
       };
       this.droplets.set(droplet.id, droplet);
-      for (const volumeId of body.volumes ?? []) {
-        const volume = this.volumes.get(volumeId);
-        if (volume !== undefined) {
-          volume.dropletIds = [...(volume.dropletIds ?? []), droplet.id];
-        }
-      }
       await this.gates.get(method);
       return Response.json({ droplet: dropletJson(droplet) }, { status: 202 });
     }
-    if (method === "POST" && collection === "volumes" && id === undefined) {
-      const body = (await request.json()) as { name: string; tags: string[] };
-      const volume: Volume = {
-        id: `vol-${this.nextId++}`,
-        name: body.name,
-        tags: body.tags,
-        dropletIds: [],
-        deleted: false,
-      };
-      this.volumes.set(volume.id, volume);
-      return Response.json({ volume: volumeJson(volume) }, { status: 201 });
-    }
-
     if (method === "GET" && collection === "droplets" && id === undefined) {
       const tag = url.searchParams.get("tag_name");
       const droplets = [...this.droplets.values()]
@@ -143,20 +109,8 @@ export class FakeDigitalOcean {
         .map(dropletJson);
       return Response.json({ droplets, links: {}, meta: { total: droplets.length } });
     }
-    if (method === "GET" && collection === "volumes" && id === undefined) {
-      const volumes = [...this.volumes.values()].map(volumeJson);
-      return Response.json({ volumes, links: {}, meta: { total: volumes.length } });
-    }
     if (method === "GET" && collection === "droplets" && id !== undefined) {
       return this.readDroplet(Number(id));
-    }
-    if (method === "GET" && collection === "volumes" && id !== undefined) {
-      const volume = this.volumes.get(id);
-      if (volume === undefined || volume.deleted) {
-        this.volumes.delete(id);
-        return notFound();
-      }
-      return Response.json({ volume: volumeJson(volume) });
     }
     if (method === "DELETE" && collection === "droplets" && id !== undefined) {
       const droplet = this.droplets.get(Number(id));
@@ -167,21 +121,6 @@ export class FakeDigitalOcean {
       await this.gates.get(method);
       return new Response(null, { status: 204 });
     }
-    if (method === "DELETE" && collection === "volumes" && id !== undefined) {
-      const volume = this.volumes.get(id);
-      if (volume === undefined) {
-        return notFound();
-      }
-      if ((volume.dropletIds ?? []).length > 0) {
-        return Response.json(
-          { id: "conflict", message: "the volume is attached to a droplet" },
-          { status: 409 },
-        );
-      }
-      volume.deleted = true;
-      return new Response(null, { status: 204 });
-    }
-
     return Response.json({ id: "server_error", message: "unexpected call" }, { status: 500 });
   }
 
@@ -192,9 +131,6 @@ export class FakeDigitalOcean {
     }
     if (droplet.readsUntilGone === 0) {
       this.droplets.delete(id);
-      for (const volume of this.volumes.values()) {
-        volume.dropletIds = volume.dropletIds?.filter((attached) => attached !== id) ?? null;
-      }
       return notFound();
     }
     if (droplet.readsUntilGone !== null) {
@@ -208,10 +144,6 @@ function dropletJson(droplet: Droplet) {
   return { id: droplet.id, name: droplet.name, status: "active", tags: droplet.tags };
 }
 
-function volumeJson(volume: Volume) {
-  return { id: volume.id, name: volume.name, tags: volume.tags, droplet_ids: volume.dropletIds };
-}
-
 function notFound(): Response {
   return Response.json({ id: "not_found", message: "not found" }, { status: 404 });
 }
@@ -219,7 +151,7 @@ function notFound(): Response {
 export function tags(
   owner: string,
   generation: number,
-  kind: "droplet" | "volume",
+  kind: "droplet",
   untilSeconds?: number,
   prefix = "cl",
 ): string[] {

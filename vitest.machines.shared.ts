@@ -63,14 +63,6 @@ export function machinesConfig(include: string[], extraBindings: Record<string, 
                   price_per_hour_usd: "0.01",
                   max_hours: 12,
                 },
-                disk: {
-                  region: "nyc3",
-                  size: "s-1vcpu-1gb",
-                  image: "ubuntu-24-04-x64",
-                  price_per_hour_usd: "0.01",
-                  max_hours: 12,
-                  volume: { size_gib: 10, mount: "/mnt/data" },
-                },
                 // more per hour than the whole hourly cap, so the gate always refuses it
                 huge: {
                   region: "nyc3",
@@ -117,7 +109,7 @@ export function machinesConfig(include: string[], extraBindings: Record<string, 
                 },
               },
               apps: {
-                homebased: { classes: ["small", "disk", "huge", "metal", "lat", "spot"] },
+                homebased: { classes: ["small", "huge", "metal", "lat", "spot"] },
                 other: { classes: ["small"] },
               },
             },

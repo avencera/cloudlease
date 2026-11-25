@@ -17,7 +17,7 @@ use cloudlease_core::{
 };
 use cloudlease_machines::{
     alert::{Alert, Priority},
-    boot::{Boot, LeaseFile, VolumeMount, check_fits, render_user_data},
+    boot::{Boot, LeaseFile, check_fits, render_user_data},
     config::{
         AwsClass, DigitalOceanClass, LatitudeClass, MachineClass, MachinesConfig, PhoenixNapClass,
         ProviderClass,
@@ -38,7 +38,7 @@ use cloudlease_machines::{
 };
 use cloudlease_provider::{
     aws::{AwsInstanceSpec, IdempotencyKey, InstanceName, RegionalSpec, UserData},
-    digitalocean::{BootScript, DoSpec, DropletSpec, ResourceName, VolumeSpec},
+    digitalocean::{BootScript, DoSpec, DropletSpec, ResourceName},
     error::ProviderErrorCode,
     latitude::{self, UserDataSpec},
     phoenixnap::{self, ServerSpec},
@@ -393,7 +393,7 @@ impl Run {
         let config = config(&self.env)?;
         let class = run_class(&config, &loaded.run)?;
         require_provider(&self.env, &loaded.run.class, class)?;
-        check_fits(&boot, &config.api_base, class.provider.volume_mount())
+        check_fits(&boot, &config.api_base)
             .and_then(|script| class.provider.check_user_data(&script))
             .map_err(|error| ApiError::new(ErrorCode::InvalidBoot, error.to_string()))?;
 
@@ -580,7 +580,6 @@ impl Run {
         let provisioning = Provisioning {
             stores,
             provider: &provider,
-            run,
             record,
             lease: &lease,
             boot,
@@ -1236,7 +1235,6 @@ fn mint_token() -> Result<LeaseToken, ApiError> {
 struct Provisioning<'a> {
     stores: &'a Stores,
     provider: &'a MachineProviders,
-    run: &'a RunRecord,
     record: &'a MachineRecord,
     lease: &'a LeaseFile<'a>,
     boot: &'a Boot,
@@ -1289,37 +1287,20 @@ impl Provisioning<'_> {
         Ok(id)
     }
 
-    fn user_data(&self, volume: Option<VolumeMount<'_>>) -> CloudleaseResult<BootScript> {
-        render_user_data(self.lease, volume, self.boot)
+    fn user_data(&self) -> CloudleaseResult<BootScript> {
+        render_user_data(self.lease, self.boot)
             .map_err(|error| CloudleaseError::Config(error.to_string()))
     }
 
-    /// Creates the class's volume, if it has one, then the droplet that mounts it
+    /// Creates the droplet
     async fn droplet(&self, class: &DigitalOceanClass) -> CloudleaseResult<()> {
-        let volume_name = volume_name(&self.run.run_id, self.record.generation)?;
-        let mut volume_ids = Vec::new();
-        let mut mount = None;
-        if let Some(volume) = &class.volume {
-            let spec = MachineSpec::DigitalOcean(DoSpec::Volume(VolumeSpec {
-                name: volume_name.clone(),
-                region: class.region.clone(),
-                size_gib: volume.size_gib,
-            }));
-            volume_ids.push(self.create(&spec).await?);
-            mount = Some(VolumeMount {
-                name: &volume_name,
-                mount: &volume.mount,
-            });
-        }
-
         let spec = MachineSpec::DigitalOcean(DoSpec::Droplet(DropletSpec {
             name: ResourceName::parse(self.record.hostname.as_str())?,
             region: class.region.clone(),
             size: class.size.clone(),
             image: class.image.clone(),
-            boot: self.user_data(mount)?,
+            boot: self.user_data()?,
             ssh_key_ids: class.ssh_key_ids.clone(),
-            volume_ids,
             vpc_uuid: class.vpc_uuid.clone(),
         }));
         self.create(&spec).await?;
@@ -1329,7 +1310,7 @@ impl Provisioning<'_> {
 
     /// Creates the server in the first of the class's locations that has stock
     async fn server(&self, class: &PhoenixNapClass) -> CloudleaseResult<()> {
-        let user_data = self.user_data(None)?;
+        let user_data = self.user_data()?;
         let first = class
             .locations
             .as_slice()
@@ -1354,7 +1335,7 @@ impl Provisioning<'_> {
     /// Creates the user data record that names the machine's owner, then the server that
     /// boots from it in the first of the class's sites that has stock
     async fn latitude(&self, class: &LatitudeClass) -> CloudleaseResult<()> {
-        let user_data = self.user_data(None)?;
+        let user_data = self.user_data()?;
         let record = MachineSpec::Latitude(LatitudeSpec::UserData(UserDataSpec {
             boot: latitude::BootScript::shell(user_data.as_str())?,
         }));
@@ -1382,7 +1363,7 @@ impl Provisioning<'_> {
 
     /// Launches the Spot instance in whichever of the class's pools EC2 picks
     async fn aws(&self, class: &AwsClass) -> CloudleaseResult<()> {
-        let user_data = self.user_data(None)?;
+        let user_data = self.user_data()?;
         let spec = MachineSpec::Aws(RegionalSpec {
             region: class.region.clone(),
             instance: AwsInstanceSpec {
@@ -1446,15 +1427,6 @@ fn require_provider(env: &Env, name: &ClassName, class: &MachineClass) -> Result
             class.provider.name()
         ),
     ))
-}
-
-fn volume_name(run: &RunId, generation: Generation) -> CloudleaseResult<ResourceName> {
-    // volume names are unique per region, so they carry the run and generation, not the
-    // client's hostname
-    Ok(ResourceName::parse(format!(
-        "{}-{generation}",
-        run.as_str().replace('_', "-")
-    ))?)
 }
 
 async fn return_permit(gate: &CapacityClient, permit: &Permit) {

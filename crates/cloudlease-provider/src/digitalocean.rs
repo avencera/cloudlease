@@ -1,12 +1,11 @@
-//! Droplets and block storage volumes on DigitalOcean
+//! Droplets on DigitalOcean
 //!
-//! Droplets have delete rank 0 and volumes rank 1, so cleanup confirms a droplet gone before
-//! it deletes the volumes the droplet may still hold. DigitalOcean's volume list has no tag
-//! filter, so inventory reads every volume and keeps those with the app's managed tag.
+//! A droplet is the only kind: a machine uses its local disk, so the adapter creates no
+//! block storage volumes and the sweep lists droplets by tag.
 
 pub mod client;
 
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU64;
 
 use cloudlease_core::{
     ids::{Generation, OwnerId, ResourceId},
@@ -34,24 +33,20 @@ pub const MAX_USER_DATA_BYTES: usize = 64 * 1024;
 pub enum DoKind {
     /// A droplet
     Droplet,
-    /// A block storage volume
-    Volume,
 }
 
 impl ResourceKind for DoKind {
-    const ALL: &'static [Self] = &[Self::Droplet, Self::Volume];
+    const ALL: &'static [Self] = &[Self::Droplet];
 
     fn tag_name(self) -> &'static str {
         match self {
             Self::Droplet => "droplet",
-            Self::Volume => "volume",
         }
     }
 
     fn delete_rank(self) -> u8 {
         match self {
             Self::Droplet => 0,
-            Self::Volume => 1,
         }
     }
 }
@@ -70,7 +65,7 @@ validated!(
 );
 
 validated!(
-    /// A resource name valid for both droplets and volumes
+    /// A droplet name
     ResourceName,
     "a name must be a lowercase letter followed by up to 62 lowercase letters, digits or dashes",
     |value| {
@@ -113,21 +108,8 @@ pub struct DropletSpec {
     pub boot: BootScript,
     /// SSH key IDs to install
     pub ssh_key_ids: Vec<NonZeroU64>,
-    /// Volumes to attach at create
-    pub volume_ids: Vec<ResourceId>,
     /// The VPC, when not the region default
     pub vpc_uuid: Option<ResourceId>,
-}
-
-/// A block storage volume to create
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VolumeSpec {
-    /// The name, unique within the region
-    pub name: ResourceName,
-    /// The region slug, which must match the droplet it attaches to
-    pub region: Slug,
-    /// The size in GiB
-    pub size_gib: NonZeroU32,
 }
 
 /// A DigitalOcean create request
@@ -135,8 +117,6 @@ pub struct VolumeSpec {
 pub enum DoSpec {
     /// Create a droplet
     Droplet(DropletSpec),
-    /// Create a volume
-    Volume(VolumeSpec),
 }
 
 impl CreateSpec for DoSpec {
@@ -145,7 +125,6 @@ impl CreateSpec for DoSpec {
     fn kind(&self) -> DoKind {
         match self {
             Self::Droplet(_) => DoKind::Droplet,
-            Self::Volume(_) => DoKind::Volume,
         }
     }
 }
@@ -205,21 +184,18 @@ impl<T: HttpTransport, R: Runtime> DigitalOcean<T, R> {
         droplet_tag: &str,
     ) -> ProviderResult<Vec<Result<Observed<DoKind>, Unrecognized>>> {
         let droplets = self.client.list_droplets_by_tag(droplet_tag).await?;
-        let volumes = self.client.list_volumes().await?;
 
-        let droplets = droplets.into_iter().filter_map(|droplet| {
-            self.classify(
-                DoKind::Droplet,
-                droplet.id.to_string(),
-                droplet.name,
-                droplet.tags,
-            )
-        });
-        let volumes = volumes.into_iter().filter_map(|volume| {
-            self.classify(DoKind::Volume, volume.id, volume.name, volume.tags)
-        });
-
-        Ok(droplets.chain(volumes).collect())
+        Ok(droplets
+            .into_iter()
+            .filter_map(|droplet| {
+                self.classify(
+                    DoKind::Droplet,
+                    droplet.id.to_string(),
+                    droplet.name,
+                    droplet.tags,
+                )
+            })
+            .collect())
     }
 }
 
@@ -251,7 +227,6 @@ fn droplet_body(spec: &DropletSpec, tags: Vec<String>) -> Value {
         "image": image,
         "user_data": spec.boot.as_str(),
         "ssh_keys": spec.ssh_key_ids.iter().map(|id| id.get()).collect::<Vec<_>>(),
-        "volumes": spec.volume_ids.iter().map(ResourceId::as_str).collect::<Vec<_>>(),
         "tags": tags,
         "monitoring": true,
         "ipv6": true,
@@ -261,15 +236,6 @@ fn droplet_body(spec: &DropletSpec, tags: Vec<String>) -> Value {
     }
 
     body
-}
-
-fn volume_body(spec: &VolumeSpec, tags: Vec<String>) -> Value {
-    json!({
-        "name": spec.name.as_str(),
-        "region": spec.region.as_str(),
-        "size_gigabytes": spec.size_gib.get(),
-        "tags": tags,
-    })
 }
 
 fn resource_id(value: impl Into<String>) -> ProviderResult<ResourceId> {
@@ -289,24 +255,18 @@ impl<T: HttpTransport, R: Runtime> CloudProvider for DigitalOcean<T, R> {
                 let droplet = self.client.create_droplet(droplet_body(spec, tags)).await?;
                 resource_id(droplet.id.to_string())
             }
-            DoSpec::Volume(spec) => {
-                let volume = self.client.create_volume(volume_body(spec, tags)).await?;
-                resource_id(volume.id)
-            }
         }
     }
 
     async fn delete(&self, kind: DoKind, id: &ResourceId) -> ProviderResult<()> {
         match kind {
             DoKind::Droplet => self.client.delete_droplet(id.as_str()).await,
-            DoKind::Volume => self.client.delete_volume(id.as_str()).await,
         }
     }
 
     async fn presence(&self, kind: DoKind, id: &ResourceId) -> ProviderResult<Presence> {
         let present = match kind {
             DoKind::Droplet => self.client.get_droplet(id.as_str()).await?.is_some(),
-            DoKind::Volume => self.client.get_volume(id.as_str()).await?.is_some(),
         };
 
         Ok(if present {

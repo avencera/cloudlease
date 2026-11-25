@@ -15,7 +15,7 @@ use cloudlease_core::{
     holding::{Holding, HoldingState, ReleaseReason},
     ids::{Generation, LeaseId, OwnerId, ResourceId, TagPrefix},
     lease::{Lease, LeasePolicy},
-    sweep::{Inventory, doom_past_ceiling, plan},
+    sweep::{Inventory, OwnerAnswer, OwnerReply, doom_past_ceiling, doom_unclaimed, plan},
     tags::{Ceiling, CeilingTag, OwnerTags, TagScheme, UnrecognizedReason},
     time::UnixMillis,
 };
@@ -787,6 +787,45 @@ fn a_server_listed_only_after_its_cleanup_gave_up_is_swept_as_an_orphan_once_set
     assert!(!api.servers.contains_key("sv_late"));
     assert!(!api.servers.contains_key("sv_undated"));
     assert!(api.servers.contains_key("sv_hand"));
+}
+
+#[test]
+fn the_sweep_defers_a_user_data_record_while_its_server_is_not_gone() {
+    let harness = harness();
+    let orphan = owner_tags("ghost", 1);
+    let (record, server) = harness.launch(&orphan);
+    harness.api.borrow_mut().failures.insert(
+        format!("DELETE servers/{server}"),
+        vec![(403, error_body("FORBIDDEN", "not allowed"))],
+    );
+
+    let inventory: Inventory<LatKind> = block_on(harness.provider.inventory()).unwrap();
+    let doomed = doom_unclaimed(
+        &plan(&inventory, &[], at(0)),
+        &BTreeMap::from([(
+            orphan.owner.clone(),
+            OwnerReply::Answered(OwnerAnswer::default()),
+        )]),
+    );
+    let reports = block_on(delete_doomed(
+        &harness.provider,
+        &harness.runtime,
+        doomed,
+        ConfirmPolicy::default(),
+    ));
+
+    // the record is not deleted while the server that boots from it may still exist
+    let outcomes: Vec<_> = reports
+        .iter()
+        .map(|report| (report.resource.id.as_str(), report.outcome.clone()))
+        .collect();
+    assert!(matches!(
+        outcomes.as_slice(),
+        [(failed, DeleteOutcome::Failed { .. }), (deferred, DeleteOutcome::Deferred)]
+            if *failed == server.as_str() && *deferred == record.as_str()
+    ));
+    assert!(harness.api.borrow().user_data.contains_key(record.as_str()));
+    assert!(reports.iter().all(|report| report.survivor().is_some()));
 }
 
 #[test]

@@ -3,10 +3,8 @@
 //! The user data is a POSIX shell script that cloud-init runs once as root. In order, it:
 //!
 //! 1. writes `/etc/cloudlease/lease.json` (mode 0600): the lease ID, its token, the API base,
-//!    the hard deadline, the heartbeat TTL and, for a provider that can take the machine back,
-//!    where the machine hears that it is about to
-//! 2. formats and mounts the class's volume, when the class has one
-//! 3. writes each client file, then runs each client command, stopping at the first failure
+//!    the hard deadline and the heartbeat TTL
+//! 2. writes each client file, then runs each client command, stopping at the first failure
 //!
 //! Everything goes to `/var/log/cloudlease-boot.log`. File contents travel base64-encoded and
 //! every path and argument is single-quoted, so nothing the client sends is parsed by the
@@ -17,7 +15,7 @@ use std::fmt::Write as _;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use cloudlease_core::time::UnixMillis;
-use cloudlease_provider::digitalocean::{BootScript, ResourceName};
+use cloudlease_provider::digitalocean::BootScript;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -133,25 +131,6 @@ impl Boot {
     }
 }
 
-/// An absolute path the boot script may write or mount at
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MountPath(String);
-
-impl MountPath {
-    /// Validates a path
-    pub fn parse(value: &str) -> Result<Self, BootError> {
-        check_path(value)?;
-
-        Ok(Self(value.to_owned()))
-    }
-
-    /// Returns the path
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 fn check_path(path: &str) -> Result<(), BootError> {
     let invalid = || BootError::InvalidPath(path.to_owned());
     let Some(relative) = path.strip_prefix('/') else {
@@ -200,21 +179,8 @@ pub struct LeaseFile<'a> {
     pub heartbeat_ttl_secs: u64,
 }
 
-/// The class volume the boot script formats and mounts
-#[derive(Clone, Copy, Debug)]
-pub struct VolumeMount<'a> {
-    /// The volume's name, which names its device
-    pub name: &'a ResourceName,
-    /// Where to mount it
-    pub mount: &'a MountPath,
-}
-
 /// Renders the droplet's user data
-pub fn render_user_data(
-    lease: &LeaseFile<'_>,
-    volume: Option<VolumeMount<'_>>,
-    boot: &Boot,
-) -> Result<BootScript, BootError> {
+pub fn render_user_data(lease: &LeaseFile<'_>, boot: &Boot) -> Result<BootScript, BootError> {
     let lease_json = serde_json::to_string(lease).map_err(|_| BootError::UserDataTooLarge)?;
     let mut script = String::new();
 
@@ -237,24 +203,6 @@ pub fn render_user_data(
         lease_file = quote(LEASE_FILE),
         lease = quote(&STANDARD.encode(lease_json)),
     );
-
-    if let Some(volume) = volume {
-        let device = format!("/dev/disk/by-id/scsi-0DO_Volume_{}", volume.name.as_str());
-        let _ = write!(
-            script,
-            "cloudlease_volume={device}\n\
-             cloudlease_wait=0\n\
-             while [ ! -e \"$cloudlease_volume\" ] && [ \"$cloudlease_wait\" -lt 60 ]; do\n\
-             \tsleep 2\n\
-             \tcloudlease_wait=$((cloudlease_wait + 1))\n\
-             done\n\
-             blkid \"$cloudlease_volume\" >/dev/null 2>&1 || mkfs.ext4 -q -F \"$cloudlease_volume\"\n\
-             mkdir -p {mount}\n\
-             mount -o defaults,discard,noatime \"$cloudlease_volume\" {mount}\n",
-            device = quote(&device),
-            mount = quote(volume.mount.as_str()),
-        );
-    }
 
     for file in &boot.payload().files {
         let _ = writeln!(
@@ -282,20 +230,14 @@ pub fn render_user_data(
 /// Checks that boot data renders within the user data limit for any lease, and returns the
 /// largest script it can render
 ///
-/// It renders with the longest lease ID, token, deadline and volume name a run can produce,
+/// It renders with the longest lease ID, token and deadline a run can produce,
 /// so boot data too large once rendered is refused before a machine is admitted or anything
 /// is created. A provider that wraps the script checks the result again with
 /// [`ProviderClass::check_user_data`](crate::config::ProviderClass::check_user_data).
-pub fn check_fits(
-    boot: &Boot,
-    api_base: &str,
-    mount: Option<&MountPath>,
-) -> Result<BootScript, BootError> {
+pub fn check_fits(boot: &Boot, api_base: &str) -> Result<BootScript, BootError> {
     let longest_run = format!("run_{}", "f".repeat(24));
     let lease_id = format!("{longest_run}-{}", u64::MAX);
     let token = format!("cll_{}", "f".repeat(64));
-    let volume = ResourceName::parse(format!("{}-{}", longest_run.replace('_', "-"), u64::MAX))
-        .map_err(|_| BootError::UserDataTooLarge)?;
     // 9999-12-31T23:59:59.999Z, the longest deadline the timestamp format writes
     let latest = UnixMillis::new(253_402_300_799_999).ok_or(BootError::UserDataTooLarge)?;
     let lease = LeaseFile {
@@ -305,12 +247,8 @@ pub fn check_fits(
         hard_deadline_at: Timestamp(latest),
         heartbeat_ttl_secs: u64::MAX,
     };
-    let volume = mount.map(|mount| VolumeMount {
-        name: &volume,
-        mount,
-    });
 
-    render_user_data(&lease, volume, boot)
+    render_user_data(&lease, boot)
 }
 
 /// Quotes a value for a POSIX shell: inside single quotes nothing is special except the
@@ -325,11 +263,9 @@ mod tests {
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use cloudlease_core::time::UnixMillis;
-    use cloudlease_provider::digitalocean::ResourceName;
 
     use super::{
-        Boot, BootError, BootFile, BootPayload, LeaseFile, MountPath, VolumeMount, check_fits,
-        quote, render_user_data,
+        Boot, BootError, BootFile, BootPayload, LeaseFile, check_fits, quote, render_user_data,
     };
     use crate::time::Timestamp;
 
@@ -360,10 +296,9 @@ mod tests {
 
     #[test]
     fn boot_data_that_quoting_inflates_past_the_user_data_limit_is_refused_up_front() {
-        let mount = MountPath::parse("/mnt/data").unwrap();
         let api_base = "https://machines.example.test";
         assert_eq!(
-            check_fits(&Boot::new(payload()).unwrap(), api_base, Some(&mount)).map(drop),
+            check_fits(&Boot::new(payload()).unwrap(), api_base).map(drop),
             Ok(())
         );
 
@@ -374,7 +309,7 @@ mod tests {
         };
         let boot = Boot::new(quotes).unwrap();
         assert_eq!(
-            check_fits(&boot, api_base, None).map(drop),
+            check_fits(&boot, api_base).map(drop),
             Err(BootError::UserDataTooLarge)
         );
     }
@@ -392,28 +327,17 @@ mod tests {
     }
 
     #[test]
-    fn user_data_writes_the_lease_first_then_the_volume_files_and_commands_in_order() {
-        let name = ResourceName::parse("cl-run-1").unwrap();
-        let mount = MountPath::parse("/mnt/data").unwrap();
-        let script = render_user_data(
-            &lease(),
-            Some(VolumeMount {
-                name: &name,
-                mount: &mount,
-            }),
-            &Boot::new(payload()).unwrap(),
-        )
-        .unwrap();
+    fn user_data_writes_the_lease_first_then_the_files_and_commands_in_order() {
+        let script = render_user_data(&lease(), &Boot::new(payload()).unwrap()).unwrap();
         let script = script.as_str();
 
         let lease_at = script.find("'/etc/cloudlease/lease.json' 0600").unwrap();
-        let volume_at = script.find("scsi-0DO_Volume_cl-run-1").unwrap();
         let file_at = script.find("'/etc/homebased/config.toml' '0600'").unwrap();
         let run_at = script
             .find("'/bin/sh' '/usr/local/lib/homebased/boot.sh'")
             .unwrap();
         assert!(script.starts_with("#!/bin/sh\n"));
-        assert!(lease_at < volume_at && volume_at < file_at && file_at < run_at);
+        assert!(lease_at < file_at && file_at < run_at);
         // the hostile argument stays one quoted argument
         assert!(script.contains(r"''\''; rm -rf / #'"));
 
