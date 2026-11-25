@@ -148,6 +148,8 @@ pub(crate) fn parse_create_fleet(body: &[u8]) -> ProviderResult<CreateFleetRespo
                 .filter_map(non_empty_value)
                 .collect(),
             instance_type: non_empty(item.instance_type),
+            availability_zone: non_empty(item.availability_zone),
+            subnet_id: non_empty(item.subnet_id),
             overrides: item.launch.into(),
         })
         .collect();
@@ -443,6 +445,10 @@ struct FleetInstanceXml {
     instance_ids: ItemSet<String>,
     #[serde(rename = "instanceType")]
     instance_type: Option<String>,
+    #[serde(rename = "availabilityZone")]
+    availability_zone: Option<String>,
+    #[serde(rename = "subnetId")]
+    subnet_id: Option<String>,
     #[serde(rename = "launchTemplateAndOverrides", default)]
     launch: LaunchTemplateAndOverridesXml,
 }
@@ -502,8 +508,14 @@ struct SpotInstanceRequestResponse {
     request_type: Option<String>,
     #[serde(rename = "instanceInterruptionBehavior")]
     interruption_behavior: Option<String>,
+    status: Option<SpotRequestStatusResponse>,
     #[serde(rename = "tagSet", default)]
     tags: ItemSet<TagResponse>,
+}
+
+#[derive(Deserialize)]
+struct SpotRequestStatusResponse {
+    code: Option<String>,
 }
 
 impl TryFrom<SpotInstanceRequestResponse> for AwsSpotInstanceRequest {
@@ -518,6 +530,7 @@ impl TryFrom<SpotInstanceRequestResponse> for AwsSpotInstanceRequest {
             interruption_behavior: parse_spot_interruption_behavior(
                 non_empty(value.interruption_behavior).as_deref(),
             ),
+            status_code: non_empty(value.status.and_then(|status| status.code)),
             tags: value
                 .tags
                 .items
@@ -782,7 +795,7 @@ mod tests {
         AwsSpotInterruptionBehavior, parse_create_fleet, parse_image, parse_instance_page,
         parse_security_group_page, parse_spot_instance_requests,
     };
-    use crate::aws::ec2::SPOT_INSTANCE_TERMINATION;
+    use crate::aws::ec2::{MARKED_FOR_TERMINATION, SPOT_INSTANCE_TERMINATION};
 
     #[test]
     fn parses_spot_request_state_and_launch_policy() {
@@ -795,6 +808,11 @@ mod tests {
                         <state>active</state>
                         <type>persistent</type>
                         <instanceInterruptionBehavior>stop</instanceInterruptionBehavior>
+                        <status>
+                            <code>marked-for-termination</code>
+                            <updateTime>2026-11-24T22:00:00.000Z</updateTime>
+                            <message>Your Spot Instance has been marked for termination.</message>
+                        </status>
                         <tagSet>
                             <item><key>rb-managed</key><value>rembuild</value></item>
                         </tagSet>
@@ -813,6 +831,7 @@ mod tests {
             AwsSpotInterruptionBehavior::Stop
         );
         assert_eq!(request.instance_id.as_deref(), Some("i-0123456789abcdef0"));
+        assert_eq!(request.status_code.as_deref(), Some(MARKED_FOR_TERMINATION));
     }
 
     #[test]
@@ -1013,6 +1032,36 @@ mod tests {
         assert!(response.instances.is_empty());
         assert_eq!(response.errors[0].code, "UnfulfillableCapacity");
         assert_eq!(response.errors[0].overrides.instance_type, None);
+    }
+
+    #[test]
+    fn reads_the_zone_and_subnet_an_instant_fleet_reports_outside_the_overrides() {
+        let body = br#"
+            <CreateFleetResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+                <requestId>r-1</requestId>
+                <fleetId>fleet-01234567</fleetId>
+                <errorSet/>
+                <fleetInstanceSet>
+                    <item>
+                        <instanceIds><item>i-01234567</item></instanceIds>
+                        <instanceType>c7a.2xlarge</instanceType>
+                        <availabilityZone>us-east-1b</availabilityZone>
+                        <availabilityZoneId>use1-az2</availabilityZoneId>
+                        <subnetId>subnet-0000000b</subnetId>
+                        <lifecycle>spot</lifecycle>
+                    </item>
+                </fleetInstanceSet>
+            </CreateFleetResponse>
+        "#;
+
+        let response = parse_create_fleet(body).unwrap();
+        let launched = &response.instances[0];
+
+        assert_eq!(launched.instance_ids, ["i-01234567"]);
+        assert_eq!(launched.instance_type.as_deref(), Some("c7a.2xlarge"));
+        assert_eq!(launched.availability_zone.as_deref(), Some("us-east-1b"));
+        assert_eq!(launched.subnet_id.as_deref(), Some("subnet-0000000b"));
+        assert_eq!(launched.overrides.availability_zone, None);
     }
 
     #[test]

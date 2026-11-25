@@ -39,7 +39,9 @@ operator user may create launch templates was not checked.
 ## What the policies allow
 
 - **inventory:** `DescribeInstances` and `DescribeSpotInstanceRequests` in the region. The
-  sweep lists by the `clm-managed` tag key; describes cannot be scoped by tag.
+  sweep lists by the `clm-managed` tag key; describes cannot be scoped by tag. Before each
+  launch the Worker also reads which of a run's live Spot requests are
+  `marked-for-termination`, to leave out the pools taking a machine back.
 - **fleet:** `CreateFleet`, which the Worker launches with
   - of instances in the listed zones and of the allowed instance-type patterns
   - from this configuration's launch template, security group, pinned AMI (and its root

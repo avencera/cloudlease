@@ -49,6 +49,8 @@ export interface SpotRequest {
   state: "active" | "closed" | "cancelled";
   type: string;
   interruptionBehavior: string;
+  // the status code of EC2's latest evaluation, such as marked-for-termination
+  statusCode: string;
   tags: Tag[];
 }
 
@@ -100,9 +102,20 @@ export class FakeEc2 {
       state: "active",
       type: "one-time",
       interruptionBehavior: "terminate",
+      statusCode: "fulfilled",
       tags,
     });
     return id;
+  }
+
+  // gives an instance EC2's two-minute interruption notice: its Spot request is marked for
+  // termination and the instance keeps running until EC2 reclaims it
+  markForTermination(id: string): void {
+    const request = this.spotRequests.get(this.instances.get(id)?.spotRequestId ?? "");
+    if (request === undefined) {
+      throw new Error(`no Spot request for instance ${id}`);
+    }
+    request.statusCode = "marked-for-termination";
   }
 
   // reclaims an instance as EC2 does when it needs the Spot capacity back: a one-time
@@ -119,6 +132,7 @@ export class FakeEc2 {
     const request = instance.spotRequestId === null ? undefined : this.spotRequests.get(instance.spotRequestId);
     if (request !== undefined) {
       request.state = "closed";
+      request.statusCode = "instance-terminated-no-capacity";
     }
   }
 
@@ -273,10 +287,13 @@ export class FakeEc2 {
         state: "active",
         type: "one-time",
         interruptionBehavior: instance.interruptionBehavior,
+        statusCode: "fulfilled",
         tags: [],
       });
+      // an instant fleet reports the instance's zone and subnet beside the override too
       launched =
         `<item><instanceIds><item>${id}</item></instanceIds><instanceType>${pool.instanceType}</instanceType>` +
+        `<availabilityZone>${pool.zone}</availabilityZone><subnetId>${pool.subnetId}</subnetId>` +
         `${launchTemplateAndOverrides(pool)}<lifecycle>spot</lifecycle></item>`;
       break;
     }
@@ -314,25 +331,50 @@ export class FakeEc2 {
     return describeResponse([...this.instances.values()].filter(matches));
   }
 
+  // EC2 refuses a call that names a request that does not exist, and leaves out the named
+  // requests a filter does not match
   private describeSpotRequests(params: URLSearchParams): Response {
-    const id = params.get("SpotInstanceRequestId.1");
-    const instanceId = params.get("Filter.1.Name") === "instance-id" ? params.get("Filter.1.Value.1") : null;
-    const requests = [...this.spotRequests.values()].filter(
-      (request) => (id === null || request.id === id) && (instanceId === null || request.instanceId === instanceId),
-    );
-    if (id !== null && requests.length === 0) {
-      return error(400, "InvalidSpotInstanceRequestID.NotFound", `The spot instance request ID '${id}' does not exist`);
+    const ids = indexed(params, "SpotInstanceRequestId");
+    this.log.push(ids.length === 0 ? "DescribeSpotInstanceRequests" : `DescribeSpotInstanceRequests ${ids.join(",")}`);
+    const missing = ids.find((id) => !this.spotRequests.has(id));
+    if (missing !== undefined) {
+      return error(400, "InvalidSpotInstanceRequestID.NotFound", `The spot instance request ID '${missing}' does not exist`);
     }
+    const fields: Record<string, (request: SpotRequest) => string> = {
+      "instance-id": (request) => request.instanceId,
+      "status-code": (request) => request.statusCode,
+    };
+    const filters: [(request: SpotRequest) => string, string[]][] = [];
+    for (let index = 1; params.has(`Filter.${index}.Name`); index += 1) {
+      const name = params.get(`Filter.${index}.Name`) ?? "";
+      const field = fields[name];
+      if (field === undefined) {
+        return error(400, "InvalidParameterValue", `unexpected filter ${name}`);
+      }
+      filters.push([field, indexed(params, `Filter.${index}.Value`)]);
+    }
+    const requests = [...this.spotRequests.values()].filter(
+      (request) => (ids.length === 0 || ids.includes(request.id)) && filters.every(([field, values]) => values.includes(field(request))),
+    );
     const items = requests
       .map(
         (request) =>
           `<item><spotInstanceRequestId>${request.id}</spotInstanceRequestId><instanceId>${request.instanceId}</instanceId>` +
-          `<state>${request.state}</state><type>${request.type}</type>` +
+          `<state>${request.state}</state><type>${request.type}</type><status><code>${request.statusCode}</code></status>` +
           `<instanceInterruptionBehavior>${request.interruptionBehavior}</instanceInterruptionBehavior>${tagSet(request.tags)}</item>`,
       )
       .join("");
     return xml("DescribeSpotInstanceRequestsResponse", `<spotInstanceRequestSet>${items}</spotInstanceRequestSet>`);
   }
+}
+
+// the values of a query list such as SpotInstanceRequestId.1, SpotInstanceRequestId.2, …
+function indexed(params: URLSearchParams, prefix: string): string[] {
+  const values: string[] = [];
+  for (let index = 1; params.has(`${prefix}.${index}`); index += 1) {
+    values.push(params.get(`${prefix}.${index}`) ?? "");
+  }
+  return values;
 }
 
 function overridesOf(params: URLSearchParams): Pool[] {

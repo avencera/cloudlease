@@ -179,10 +179,18 @@ untagged one-time request as the instance's own and never cancels it: it closes 
 instance.
 
 Before each launch the run leaves out the pools that took one of its machines back in the last
-hour: it lists the run's instances by their owner tag, terminated ones included (EC2 lists
-them for about an hour), and leaves out the type and zone of each one whose state reason is
-`Server.SpotInstanceTermination`, logging the pools it left out. If that leaves no pool, the
-launch offers them all. If the list fails, the launch offers every pool.
+hour, or are taking one back now: it lists the run's instances by their owner tag, terminated
+ones included (EC2 lists them for about an hour), and leaves out the type and zone of each one
+whose state reason is `Server.SpotInstanceTermination`. A machine EC2 has given its two-minute
+interruption notice still runs, and homebased asks for its replacement within that time, so
+one `DescribeSpotInstanceRequests` call over the Spot requests of the run's other live
+instances also leaves out the pool of each one whose request is `marked-for-termination`. The
+run logs the pools it left out. If that leaves no pool, the launch offers them all. If either
+read fails, the launch offers every pool.
+
+The fleet reports the pool it launched in by its override, and an instant fleet also reports
+the instance's zone and subnet beside it; the launch reads either, so a launched instance is
+never taken for a failed create when the override is missing.
 
 A fleet that launches nothing answers with an empty instance set and one error per refused
 pool. When any pool refused for Spot capacity or for a Spot price above the max price, the
@@ -378,7 +386,9 @@ tags and boot data, capacity errors moving through every zone of a type before t
 type and the last failing the create with its permit back at once, release, heartbeat lapse
 and hard deadline each terminating the instance and confirming it gone, an interrupted
 instance ending its lease as `interrupted` once past the 2 minute grace and returning its
-permit, a present instance's lease kept with its next check a minute away, the sweep
+permit, the pool of an interrupted machine, or of one EC2 has given its interruption notice
+and still runs, left out of the run's next launch, a present instance's lease kept with its
+next check a minute away, the sweep
 terminating an unclaimed instance past its ceiling and keeping a claimed one and another
 app's, per-second billing, and boot data over EC2's 16 KiB refused. The bare suite covers
 phoenixNAP, Latitude.sh and AWS classes refused without credentials.

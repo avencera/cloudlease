@@ -39,9 +39,9 @@ pub use ec2::{
     AwsSpotInstanceRequest, AwsSpotInstanceRequestState, AwsSpotInstanceRequestType,
     AwsSpotInterruptionBehavior, AwsStateReason, AwsSubnet, AwsTag, CreateFleetRequest,
     CreateFleetResponse, Ec2, FleetError, FleetInstances, FleetOverrides, InstanceFilter,
-    InstanceName, InstanceType, LaunchTemplate, LaunchTemplateId, MAX_USER_DATA_BYTES,
-    NAME_TAG_KEY, RetiredPlacement, SPOT_INSTANCE_TERMINATION, SecurityGroupId, SpotMaxPrice,
-    SpotPool, SubnetId, TcpIngress, UserData, is_ambiguous_failure,
+    InstanceName, InstanceType, LaunchTemplate, LaunchTemplateId, MARKED_FOR_TERMINATION,
+    MAX_USER_DATA_BYTES, NAME_TAG_KEY, RetiredPlacement, SPOT_INSTANCE_TERMINATION,
+    SecurityGroupId, SpotMaxPrice, SpotPool, SubnetId, TcpIngress, UserData, is_ambiguous_failure,
 };
 pub use ingress::{AwsIngress, SharedSecurityGroup};
 pub use signing::{AwsCredentials, AwsRegion};
@@ -189,11 +189,13 @@ pub struct SpotInterruption {
     pub instance_type: InstanceType,
     /// The Availability Zone
     pub availability_zone: AvailabilityZone,
-    /// When EC2 terminated the instance, when its transition reason names a time
+    /// When EC2 terminated the instance, when its transition reason names a time; `None` too
+    /// for an instance EC2 has given its interruption notice but not yet terminated, whose
+    /// interruption is happening now
     pub at: Option<UnixMillis>,
 }
 
-/// Reads which Spot pools recently took an owner's instances back
+/// Reads which Spot pools recently took an owner's instances back, or are taking one back
 ///
 /// EC2 keeps a terminated instance visible for about an hour, so this sees only recent
 /// interruptions.
@@ -351,10 +353,15 @@ impl<C: Ec2> Aws<C> {
         Ok(LaunchedInstance { instance, pool })
     }
 
-    /// Returns the pools that took any generation of `owner`'s instances back
+    /// Returns the pools that took any generation of `owner`'s instances back, or are taking
+    /// one back now
     ///
     /// Terminated instances count, since EC2 lists them for about an hour after the
-    /// interruption; an instance whose type or zone EC2 no longer reports is skipped.
+    /// interruption; an instance whose type or zone EC2 no longer reports is skipped. So does
+    /// a live instance whose Spot request is [marked for termination](MARKED_FOR_TERMINATION):
+    /// EC2 has given it the two-minute notice, and its replacement is asked for within that
+    /// time, while it still runs. One `DescribeSpotInstanceRequests` call covers every such
+    /// instance, and is skipped when there is none.
     pub async fn spot_interruptions(
         &self,
         owner: &OwnerId,
@@ -364,8 +371,7 @@ impl<C: Ec2> Aws<C> {
             owner.as_str(),
         ));
         let instances = self.ec2.list_instances(filter).await?;
-
-        Ok(instances
+        let owned: Vec<_> = instances
             .iter()
             .filter(|instance| {
                 matches!(
@@ -373,8 +379,35 @@ impl<C: Ec2> Aws<C> {
                     TagMatch::Managed(tags) if tags.owner == *owner
                 )
             })
-            .filter_map(interruption)
-            .collect())
+            .collect();
+        let mut interruptions: Vec<_> = owned.iter().copied().filter_map(interruption).collect();
+
+        let live = owned
+            .iter()
+            .filter(|instance| !instance.state().is_absent() && interruption(instance).is_none());
+        let by_request: BTreeMap<&str, &AwsInstance> = live
+            .filter_map(|instance| Some((instance.spot_instance_request_id()?, *instance)))
+            .collect();
+        if by_request.is_empty() {
+            return Ok(interruptions);
+        }
+
+        let requests = self
+            .ec2
+            .describe_spot_instance_requests_with_status(
+                by_request.keys().map(|id| (*id).to_owned()).collect(),
+                MARKED_FOR_TERMINATION,
+            )
+            .await?;
+        interruptions.extend(
+            requests
+                .iter()
+                .filter(|request| request.status_code.as_deref() == Some(MARKED_FOR_TERMINATION))
+                .filter_map(|request| by_request.get(request.id.as_str()))
+                .filter_map(|instance| pool_of(instance, None)),
+        );
+
+        Ok(interruptions)
     }
 
     /// Returns the live instances with an exact tag set for one owner and generation
@@ -814,17 +847,31 @@ fn describe_failure(error: &FleetError) -> String {
     format!("{pool} ({}{message})", safe_code(&error.code))
 }
 
-/// Maps the override EC2 reports back to the spec's pool
+/// Maps the pool EC2 reports back to the spec's pool
+///
+/// The override is read first, then the instance's own type, zone and subnet, which an
+/// instant fleet reports outside the override, so a launch is never mistaken for a failed
+/// create when one of the two is missing.
 fn launched_pool(pools: &LaunchPools, launched: &FleetInstances) -> ProviderResult<SpotPool> {
     let instance_type = launched
         .overrides
         .instance_type
         .as_deref()
         .or(launched.instance_type.as_deref());
-    let by_zone = instance_type.zip(launched.overrides.availability_zone.as_deref());
+    let zone = launched
+        .overrides
+        .availability_zone
+        .as_deref()
+        .or(launched.availability_zone.as_deref());
+    let subnet = launched
+        .overrides
+        .subnet_id
+        .as_deref()
+        .or(launched.subnet_id.as_deref());
+    let by_zone = instance_type.zip(zone);
     let by_subnet = || {
         let instance_type = instance_type?;
-        let subnet = launched.overrides.subnet_id.as_deref()?;
+        let subnet = subnet?;
         pools.as_slice().iter().find(|pool| {
             pool.instance_type.as_str() == instance_type && pool.subnet_id.as_str() == subnet
         })
@@ -847,10 +894,14 @@ fn interruption(instance: &AwsInstance) -> Option<SpotInterruption> {
         return None;
     }
 
+    pool_of(instance, reason.at)
+}
+
+fn pool_of(instance: &AwsInstance, at: Option<UnixMillis>) -> Option<SpotInterruption> {
     Some(SpotInterruption {
         instance_type: InstanceType::parse(instance.instance_type()?).ok()?,
         availability_zone: AvailabilityZone::parse(instance.availability_zone()?).ok()?,
-        at: reason.at,
+        at,
     })
 }
 

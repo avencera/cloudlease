@@ -170,6 +170,26 @@ describe("AWS Spot machines in miniflare", () => {
     expect(ec2.fleets[2]).toEqual(ALL_POOLS);
   });
 
+  it("leaves out of the run's next launch the pool of a machine EC2 has given its interruption notice", async () => {
+    const run = await spotRun();
+    await createMachine(run, "hb-spot-notice-1");
+    const noticed = instanceOf("hb-spot-notice-1");
+    expect(noticed).toMatchObject({ instanceType: "c8a.4xlarge", zone: "us-east-1a" });
+    // homebased asks for the replacement within the two-minute notice, while EC2 still runs it
+    noticed.state = "running";
+    ec2.markForTermination(noticed.id);
+    const requestsBefore = ec2.log.filter((entry) => entry.startsWith("DescribeSpotInstanceRequests")).length;
+
+    await createMachine(run, "hb-spot-notice-2");
+
+    expect(ec2.fleets[1]).toEqual(ALL_POOLS.filter((pool) => pool !== "c8a.4xlarge@us-east-1a"));
+    expect(instanceOf("hb-spot-notice-2")).toMatchObject({ instanceType: "c8a.4xlarge", zone: "us-east-1b" });
+    // one request read for the launch, naming the noticed machine's request
+    const requests = ec2.log.filter((entry) => entry.startsWith("DescribeSpotInstanceRequests")).slice(requestsBefore);
+    expect(requests).toEqual([`DescribeSpotInstanceRequests ${noticed.spotRequestId}`]);
+    expect(instanceOf("hb-spot-notice-1").state).toBe("running");
+  });
+
   it("offers every pool when each one interrupted the run recently", async () => {
     const run = await spotRun();
     for (const pool of ALL_POOLS) {

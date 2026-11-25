@@ -128,7 +128,8 @@ The miniflare suite runs the test Worker against a fake DigitalOcean API, instal
   out-of-band terminate) has not run. The AWS `CreateFleet` launch has run only against the
   fake EC2: the launch template is not applied yet, and whether the fleet's Spot request
   carries tags, whether `CreateFleet` also evaluates the caller's `RunInstances` conditions,
-  and how long EC2 keeps a `ClientToken` are unconfirmed
+  and how long EC2 keeps a `ClientToken` are unconfirmed. Leaving out the pool of a machine
+  whose Spot request is `marked-for-termination` has also run only against the fake EC2
 - Firewalls on DigitalOcean, phoenixNAP and Latitude.sh. `firewall::IngressPolicy` has only
   the AWS shared security group implementation
 - Batch-job records and exit status. These belong to the app, which builds on holdings

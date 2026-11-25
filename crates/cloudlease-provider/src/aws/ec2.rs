@@ -32,6 +32,10 @@ pub const MAX_USER_DATA_BYTES: usize = 16 * 1024;
 /// The state reason code EC2 gives an instance it terminated to take its Spot capacity back
 pub const SPOT_INSTANCE_TERMINATION: &str = "Server.SpotInstanceTermination";
 
+/// The Spot request status code EC2 sets when it has given its instance the two-minute
+/// interruption notice
+pub const MARKED_FOR_TERMINATION: &str = "marked-for-termination";
+
 /// One EC2 tag
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct AwsTag {
@@ -486,6 +490,8 @@ pub struct AwsSpotInstanceRequest {
     pub request_type: AwsSpotInstanceRequestType,
     /// The interruption behavior
     pub interruption_behavior: AwsSpotInterruptionBehavior,
+    /// The status code of EC2's latest evaluation, such as [`MARKED_FOR_TERMINATION`]
+    pub status_code: Option<String>,
     /// The tags
     pub tags: Vec<AwsTag>,
 }
@@ -673,6 +679,12 @@ pub struct FleetInstances {
     pub instance_ids: Vec<String>,
     /// The instance type
     pub instance_type: Option<String>,
+    /// The Availability Zone the instance launched in, which an instant fleet reports
+    /// outside the override too
+    pub availability_zone: Option<String>,
+    /// The subnet the instance launched in, which an instant fleet reports outside the
+    /// override too
+    pub subnet_id: Option<String>,
     /// The override EC2 used
     pub overrides: FleetOverrides,
 }
@@ -788,6 +800,14 @@ pub trait Ec2 {
     fn describe_spot_instance_requests_for_instance(
         &self,
         instance_id: String,
+    ) -> LocalFuture<'_, ProviderResult<Vec<AwsSpotInstanceRequest>>>;
+
+    /// Describes the Spot requests among `spot_instance_request_ids` whose status code is
+    /// `status_code`, in one call
+    fn describe_spot_instance_requests_with_status(
+        &self,
+        spot_instance_request_ids: Vec<String>,
+        status_code: &'static str,
     ) -> LocalFuture<'_, ProviderResult<Vec<AwsSpotInstanceRequest>>>;
 
     /// Launches at most one Spot instance with an instant fleet
@@ -1054,6 +1074,35 @@ impl<T: HttpTransport, R: Runtime> Ec2 for Ec2Client<T, R> {
                         query("Filter.1.Name", "instance-id"),
                         query("Filter.1.Value.1", &instance_id),
                     ],
+                    AwsRequestSafety::ReadOnly,
+                )
+                .await?;
+            parse_spot_instance_requests(&response.body, None)
+        })
+    }
+
+    fn describe_spot_instance_requests_with_status(
+        &self,
+        spot_instance_request_ids: Vec<String>,
+        status_code: &'static str,
+    ) -> LocalFuture<'_, ProviderResult<Vec<AwsSpotInstanceRequest>>> {
+        Box::pin(async move {
+            // a filter leaves out the named requests it does not match instead of failing, and
+            // EC2 pages a describe only when it is sent MaxResults, which this call never is
+            let mut parameters = vec![
+                query("Filter.1.Name", "status-code"),
+                query("Filter.1.Value.1", status_code),
+            ];
+            parameters.extend(
+                spot_instance_request_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| query(&format!("SpotInstanceRequestId.{}", index + 1), id)),
+            );
+            let response = self
+                .call(
+                    "DescribeSpotInstanceRequests",
+                    parameters,
                     AwsRequestSafety::ReadOnly,
                 )
                 .await?;
