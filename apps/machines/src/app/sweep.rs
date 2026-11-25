@@ -3,9 +3,10 @@
 use std::collections::BTreeSet;
 
 use cloudlease_machines::{
-    alert::{Alert, Priority, SWEEP_KEY, UNLISTED_KEY_PREFIX},
+    alert::{Alert, Priority, SWEEP_KEY, UNDELETED_KEY_PREFIX, UNLISTED_KEY_PREFIX},
     provider::MachineKind,
 };
+use cloudlease_provider::sweep::DeleteOutcome;
 use cloudlease_worker::{
     error::CloudleaseResult,
     http::call_json,
@@ -33,11 +34,19 @@ pub async fn run(env: &Env) {
                 .unlisted
                 .iter()
                 .map(|unlisted| format!("{UNLISTED_KEY_PREFIX}{}", unlisted.provider));
+            // a resource the provider keeps refusing to delete stays billable, and its owner's
+            // own retries only log, so it needs a streak of its own
+            let undeleted = report
+                .deletes
+                .iter()
+                .filter(|delete| undeleted(&delete.report.outcome))
+                .map(|delete| format!("{UNDELETED_KEY_PREFIX}{}", delete.report.resource.id));
             report
                 .owners_failed
                 .iter()
                 .map(|failure| failure.owner.as_str().to_owned())
                 .chain(unlisted)
+                .chain(undeleted)
                 .collect()
         }
         Err(error) => {
@@ -164,6 +173,36 @@ fn failure_alert(key: &str, count: u32, report: Option<&SweepReport<MachineKind>
         };
     }
 
+    if let Some(id) = key.strip_prefix(UNDELETED_KEY_PREFIX) {
+        let delete = report.and_then(|report| {
+            report
+                .deletes
+                .iter()
+                .find(|delete| delete.report.resource.id.as_str() == id)
+        });
+        let detail = delete.map_or_else(
+            || "unknown".to_owned(),
+            |delete| {
+                format!(
+                    "{:?} of {} generation {}, {:?}",
+                    delete.report.resource.tags.kind,
+                    delete.report.resource.tags.owner,
+                    delete.report.resource.tags.generation,
+                    delete.report.outcome
+                )
+            },
+        );
+        return Alert {
+            title: format!("cloudlease: the sweep cannot delete {id}"),
+            message: format!(
+                "The last {count} sweeps failed to delete resource {id} ({detail}). It may \
+                 still be running and billed; delete it at the provider and check the \
+                 Worker's credentials and permissions."
+            ),
+            priority: Priority::High,
+        };
+    }
+
     let error = report
         .and_then(|report| {
             report
@@ -180,4 +219,12 @@ fn failure_alert(key: &str, count: u32, report: Option<&SweepReport<MachineKind>
         ),
         priority: Priority::Default,
     }
+}
+
+// a deferred delete waits on another resource of the same machine, whose own outcome counts
+const fn undeleted(outcome: &DeleteOutcome) -> bool {
+    matches!(
+        outcome,
+        DeleteOutcome::Failed { .. } | DeleteOutcome::StillPresent
+    )
 }

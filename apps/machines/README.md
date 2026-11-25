@@ -303,7 +303,9 @@ the Worker log either way:
 - a sweep deleting a resource whose lease no run had already ended, which means it leaked
   (priority 3)
 - a run object failing to answer the sweep (priority 3), a provider the sweep cannot list
-  (priority 4), or the sweep failing outright for another reason (priority 4), on the third
+  (priority 4), a resource the sweep fails to delete or still finds after its delete, such
+  as one whose provider refuses the delete (priority 4), or the sweep failing outright for
+  another reason (priority 4), on the third
   sweep in a row and then hourly (the `Monitor` object counts the streaks). An optional
   provider whose settings are broken, such as one secret set without the other, counts as
   one the sweep cannot list, since it may still have machines; its classes are refused with

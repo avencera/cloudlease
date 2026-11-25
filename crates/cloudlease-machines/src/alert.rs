@@ -27,6 +27,10 @@ pub const SWEEP_KEY: &str = "sweep";
 /// The streak key prefix of a provider the sweep could not list, followed by its name
 pub const UNLISTED_KEY_PREFIX: &str = "unlisted:";
 
+/// The streak key prefix of a resource the sweep failed to delete, followed by its provider
+/// ID
+pub const UNDELETED_KEY_PREFIX: &str = "undeleted:";
+
 /// How urgent an alert is, as ntfy priorities
 ///
 /// There is no priority 5: the alerts topic may be one that a Superalert Mac app follows, and

@@ -567,6 +567,24 @@ describe("cloudlease machines in miniflare", () => {
     expect(ntfy.titles()).toEqual([]);
   });
 
+  it("alerts when the sweep keeps failing to delete a released machine's droplet", async () => {
+    const run = await createRun();
+    const lease = await createMachine(run, "hb-sweep-undeletable");
+    const dropletId = dropletOf("hb-sweep-undeletable")?.id;
+    fake.failDeletes = true;
+    const response = await call("POST", `/v1/leases/${lease.lease_id}/release`, CLIENT, { reason: "idle" });
+    expect(response.status).toBe(202);
+
+    // the run is already releasing it, so no orphan alert; only the streak can tell
+    await scheduled();
+    await scheduled();
+    expect(ntfy.titles()).toEqual([]);
+    await scheduled();
+
+    expect(ntfy.titles()).toEqual([`cloudlease: the sweep cannot delete ${dropletId}`]);
+    expect(fake.droplets.has(dropletId ?? 0)).toBe(true);
+  });
+
   it("deletes a stalled run's droplet past its hard deadline on the next sweep", async () => {
     const run = await createRun();
     const past = Math.floor(Date.now() / 1000) - 10;

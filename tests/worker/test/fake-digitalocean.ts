@@ -34,6 +34,8 @@ export class FakeDigitalOcean {
   failCreates = false;
   // answers every list with HTTP 500, so an inventory cannot be read
   failLists = false;
+  // answers every delete with HTTP 403, as for a token that lost its delete scope
+  failDeletes = false;
   private nextId = 9_000;
   private readonly gates = new Map<string, Promise<void>>();
 
@@ -90,6 +92,9 @@ export class FakeDigitalOcean {
 
     if (method === "POST" && this.failCreates) {
       return Response.json({ id: "unprocessable_entity", message: "size unavailable" }, { status: 422 });
+    }
+    if (method === "DELETE" && this.failDeletes) {
+      return Response.json({ id: "forbidden", message: "you do not have access" }, { status: 403 });
     }
     if (method === "GET" && id === undefined && this.failLists) {
       return Response.json({ id: "server_error", message: "listing failed" }, { status: 500 });
